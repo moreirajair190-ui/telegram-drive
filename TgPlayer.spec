@@ -1,6 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
-PyInstaller spec do TGClassPlayer v6 (compatível com PyInstaller 6.x).
+PyInstaller spec do TgPlayer v6.2 (compatível com PyInstaller 6.x).
 
 Gera um executável de pasta única (onedir) — é a forma MAIS confiável para
 apps com QtWebEngine / QtMultimedia. O modo "onefile" também é possível,
@@ -11,10 +11,10 @@ IMPORTANTE: o PyInstaller 6.x REMOVEU os argumentos antigos
 ``block_cipher``. Este .spec NÃO os usa mais (era a causa do build falhar).
 
 Build:
-    pyinstaller --noconfirm TGClassPlayer.spec
+    pyinstaller --noconfirm TgPlayer.spec
 
 Resultado:
-    dist/TGClassPlayer/TGClassPlayer.exe
+    dist/TgPlayer/TgPlayer.exe
 """
 
 import os
@@ -44,6 +44,10 @@ def _collect(pkg):
 # Pyrogram (TgCrypto é opcional — só coletamos se existir).
 _collect("pyrogram")
 _collect("tgcrypto")
+
+# python-vlc (OPCIONAL): backend de vídeo com libVLC embarcado. Só é coletado
+# se estiver instalado; caso contrário o app usa o QMediaPlayer normalmente.
+_collect("vlc")
 
 # aiohttp.
 try:
@@ -76,7 +80,7 @@ _collect("PySide6.QtCharts")
 
 # Pacote da própria aplicação (em src/).
 try:
-    hiddenimports += collect_submodules("tgclassplayer")
+    hiddenimports += collect_submodules("tgplayer")
 except Exception:
     pass
 
@@ -87,7 +91,7 @@ if not os.path.exists(icon_path):
 
 
 a = Analysis(
-    ["TGClassPlayer.py"],
+    ["TgPlayer.py"],
     pathex=["src"],
     binaries=binaries,
     datas=datas,
@@ -112,7 +116,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="TGClassPlayer",
+    name="TgPlayer",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -134,5 +138,5 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name="TGClassPlayer",
+    name="TgPlayer",
 )

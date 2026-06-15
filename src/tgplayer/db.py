@@ -1,4 +1,4 @@
-"""Camada de banco de dados (SQLite, WAL) do TGClassPlayer v6.
+"""Camada de banco de dados (SQLite, WAL) do TgPlayer.
 
 Modelo de dados:
 - courses    : um curso por chat do Telegram (com is_forum, color, sort_order).

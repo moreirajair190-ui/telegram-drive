@@ -53,7 +53,7 @@ class TelegramService:
         ensure_dirs()
         self.loop = asyncio.new_event_loop()
         self.thread = threading.Thread(
-            target=self._run_loop, name="TGClassPlayerAsync", daemon=True
+            target=self._run_loop, name="TgPlayerAsync", daemon=True
         )
         self.thread.start()
         self.client = None
@@ -130,6 +130,8 @@ class TelegramService:
                     pass
                 self.client = None
 
+        # Mantemos o nome de sess\u00e3o legado ("tgclassplayer") para que usu\u00e1rios
+        # que atualizam do TGClassPlayer continuem logados sem refazer login.
         self.client = Client(
             "tgclassplayer",
             api_id=self.api_id,
@@ -587,6 +589,11 @@ class TelegramService:
             mime_type=video.get("mime_type"),
         )
         self.sessions[token] = session
+        # Partida rápida: já dispara o download do início + cauda (moov).
+        try:
+            session.prefetch_start()
+        except Exception:  # noqa: BLE001
+            log.exception("Falha ao iniciar pré-busca do stream %s", token)
         self.session_meta[token] = {
             "title": video.get("title") or filename,
             "start_position_ms": int(video.get("start_position_ms") or 0),
@@ -616,6 +623,7 @@ class TelegramService:
         app = web.Application(client_max_size=1024**3)
         app.router.add_get("/stream/{token}/{filename:.*}", self._handle_stream, allow_head=True)
         app.router.add_get("/player/{token}", self._handle_player)
+        app.router.add_get("/buffer/{token}", self._handle_buffer)
         app.router.add_get("/health", self._handle_health)
         self.runner = web.AppRunner(app, access_log=None)
         await self.runner.setup()
@@ -629,6 +637,39 @@ class TelegramService:
 
     async def _handle_health(self, request: web.Request) -> web.Response:
         return web.json_response({"ok": True, "time": time.time()})
+
+    async def _handle_buffer(self, request: web.Request) -> web.Response:
+        """Informa o progresso de buffer de partida (overlay 'Carregando aula…')."""
+        token = request.match_info.get("token") or ""
+        session = self.sessions.get(token)
+        if not session:
+            return web.json_response({"ratio": 0.0, "ready": False, "found": False})
+        try:
+            ratio = float(session.buffer_ratio())
+        except Exception:  # noqa: BLE001
+            ratio = 0.0
+        return web.json_response(
+            {
+                "ratio": ratio,
+                "ready": ratio >= 0.999,
+                "found": True,
+                "error": session.error,
+            },
+            headers={
+                "Cache-Control": "no-store",
+                "Access-Control-Allow-Origin": "*",
+            },
+        )
+
+    def buffer_ratio(self, token: str) -> float:
+        """Acesso síncrono ao progresso de buffer (usado pelo overlay do Qt)."""
+        session = self.sessions.get(token)
+        if not session:
+            return 0.0
+        try:
+            return float(session.buffer_ratio())
+        except Exception:  # noqa: BLE001
+            return 0.0
 
     async def _handle_player(self, request: web.Request) -> web.Response:
         """Serve a PÁGINA do player na MESMA origem do vídeo (corrige bloqueio)."""

@@ -1,6 +1,6 @@
 @echo off
 REM ============================================================================
-REM  TGClassPlayer v6 - Rodar a partir do codigo-fonte (sem gerar .exe)
+REM  TgPlayer v6.2 - Rodar a partir do codigo-fonte (sem gerar .exe)
 REM  Util para testar rapidamente. Cria o .venv na primeira execucao.
 REM ============================================================================
 
@@ -24,8 +24,8 @@ if not exist ".venv" (
     call ".venv\Scripts\activate.bat"
 )
 
-echo Iniciando o TGClassPlayer ...
-python TGClassPlayer.py
+echo Iniciando o TgPlayer ...
+python TgPlayer.py
 
 pause
 endlocal

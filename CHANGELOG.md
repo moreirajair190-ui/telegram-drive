@@ -1,4 +1,89 @@
-# Changelog — TGClassPlayer
+# Changelog — TgPlayer
+
+## v6.2.0
+
+> **O projeto agora se chama TgPlayer** (antes: TGClassPlayer). O nome do
+> executável, do entry point (`TgPlayer.py`) e do pacote Python (`tgplayer`)
+> foram atualizados. **Seus dados são preservados**: login do Telegram, banco
+> (`tgclassplayer.sqlite3`), progresso e configurações continuam funcionando —
+> em modo `.exe`, se já existir a pasta antiga `%LOCALAPPDATA%\TGClassPlayer`,
+> ela é reaproveitada automaticamente.
+
+Foco desta versão: **consertar e turbinar o PLAYER INTERNO** (o que abre em
+"Assistir agora"), que antes carregava devagar, ficava preso em `00:00 / 00:00`
+com tela preta e tinha uma interface crua.
+
+### 🚀 Carregamento muito mais rápido (sem travar em 00:00)
+
+- **Pré-busca do índice `moov` do MP4.** Ao preparar o stream, o servidor local
+  agora baixa **imediatamente** o **bloco 0** (início) **e os 2 últimos blocos**
+  do arquivo. Em MP4 *não-faststart* o átomo `moov` (necessário para o player
+  começar) fica **no fim**; antes o player ia ao fim, baixava blocos e só então
+  voltava ao início — a causa raiz da espera enorme. Agora o índice já está
+  pronto quando o player precisa dele.
+- **Primeiro byte rápido (yield parcial).** O download de cada bloco passou a
+  **gravar em disco incrementalmente** e a marcar quantos bytes já estão
+  prontos. O `read_range` **libera ~256 KiB iniciais sem esperar** o bloco
+  inteiro de 2 MiB — o vídeo começa a fluir em segundos.
+- **Mais paralelismo, com cancelamento.** `Semaphore(3 → 6)` e
+  `READ_AHEAD_BLOCKS (4 → 6)`. Todos os downloads em andamento são
+  **cancelados ao fechar** a janela (libera rede; o cache é apagado).
+- **Overlay "Carregando aula… NN%".** Em vez de tela preta morta, há um overlay
+  com **porcentagem real de buffer** e, após ~6 s, o botão **"Está demorando?
+  Abrir no VLC"**.
+
+#### Por que a Opção 1 (e não só a 2 ou a 3)?
+
+Foram avaliadas as 3 arquiteturas propostas:
+
+- **Opção 1 — buffer de partida + readahead agressivo no servidor local
+  (IMPLEMENTADA como base).** É a que resolve a *causa raiz* (moov no fim +
+  espera do bloco inteiro) sem mudar o fluxo de streaming sob demanda já
+  existente, **sem gravar o vídeo em disco permanentemente** e sem dependências
+  novas obrigatórias. Melhor custo/benefício e risco baixo.
+- **Opção 2 — pré-download dos primeiros N MiB para arquivo temporário.**
+  Ajudaria a partida, mas **não resolve** o problema do `moov` no fim (que pode
+  estar muito além dos primeiros N MiB) e tende a "baixar para depois tocar",
+  contrariando o streaming sob demanda. Descartada como base; a pré-busca da
+  *cauda* da Opção 1 cobre o ganho pretendido.
+- **Opção 3 — libVLC embarcado na nossa janela (IMPLEMENTADA como backend
+  preferencial quando disponível).** Ganha a **velocidade do VLC** dentro do
+  app (via `set_hwnd`/`winId`), **sem abrir o VLC externo**. É **opcional**
+  (`pip install python-vlc`): se a libVLC não estiver presente, o player cai
+  automaticamente para o QMediaPlayer. Combinada com a Opção 1, dá o melhor
+  resultado.
+
+**Ordem de backends do player:** libVLC embarcado → QMediaPlayer (codecs
+nativos do SO) → QtWebEngine (fallback final).
+
+### 🎨 Interface premium
+
+- Barra de controles **flutuante com auto-hide (~3 s)** em tela cheia.
+- **Seek bar premium** desenhada à mão: faixa de **buffer carregado**, faixa
+  reproduzida em gradiente, **thumb** com realce no hover e **tooltip de tempo**.
+- Botões grandes e legíveis: **play**, **±10s**, **volume + mudo**,
+  **velocidade 0.5–2x**, **tela cheia** e **Abrir no VLC**. **Cabeçalho** com o
+  título e selo do backend em uso. Alto contraste.
+- **Atalhos:** `Espaço` (play/pause), `←/→` (±10s), `↑/↓` (volume), `F` (tela
+  cheia), `Esc` (sair da tela cheia), `M` (mudo).
+- O **fallback QtWebEngine** continua intacto.
+
+### ⏪ Retomada confiável
+
+- Progresso salvo **a cada ~5 s** e **ao fechar**.
+- Ao reabrir, o player **retoma exatamente** na posição salva quando a mídia
+  carrega; se faltar **menos de 5 s** para o fim, **recomeça do zero**.
+- Aviso discreto **"Retomando de mm:ss"**.
+- Aula marcada como **assistida ✅** ao passar de **~92%**.
+
+### 🔒 Privacidade / entrega
+
+- O vídeo **nunca** é armazenado permanentemente: o cache é apagado ao fechar.
+- `python-vlc` é **opcional** (documentado no `requirements.txt` e no README).
+- O `.exe` continua compilando (spec atualizado; `python-vlc` coletado só se
+  existir).
+
+---
 
 ## v6.1.0
 
