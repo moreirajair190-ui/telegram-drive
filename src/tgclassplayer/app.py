@@ -1,3 +1,17 @@
+"""Janela principal do TGClassPlayer v6 (interface refeita do zero).
+
+Estrutura da interface:
+- Barra superior: marca, nome do curso/matéria, BARRA DE PROGRESSO GERAL
+  (aulas assistidas/total, horas) e alternância de tema 🌞/🌙 (persistente).
+- Abas (QTabWidget): "Aulas" (navegação por matérias + módulos, filtros, busca,
+  edição completa, player) e "Acompanhamento" 📊 (Pomodoro, tarefas, gráficos).
+- Aba "Aulas": 3 colunas — matérias (esquerda), árvore de módulos/aulas
+  (centro) e painel de detalhes da aula (direita).
+
+Toda a navegação usa o modelo de MATÉRIAS (subjects) do banco v6 e as novas
+APIs de sincronização, streaming (player same-origin) e diálogos.
+"""
+
 from __future__ import annotations
 
 import logging
@@ -10,6 +24,7 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QColor, QFont
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QDialog,
     QFileDialog,
     QFrame,
@@ -24,25 +39,26 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
-    QSplitter,
+    QTabWidget,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
-from .db import Course, Database, Video
+from .db import Course, Database, Subject, Video
 from .dialogs import (
     EditVideoDialog,
     LoginDialog,
     SelectCoursesDialog,
-    SummaryEditorDialog,
+    SubjectsEditorDialog,
     wait_future,
 )
 from .logging_setup import setup_logging
 from .player import VideoPlayerDialog
-from .style import APP_QSS, COLORS
-from .summary_parser import count_tags, parse_menu
+from .study_tab import StudyTab
+from .style import build_qss, palette
+from .summary_parser import match_videos_to_tree
 from .telegram_service import TelegramService
 from .utils import human_duration, human_size
 from .vlc_locator import find_vlc, launch_vlc, open_vlc_download_page
@@ -51,78 +67,125 @@ log = logging.getLogger(__name__)
 
 ROLE_VIDEO_ID = Qt.UserRole
 ROLE_NODE_TYPE = Qt.UserRole + 1
-ROLE_TOPIC = Qt.UserRole + 2
+
+# Identificador especial para "todas as matérias".
+SUBJECT_ALL = -1
+SUBJECT_NONE = 0  # vídeos sem matéria
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.db = Database()
         self.service = TelegramService()
+        self.theme = self.db.get_setting("theme") or "dark"
         self.current_course_id: int | None = None
+        self.current_subject_id: int = SUBJECT_ALL
         self.current_video_id: int | None = None
         self.setWindowTitle("TGClassPlayer — Videoaulas do Telegram")
-        self.resize(1440, 860)
-        self.setMinimumSize(1100, 680)
+        self.resize(1500, 900)
+        self.setMinimumSize(1180, 720)
         self.build_ui()
+        self.apply_theme(self.theme, persist=False)
         self.refresh_courses()
         QTimer.singleShot(400, self.try_quick_connect)
 
-    # ============================================================= construção UI
+    # ===================================================== construção da interface
     def build_ui(self) -> None:
-        root = QSplitter()
-        root.setObjectName("RootSplitter")
-        root.setChildrenCollapsible(False)
-        root.setHandleWidth(1)
-        self.setCentralWidget(root)
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        root.addWidget(self._build_sidebar())
-        root.addWidget(self._build_center())
-        root.addWidget(self._build_right())
-        root.setSizes([310, 800, 360])
-        root.setStretchFactor(1, 1)
+        root.addWidget(self._build_topbar())
+
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._build_lessons_tab(), "🎬  Aulas")
+        self.study_tab = StudyTab(self.db, self.get_current_course)
+        self.tabs.addTab(self.study_tab, "📊  Acompanhamento")
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        root.addWidget(self.tabs, 1)
 
         self._build_menu()
 
-    def _build_sidebar(self) -> QWidget:
-        sidebar = QWidget()
-        sidebar.setObjectName("Sidebar")
-        sidebar.setMinimumWidth(280)
-        sidebar.setMaximumWidth(360)
-        layout = QVBoxLayout(sidebar)
-        layout.setContentsMargins(20, 22, 20, 20)
-        layout.setSpacing(12)
+    # ---------------------------------------------------------------- barra topo
+    def _build_topbar(self) -> QWidget:
+        bar = QWidget()
+        bar.setObjectName("TopBar")
+        bar.setFixedHeight(78)
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(22, 12, 22, 12)
+        layout.setSpacing(18)
 
-        # Marca
-        brand_row = QHBoxLayout()
-        brand_row.setSpacing(0)
+        brand_box = QHBoxLayout()
+        brand_box.setSpacing(0)
         brand = QLabel("TGClass")
         brand.setObjectName("Brand")
         brand_accent = QLabel("Player")
         brand_accent.setObjectName("BrandAccent")
-        brand_row.addWidget(brand)
-        brand_row.addWidget(brand_accent)
-        brand_row.addStretch(1)
-        layout.addLayout(brand_row)
-        subtitle = QLabel("Seus cursos do Telegram, organizados")
-        subtitle.setObjectName("Muted2")
-        layout.addWidget(subtitle)
+        brand_box.addWidget(brand)
+        brand_box.addWidget(brand_accent)
+        layout.addLayout(brand_box)
 
-        layout.addSpacing(6)
+        # Curso/matéria atual + progresso geral.
+        center = QVBoxLayout()
+        center.setSpacing(3)
+        self.topbar_title = QLabel("Selecione um curso")
+        self.topbar_title.setObjectName("PageTitle")
+        center.addWidget(self.topbar_title)
+
+        prog_row = QHBoxLayout()
+        prog_row.setSpacing(10)
+        self.overall_progress = QProgressBar()
+        self.overall_progress.setTextVisible(True)
+        self.overall_progress.setFormat("%p% concluído")
+        self.overall_progress.setValue(0)
+        self.overall_progress.setFixedHeight(16)
+        prog_row.addWidget(self.overall_progress, 1)
+        self.overall_meta = QLabel("0/0 aulas · 0h")
+        self.overall_meta.setObjectName("Muted2")
+        prog_row.addWidget(self.overall_meta)
+        center.addLayout(prog_row)
+        layout.addLayout(center, 1)
+
+        # Status da conta.
         self.status_label = QLabel("Não conectado")
         self.status_label.setObjectName("StatusLabel")
         layout.addWidget(self.status_label)
 
-        self.login_btn = QPushButton("Conectar ao Telegram")
+        self.login_btn = QPushButton("Conectar")
         self.login_btn.setObjectName("PrimaryButton")
         self.login_btn.clicked.connect(self.open_login)
         layout.addWidget(self.login_btn)
 
-        self.add_courses_btn = QPushButton("+  Adicionar cursos")
-        self.add_courses_btn.clicked.connect(self.add_courses_from_telegram)
-        layout.addWidget(self.add_courses_btn)
+        self.theme_btn = QPushButton("🌙")
+        self.theme_btn.setObjectName("ThemeToggle")
+        self.theme_btn.setToolTip("Alternar tema claro/escuro")
+        self.theme_btn.clicked.connect(self.toggle_theme)
+        layout.addWidget(self.theme_btn)
 
-        layout.addSpacing(10)
+        return bar
+
+    # ---------------------------------------------------------------- aba "Aulas"
+    def _build_lessons_tab(self) -> QWidget:
+        page = QWidget()
+        outer = QHBoxLayout(page)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        outer.addWidget(self._build_sidebar())
+        outer.addWidget(self._build_center(), 1)
+        outer.addWidget(self._build_right())
+        return page
+
+    def _build_sidebar(self) -> QWidget:
+        sidebar = QWidget()
+        sidebar.setObjectName("Sidebar")
+        sidebar.setFixedWidth(300)
+        layout = QVBoxLayout(sidebar)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(10)
+
         section = QLabel("MEUS CURSOS")
         section.setObjectName("SectionTitle")
         layout.addWidget(section)
@@ -131,12 +194,26 @@ class MainWindow(QMainWindow):
         self.course_list.currentItemChanged.connect(self.on_course_selected)
         self.course_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.course_list.customContextMenuRequested.connect(self.show_course_menu)
-        layout.addWidget(self.course_list, 1)
+        layout.addWidget(self.course_list, 2)
 
-        self.refresh_btn = QPushButton("↻  Atualizar lista")
-        self.refresh_btn.setObjectName("GhostButton")
-        self.refresh_btn.clicked.connect(self.refresh_courses)
-        layout.addWidget(self.refresh_btn)
+        self.add_courses_btn = QPushButton("+  Adicionar cursos")
+        self.add_courses_btn.clicked.connect(self.add_courses_from_telegram)
+        layout.addWidget(self.add_courses_btn)
+
+        layout.addSpacing(6)
+        subj_section = QLabel("MATÉRIAS")
+        subj_section.setObjectName("SectionTitle")
+        layout.addWidget(subj_section)
+
+        self.subject_list = QListWidget()
+        self.subject_list.currentItemChanged.connect(self.on_subject_selected)
+        self.subject_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.subject_list.customContextMenuRequested.connect(self.show_subject_menu)
+        layout.addWidget(self.subject_list, 3)
+
+        self.edit_subjects_btn = QPushButton("✎  Editar matérias/sumários")
+        self.edit_subjects_btn.clicked.connect(self.edit_subjects)
+        layout.addWidget(self.edit_subjects_btn)
 
         return sidebar
 
@@ -144,16 +221,15 @@ class MainWindow(QMainWindow):
         center = QWidget()
         center.setObjectName("CenterPane")
         layout = QVBoxLayout(center)
-        layout.setContentsMargins(26, 24, 26, 22)
-        layout.setSpacing(14)
+        layout.setContentsMargins(22, 18, 22, 18)
+        layout.setSpacing(12)
 
-        # Cabeçalho do curso
         header = QHBoxLayout()
         head_col = QVBoxLayout()
-        head_col.setSpacing(4)
+        head_col.setSpacing(2)
         self.course_title = QLabel("Selecione um curso")
-        self.course_title.setObjectName("PageTitle")
-        self.course_meta = QLabel("Conecte-se ao Telegram e adicione seus grupos/canais como cursos.")
+        self.course_title.setObjectName("PanelTitle")
+        self.course_meta = QLabel("Conecte-se ao Telegram e adicione seus grupos/canais.")
         self.course_meta.setObjectName("Muted")
         self.course_meta.setWordWrap(True)
         head_col.addWidget(self.course_title)
@@ -163,51 +239,53 @@ class MainWindow(QMainWindow):
         self.sync_btn = QPushButton("⟳  Sincronizar")
         self.sync_btn.setObjectName("PrimaryButton")
         self.sync_btn.clicked.connect(self.sync_current_course)
-        self.summary_btn = QPushButton("✎  Editar sumário")
-        self.summary_btn.clicked.connect(self.edit_summary)
-        header.addWidget(self.summary_btn)
         header.addWidget(self.sync_btn)
         layout.addLayout(header)
 
-        # Barra de progresso do curso
-        self.course_progress = QProgressBar()
-        self.course_progress.setTextVisible(True)
-        self.course_progress.setFormat("%p% concluído")
-        self.course_progress.setValue(0)
-        layout.addWidget(self.course_progress)
-
-        # Busca + filtros
+        # Busca + filtros de status.
         search_row = QHBoxLayout()
+        search_row.setSpacing(8)
         self.search_box = QLineEdit()
         self.search_box.setPlaceholderText("🔍  Buscar aula, hashtag ou módulo...")
-        self.search_box.textChanged.connect(self.render_current_course)
+        self.search_box.textChanged.connect(self.render_lessons)
         search_row.addWidget(self.search_box, 1)
-        self.fav_filter_btn = QPushButton("★ Favoritas")
-        self.fav_filter_btn.setCheckable(True)
-        self.fav_filter_btn.toggled.connect(self.render_current_course)
-        search_row.addWidget(self.fav_filter_btn)
-        self.pending_filter_btn = QPushButton("Pendentes")
-        self.pending_filter_btn.setCheckable(True)
-        self.pending_filter_btn.toggled.connect(self.render_current_course)
-        search_row.addWidget(self.pending_filter_btn)
         layout.addLayout(search_row)
 
-        # Árvore de aulas
+        filter_row = QHBoxLayout()
+        filter_row.setSpacing(6)
+        self.filter_group = QButtonGroup(self)
+        self.filter_group.setExclusive(True)
+        for key, label in (
+            ("todas", "Todas"),
+            ("assistidas", "Assistidas"),
+            ("pendentes", "Pendentes"),
+            ("favoritas", "★ Favoritas"),
+        ):
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setProperty("filter_key", key)
+            if key == "todas":
+                btn.setChecked(True)
+            self.filter_group.addButton(btn)
+            filter_row.addWidget(btn)
+        self.filter_group.buttonClicked.connect(lambda _b: self.render_lessons())
+        filter_row.addStretch(1)
+        layout.addLayout(filter_row)
+
+        # Árvore: módulo -> aula -> tipo -> vídeos.
         self.video_tree = QTreeWidget()
-        self.video_tree.setHeaderLabels(["Aula / módulo", "Tags", "Duração", "Status"])
+        self.video_tree.setHeaderLabels(["Aula / módulo", "Tipo", "Duração", "Status"])
         self.video_tree.itemSelectionChanged.connect(self.on_video_selected)
-        self.video_tree.itemDoubleClicked.connect(self.on_tree_item_double_clicked)
+        self.video_tree.itemDoubleClicked.connect(self.on_tree_double_clicked)
         self.video_tree.setRootIsDecorated(True)
-        self.video_tree.setItemsExpandable(True)
         self.video_tree.setExpandsOnDoubleClick(False)
         self.video_tree.setAnimated(True)
-        self.video_tree.setIndentation(22)
+        self.video_tree.setIndentation(20)
         self.video_tree.setUniformRowHeights(False)
         self.video_tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.video_tree.customContextMenuRequested.connect(self.show_video_menu)
-        self.video_tree.header()
         self.video_tree.setColumnWidth(0, 560)
-        self.video_tree.setColumnWidth(1, 140)
+        self.video_tree.setColumnWidth(1, 120)
         self.video_tree.setColumnWidth(2, 90)
         layout.addWidget(self.video_tree, 1)
 
@@ -216,17 +294,15 @@ class MainWindow(QMainWindow):
     def _build_right(self) -> QWidget:
         right = QWidget()
         right.setObjectName("RightPane")
-        right.setMinimumWidth(330)
-        right.setMaximumWidth(440)
+        right.setFixedWidth(360)
         layout = QVBoxLayout(right)
-        layout.setContentsMargins(20, 24, 20, 20)
-        layout.setSpacing(14)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(12)
 
-        # Cartão da aula selecionada
         card = QFrame()
         card.setObjectName("HeroCard")
         card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(20, 20, 20, 20)
+        card_layout.setContentsMargins(18, 18, 18, 18)
         card_layout.setSpacing(8)
         label = QLabel("AULA SELECIONADA")
         label.setObjectName("SectionTitle")
@@ -247,7 +323,7 @@ class MainWindow(QMainWindow):
         self.resume_bar.hide()
         card_layout.addWidget(self.resume_bar)
 
-        card_layout.addSpacing(8)
+        card_layout.addSpacing(6)
         self.watch_btn = QPushButton("▶  Assistir agora")
         self.watch_btn.setObjectName("PrimaryButton")
         self.watch_btn.clicked.connect(self.watch_selected_internal)
@@ -266,14 +342,13 @@ class MainWindow(QMainWindow):
         self.edit_btn = QPushButton("✎ Editar")
         self.edit_btn.clicked.connect(self.edit_selected_video)
         self.mark_btn = QPushButton("✓ Assistida")
-        self.mark_btn.clicked.connect(self.mark_selected_watched)
+        self.mark_btn.clicked.connect(self.toggle_watched_selected)
         row2.addWidget(self.edit_btn)
         row2.addWidget(self.mark_btn)
         card_layout.addLayout(row2)
-
         layout.addWidget(card)
 
-        # Cartão "Como funciona"
+        # Cartão "como funciona".
         help_card = QFrame()
         help_card.setObjectName("CardSoft")
         h_layout = QVBoxLayout(help_card)
@@ -284,8 +359,8 @@ class MainWindow(QMainWindow):
         h_layout.addWidget(help_title)
         help_text = QLabel(
             "O app cria um link local (127.0.0.1) e carrega o vídeo por blocos, "
-            "sob demanda. A aula começa na hora, você pode pular para qualquer "
-            "ponto sem travar e o vídeo não fica salvo no computador."
+            "sob demanda. A aula começa na hora, você pula para qualquer ponto "
+            "sem travar e o vídeo não fica salvo no computador."
         )
         help_text.setObjectName("Muted")
         help_text.setWordWrap(True)
@@ -307,6 +382,9 @@ class MainWindow(QMainWindow):
         account.addAction(logout)
 
         tools = menubar.addMenu("Ferramentas")
+        theme_action = QAction("Alternar tema claro/escuro", self)
+        theme_action.triggered.connect(self.toggle_theme)
+        tools.addAction(theme_action)
         vlc_action = QAction("Configurar VLC...", self)
         vlc_action.triggered.connect(self.choose_vlc)
         tools.addAction(vlc_action)
@@ -322,6 +400,33 @@ class MainWindow(QMainWindow):
         about.triggered.connect(self.show_about)
         help_menu.addAction(about)
 
+    # ====================================================================== tema
+    def apply_theme(self, theme: str, persist: bool = True) -> None:
+        self.theme = "light" if theme == "light" else "dark"
+        app = QApplication.instance()
+        if app:
+            app.setStyleSheet(build_qss(self.theme))
+        self.theme_btn.setText("🌞" if self.theme == "dark" else "🌙")
+        try:
+            self.study_tab.apply_palette(palette(self.theme))
+        except Exception:  # noqa: BLE001
+            pass
+        if persist:
+            self.db.set_setting("theme", self.theme)
+        # Reaplica cores de itens pintados manualmente.
+        if self.current_course_id:
+            self.render_lessons()
+
+    def toggle_theme(self) -> None:
+        self.apply_theme("light" if self.theme == "dark" else "dark")
+
+    def _on_tab_changed(self, index: int) -> None:
+        if self.tabs.widget(index) is self.study_tab:
+            try:
+                self.study_tab.refresh()
+            except Exception:  # noqa: BLE001
+                pass
+
     # ============================================================ conexão Telegram
     def try_quick_connect(self) -> None:
         api_id = self.db.get_setting("api_id")
@@ -334,26 +439,29 @@ class MainWindow(QMainWindow):
                 "Telegram", "Verificando sessão salva...", self, timeout_ms=15000,
             )
             if result.get("authorized"):
-                me = result.get("me") or {}
-                self._set_connected(me)
+                self._set_connected(result.get("me") or {})
         except Exception:  # noqa: BLE001
             log.exception("Autoconexão falhou")
-            self.status_label.setText("Sessão ainda não conectada")
+            self.status_label.setText("Sessão não conectada")
 
     def _set_connected(self, me: dict[str, Any]) -> None:
-        name = me.get("first_name") or me.get("username") or "Conta conectada"
+        name = me.get("first_name") or me.get("username") or "Conectado"
         self.status_label.setText(f"●  {name}")
         self.status_label.setObjectName("StatusConnected")
-        self.status_label.setStyleSheet("")
-        self.status_label.style().unpolish(self.status_label)
-        self.status_label.style().polish(self.status_label)
-        self.login_btn.setText("Conta conectada ✓")
+        self._repolish(self.status_label)
+        self.login_btn.setText("Conectado ✓")
+
+    def _repolish(self, widget: QWidget) -> None:
+        widget.style().unpolish(widget)
+        widget.style().polish(widget)
 
     def open_login(self) -> None:
         dlg = LoginDialog(self.service, self.db, self)
         if dlg.exec() == QDialog.Accepted:
             try:
-                me = wait_future(self.service.call(self.service.get_me()), "Telegram", "Carregando conta...", self)
+                me = wait_future(
+                    self.service.call(self.service.get_me()), "Telegram", "Carregando conta...", self
+                )
                 self._set_connected(me or {})
                 QMessageBox.information(self, "Telegram", "Conta conectada com sucesso!")
             except Exception as exc:  # noqa: BLE001
@@ -368,9 +476,8 @@ class MainWindow(QMainWindow):
             pass
         self.status_label.setText("Não conectado")
         self.status_label.setObjectName("StatusLabel")
-        self.status_label.style().unpolish(self.status_label)
-        self.status_label.style().polish(self.status_label)
-        self.login_btn.setText("Conectar ao Telegram")
+        self._repolish(self.status_label)
+        self.login_btn.setText("Conectar")
 
     # =================================================================== cursos
     def add_courses_from_telegram(self) -> None:
@@ -403,16 +510,33 @@ class MainWindow(QMainWindow):
         for course in self.db.list_courses():
             videos = self.db.list_videos(course.id)
             watched = sum(1 for v in videos if v.watched_at)
-            label = course.title
+            kind = "🗂️ Fórum" if course.is_forum else (
+                "📢 Canal" if (course.chat_type or "").upper() == "CHANNEL" else "👥 Grupo"
+            )
             sub = f"{len(videos)} aulas · {watched} assistidas" if videos else "sem sincronizar"
-            item = QListWidgetItem(f"{label}\n{sub}")
+            item = QListWidgetItem(f"{course.title}\n{kind} · {sub}")
             item.setData(Qt.UserRole, course.id)
+            if course.color:
+                item.setForeground(QColor(course.color))
             self.course_list.addItem(item)
             if selected_id and course.id == selected_id:
                 self.course_list.setCurrentItem(item)
         self.course_list.blockSignals(False)
-        if selected_id:
-            self.render_current_course()
+        if selected_id and self.current_course_id == selected_id:
+            self.refresh_subjects()
+            self.render_lessons()
+
+    def on_course_selected(self, current: QListWidgetItem | None, _prev=None) -> None:
+        if not current:
+            self.current_course_id = None
+            return
+        self.current_course_id = int(current.data(Qt.UserRole))
+        self.current_subject_id = SUBJECT_ALL
+        self.refresh_subjects()
+        self.render_lessons()
+
+    def get_current_course(self) -> Course | None:
+        return self.db.get_course(self.current_course_id) if self.current_course_id else None
 
     def show_course_menu(self, pos) -> None:
         item = self.course_list.itemAt(pos)
@@ -421,19 +545,30 @@ class MainWindow(QMainWindow):
         course_id = int(item.data(Qt.UserRole))
         menu = QMenu(self)
         rename = menu.addAction("Renomear curso")
+        color = menu.addAction("Definir cor")
         sync = menu.addAction("Sincronizar")
-        summary = menu.addAction("Editar sumário")
+        subjects = menu.addAction("Editar matérias/sumários")
+        menu.addSeparator()
+        up = menu.addAction("↑ Mover para cima")
+        down = menu.addAction("↓ Mover para baixo")
         menu.addSeparator()
         delete = menu.addAction("Excluir curso")
         action = menu.exec(self.course_list.mapToGlobal(pos))
         if action == rename:
             self._rename_course(course_id)
+        elif action == color:
+            self._set_course_color(course_id)
         elif action == sync:
             self.current_course_id = course_id
             self.sync_current_course()
-        elif action == summary:
+        elif action == subjects:
             self.current_course_id = course_id
-            self.edit_summary()
+            self.refresh_subjects()
+            self.edit_subjects()
+        elif action == up:
+            self._move_course(course_id, -1)
+        elif action == down:
+            self._move_course(course_id, 1)
         elif action == delete:
             self._delete_course(course_id)
 
@@ -445,6 +580,28 @@ class MainWindow(QMainWindow):
         if ok and title.strip():
             self.db.rename_course(course_id, title.strip())
             self.refresh_courses()
+            if self.current_course_id == course_id:
+                self.render_lessons()
+
+    def _set_course_color(self, course_id: int) -> None:
+        from PySide6.QtWidgets import QColorDialog
+        course = self.db.get_course(course_id)
+        initial = QColor(course.color) if course and course.color else QColor("#7c5cff")
+        chosen = QColorDialog.getColor(initial, self, "Cor do curso")
+        if chosen.isValid():
+            self.db.set_course_color(course_id, chosen.name())
+            self.refresh_courses()
+
+    def _move_course(self, course_id: int, delta: int) -> None:
+        ids = [c.id for c in self.db.list_courses()]
+        if course_id not in ids:
+            return
+        idx = ids.index(course_id)
+        new = idx + delta
+        if 0 <= new < len(ids):
+            ids[idx], ids[new] = ids[new], ids[idx]
+            self.db.reorder_courses(ids)
+            self.refresh_courses()
 
     def _delete_course(self, course_id: int) -> None:
         course = self.db.get_course(course_id)
@@ -452,26 +609,20 @@ class MainWindow(QMainWindow):
             return
         if QMessageBox.question(
             self, "Excluir curso",
-            f"Excluir “{course.title}” e todas as aulas indexadas?\n(O conteúdo no Telegram não é afetado.)",
+            f"Excluir “{course.title}” e todas as aulas/matérias indexadas?\n"
+            "(O conteúdo no Telegram não é afetado.)",
         ) != QMessageBox.Yes:
             return
         self.db.delete_course(course_id)
         if self.current_course_id == course_id:
             self.current_course_id = None
+            self.current_subject_id = SUBJECT_ALL
+            self.subject_list.clear()
             self.video_tree.clear()
             self.course_title.setText("Selecione um curso")
             self.course_meta.setText("")
+            self._update_topbar(None)
         self.refresh_courses()
-
-    def on_course_selected(self, current: QListWidgetItem | None, previous: QListWidgetItem | None = None) -> None:
-        if not current:
-            self.current_course_id = None
-            return
-        self.current_course_id = int(current.data(Qt.UserRole))
-        self.render_current_course()
-
-    def get_current_course(self) -> Course | None:
-        return self.db.get_course(self.current_course_id) if self.current_course_id else None
 
     def sync_current_course(self) -> None:
         course = self.get_current_course()
@@ -488,138 +639,315 @@ class MainWindow(QMainWindow):
         try:
             result = wait_future(
                 self.service.call(self.service.sync_course(course.chat_id, limit=limit)),
-                "Sincronizando", "Buscando vídeos, hashtags e sumários no Telegram...", self,
+                "Sincronizando", "Detectando o tipo do chat e lendo aulas/sumários...", self,
             )
             course_id = self.db.upsert_course(result["chat"])
             self.current_course_id = course_id
-            self.db.update_course_summary(course_id, result.get("summary_text"), result.get("topics") or [])
-            self.db.replace_videos(course_id, result.get("videos") or [])
+            self._apply_sync_result(course_id, result)
             self.refresh_courses()
-            self.render_current_course()
+            self.refresh_subjects()
+            self.render_lessons()
+            detected = {
+                "forum": "Fórum (cada tópico virou uma matéria)",
+                "channel": "Canal (lista linear de aulas)",
+                "group": "Grupo (matéria única)",
+            }.get(result.get("detected", ""), result.get("detected", ""))
             QMessageBox.information(
                 self, "Sincronizado",
-                f"{len(result.get('videos') or [])} vídeo(s) encontrados em "
+                f"Tipo detectado: {detected}.\n"
+                f"{len(result.get('videos') or [])} vídeo(s) em "
                 f"{result.get('scanned')} mensagens analisadas.",
             )
         except Exception as exc:  # noqa: BLE001
             log.exception("Erro ao sincronizar curso")
             QMessageBox.critical(self, "Erro ao sincronizar", f"{exc}")
 
-    # =========================================================== render da árvore
-    def render_current_course(self) -> None:
+    def _apply_sync_result(self, course_id: int, result: dict[str, Any]) -> None:
+        """Cria/atualiza matérias e liga cada vídeo à sua matéria, preservando edições."""
+        # 1) Matérias (subjects). Mapa telegram_topic_id -> subject_id.
+        topic_to_subject: dict[str, int] = {}
+        for s in result.get("subjects") or []:
+            tg_id = str(s.get("telegram_topic_id") or "")
+            subject_id = self.db.find_or_create_subject(
+                course_id,
+                s.get("title") or "Matéria",
+                telegram_topic_id=tg_id or None,
+                summary_text=s.get("summary_text") or "",
+                manual=0,
+            )
+            # Atualiza o sumário vindo do Telegram apenas se a matéria não tiver
+            # sido editada manualmente pelo usuário.
+            existing = self.db.get_subject(subject_id)
+            if existing and not existing.manual and s.get("summary_text"):
+                self.db.update_subject_summary(subject_id, s.get("summary_text"))
+            topic_to_subject[tg_id] = subject_id
+
+        # 2) Vídeos: resolve subject_id pelo telegram_topic_id de cada vídeo.
+        videos = []
+        for v in result.get("videos") or []:
+            tg_id = str(v.get("telegram_topic_id") or "general")
+            v = dict(v)
+            v["subject_id"] = topic_to_subject.get(tg_id)
+            videos.append(v)
+        self.db.replace_videos(course_id, videos)
+
+    # ================================================================ matérias
+    def refresh_subjects(self) -> None:
+        self.subject_list.blockSignals(True)
+        self.subject_list.clear()
+        course = self.get_current_course()
+        if not course:
+            self.subject_list.blockSignals(False)
+            return
+        subjects = self.db.list_subjects(course.id)
+        videos = self.db.list_videos(course.id)
+
+        all_item = QListWidgetItem(f"📚  Todas as matérias  ·  {len(videos)} aulas")
+        all_item.setData(Qt.UserRole, SUBJECT_ALL)
+        self.subject_list.addItem(all_item)
+
+        for subject in subjects:
+            count = sum(1 for v in videos if v.subject_id == subject.id)
+            watched = sum(1 for v in videos if v.subject_id == subject.id and v.watched_at)
+            item = QListWidgetItem(f"{subject.title}\n{count} aulas · {watched} assistidas")
+            item.setData(Qt.UserRole, subject.id)
+            self.subject_list.addItem(item)
+
+        no_subject = sum(1 for v in videos if not v.subject_id)
+        if no_subject:
+            item = QListWidgetItem(f"❔  Sem matéria  ·  {no_subject} aulas")
+            item.setData(Qt.UserRole, SUBJECT_NONE)
+            self.subject_list.addItem(item)
+
+        # Restaura seleção.
+        target = self.current_subject_id
+        for i in range(self.subject_list.count()):
+            if int(self.subject_list.item(i).data(Qt.UserRole)) == target:
+                self.subject_list.setCurrentRow(i)
+                break
+        else:
+            self.subject_list.setCurrentRow(0)
+            self.current_subject_id = SUBJECT_ALL
+        self.subject_list.blockSignals(False)
+
+    def on_subject_selected(self, current: QListWidgetItem | None, _prev=None) -> None:
+        if not current:
+            return
+        self.current_subject_id = int(current.data(Qt.UserRole))
+        self.render_lessons()
+
+    def show_subject_menu(self, pos) -> None:
+        item = self.subject_list.itemAt(pos)
+        course = self.get_current_course()
+        if not course:
+            return
+        menu = QMenu(self)
+        new = menu.addAction("+ Nova matéria")
+        sid = int(item.data(Qt.UserRole)) if item else None
+        rename = edit_summary = up = down = delete = None
+        if sid and sid > 0:
+            rename = menu.addAction("Renomear matéria")
+            edit_summary = menu.addAction("Editar sumário")
+            menu.addSeparator()
+            up = menu.addAction("↑ Mover para cima")
+            down = menu.addAction("↓ Mover para baixo")
+            menu.addSeparator()
+            delete = menu.addAction("Excluir matéria")
+        action = menu.exec(self.subject_list.mapToGlobal(pos))
+        if action == new:
+            self._add_subject(course.id)
+        elif action and action == rename:
+            self._rename_subject(sid)
+        elif action and action == edit_summary:
+            self.edit_subjects()
+        elif action and action == up:
+            self._move_subject(course.id, sid, -1)
+        elif action and action == down:
+            self._move_subject(course.id, sid, 1)
+        elif action and action == delete:
+            self._delete_subject(sid)
+
+    def _add_subject(self, course_id: int) -> None:
+        title, ok = QInputDialog.getText(self, "Nova matéria", "Nome da matéria:")
+        if ok and title.strip():
+            self.db.add_subject(course_id, title.strip(), manual=1)
+            self.refresh_subjects()
+
+    def _rename_subject(self, subject_id: int) -> None:
+        subject = self.db.get_subject(subject_id)
+        if not subject:
+            return
+        title, ok = QInputDialog.getText(
+            self, "Renomear matéria", "Novo nome:", text=subject.title
+        )
+        if ok and title.strip():
+            self.db.rename_subject(subject_id, title.strip())
+            self.refresh_subjects()
+            self.render_lessons()
+
+    def _move_subject(self, course_id: int, subject_id: int, delta: int) -> None:
+        ids = [s.id for s in self.db.list_subjects(course_id)]
+        if subject_id not in ids:
+            return
+        idx = ids.index(subject_id)
+        new = idx + delta
+        if 0 <= new < len(ids):
+            ids[idx], ids[new] = ids[new], ids[idx]
+            self.db.reorder_subjects(ids)
+            self.refresh_subjects()
+
+    def _delete_subject(self, subject_id: int) -> None:
+        subject = self.db.get_subject(subject_id)
+        if not subject:
+            return
+        if QMessageBox.question(
+            self, "Excluir matéria",
+            f"Excluir a matéria “{subject.title}”?\n"
+            "As aulas dela ficam como “Sem matéria” (não são apagadas).",
+        ) != QMessageBox.Yes:
+            return
+        self.db.delete_subject(subject_id)
+        if self.current_subject_id == subject_id:
+            self.current_subject_id = SUBJECT_ALL
+        self.refresh_subjects()
+        self.render_lessons()
+
+    def edit_subjects(self) -> None:
+        course = self.get_current_course()
+        if not course:
+            QMessageBox.information(self, "Curso", "Selecione um curso primeiro.")
+            return
+        subjects = self.db.list_subjects(course.id)
+        dlg = SubjectsEditorDialog(subjects, self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        edited, deleted_ids = dlg.result()
+        for sid in deleted_ids:
+            self.db.delete_subject(int(sid))
+        order_ids: list[int] = []
+        for s in edited:
+            if s.get("id"):
+                sid = int(s["id"])
+                self.db.rename_subject(sid, s.get("title") or "Matéria")
+                self.db.update_subject_summary(sid, s.get("summary_text") or "")
+            else:
+                sid = self.db.add_subject(
+                    course.id, s.get("title") or "Matéria",
+                    summary_text=s.get("summary_text") or "", manual=1,
+                )
+            order_ids.append(sid)
+        if order_ids:
+            self.db.reorder_subjects(order_ids)
+        self.refresh_subjects()
+        self.render_lessons()
+
+    # ============================================================ render das aulas
+    def _filter_key(self) -> str:
+        btn = self.filter_group.checkedButton()
+        return btn.property("filter_key") if btn else "todas"
+
+    def _update_topbar(self, course: Course | None) -> None:
+        if not course:
+            self.topbar_title.setText("Selecione um curso")
+            self.overall_progress.setValue(0)
+            self.overall_meta.setText("0/0 aulas · 0h")
+            return
+        videos = self.db.list_videos(course.id)
+        watched = sum(1 for v in videos if v.watched_at)
+        total = len(videos)
+        pct = int((watched / total) * 100) if total else 0
+        total_seconds = sum(int(v.duration or 0) for v in videos)
+        watched_seconds = sum(int(v.duration or 0) for v in videos if v.watched_at)
+        subject_name = ""
+        if self.current_subject_id and self.current_subject_id > 0:
+            subj = self.db.get_subject(self.current_subject_id)
+            if subj:
+                subject_name = f"  ›  {subj.title}"
+        self.topbar_title.setText(f"{course.title}{subject_name}")
+        self.overall_progress.setValue(pct)
+        self.overall_meta.setText(
+            f"{watched}/{total} aulas · "
+            f"{human_duration(watched_seconds)} / {human_duration(total_seconds)}"
+        )
+
+    def _video_passes(self, video: Video, query: str, filter_key: str) -> bool:
+        if filter_key == "assistidas" and not video.watched_at:
+            return False
+        if filter_key == "pendentes" and video.watched_at:
+            return False
+        if filter_key == "favoritas" and not video.favorite:
+            return False
+        if query and not self._video_matches(video, query):
+            return False
+        return True
+
+    def _video_matches(self, video: Video, query: str) -> bool:
+        hay = " ".join(
+            [
+                video.title, video.file_name, video.caption or "",
+                " ".join(video.hashtags), video.module or "", video.lesson or "",
+                video.type or "", video.note or "",
+            ]
+        ).lower()
+        return query in hay
+
+    def render_lessons(self) -> None:
         course = self.get_current_course()
         self.video_tree.clear()
         self.current_video_id = None
+        self._clear_detail()
+        self._update_topbar(course)
         if not course:
-            self.course_progress.setValue(0)
+            self.course_title.setText("Selecione um curso")
+            self.course_meta.setText("Conecte-se ao Telegram e adicione seus grupos/canais.")
             return
+
         videos = self.db.list_videos(course.id)
-        topics = course.topics()
+        subjects = self.db.list_subjects(course.id)
         query = self.search_box.text().strip().lower()
-        only_fav = self.fav_filter_btn.isChecked()
-        only_pending = self.pending_filter_btn.isChecked()
+        filter_key = self._filter_key()
 
         watched = sum(1 for v in videos if v.watched_at)
-        total_size = sum(int(v.size or 0) for v in videos)
-        total_duration = sum(int(v.duration or 0) for v in videos)
         self.course_title.setText(course.title)
         self.course_meta.setText(
-            f"{len(videos)} aulas  ·  {len(topics)} sumários  ·  {watched} assistidas  ·  "
-            f"{human_size(total_size)}  ·  {human_duration(total_duration)}  ·  "
+            f"{len(videos)} aulas · {len(subjects)} matérias · {watched} assistidas · "
             f"último sync: {self._fmt_date(course.last_sync)}"
         )
-        pct = int((watched / len(videos)) * 100) if videos else 0
-        self.course_progress.setValue(pct)
 
-        def passes(video: Video) -> bool:
-            if only_fav and not video.favorite:
-                return False
-            if only_pending and video.watched_at:
-                return False
-            if query and not self.video_matches(video, query):
-                return False
-            return True
+        # Decide quais matérias mostrar conforme seleção da barra de matérias.
+        if self.current_subject_id == SUBJECT_ALL:
+            visible_subjects = subjects
+            show_no_subject = True
+        elif self.current_subject_id == SUBJECT_NONE:
+            visible_subjects = []
+            show_no_subject = True
+        else:
+            visible_subjects = [s for s in subjects if s.id == self.current_subject_id]
+            show_no_subject = False
 
-        tag_map: dict[str, Video] = {}
-        for video in videos:
-            for tag in video.hashtags:
-                tag_map.setdefault(tag.upper(), video)
-
-        shown: set[int] = set()
         has_any = False
+        single_subject = len(visible_subjects) == 1 and not show_no_subject
 
-        if topics:
-            for idx, topic in enumerate(topics):
-                topic_title = str(topic.get("title") or "Sumário")
-                summary_text = topic.get("summary_text") or ""
-                topic_tags = topic.get("tags") or []
-                telegram_topic_id = str(topic.get("telegram_topic_id") or topic.get("id") or "general")
-                topic_item = QTreeWidgetItem([
-                    f"📚  {topic_title}",
-                    f"{len(topic_tags)} tags" if topic_tags else "",
-                    "", "sumário",
-                ])
-                topic_item.setData(0, ROLE_NODE_TYPE, "topic")
-                topic_item.setData(0, ROLE_TOPIC, topic_title)
-                self._style_folder(topic_item)
-                topic_item.setExpanded(idx == 0)
+        for subject in visible_subjects:
+            subject_videos = [v for v in videos if v.subject_id == subject.id]
+            added = self._render_subject(
+                subject, subject_videos, query, filter_key, as_root=single_subject
+            )
+            has_any = has_any or added
 
-                before = topic_item.childCount()
-                menu_root = parse_menu(summary_text)
-                any_visible = False
-                for node in menu_root.children:
-                    if self.add_menu_node(topic_item, node, tag_map, shown, passes):
-                        any_visible = True
-
-                topic_unmatched = []
-                if telegram_topic_id != "general":
-                    topic_unmatched = [
-                        v for v in videos
-                        if v.id not in shown and str(v.topic_id or "general") == telegram_topic_id
-                    ]
-                # também agrupa por topic_title editado manualmente
-                topic_unmatched += [
-                    v for v in videos
-                    if v.id not in shown and (v.topic_title or "") == topic_title and v not in topic_unmatched
+        if show_no_subject:
+            no_subject_videos = [v for v in videos if not v.subject_id]
+            if no_subject_videos:
+                filtered = [
+                    v for v in no_subject_videos if self._video_passes(v, query, filter_key)
                 ]
-                added_unmatched = self.add_video_group(
-                    topic_item, "Outras aulas deste tópico", topic_unmatched, shown, passes,
-                )
-                any_visible = any_visible or added_unmatched or topic_item.childCount() > before
-
-                if any_visible or (not query and not only_fav and not only_pending and summary_text):
-                    self.video_tree.addTopLevelItem(topic_item)
+                if filtered:
+                    parent = self._make_folder("❔  Sem matéria", "matéria")
+                    for v in sorted(filtered, key=lambda x: x.message_id):
+                        parent.addChild(self._video_item(v))
+                    self.video_tree.addTopLevelItem(parent)
+                    parent.setExpanded(True)
                     has_any = True
-
-        if not topics and course.summary_text:
-            menu_root = parse_menu(course.summary_text)
-            if count_tags(menu_root) > 0 or menu_root.children:
-                for node in menu_root.children:
-                    if self.add_menu_node(self.video_tree, node, tag_map, shown, passes):
-                        has_any = True
-
-        other_videos = [v for v in videos if v.id not in shown and passes(v)]
-        if other_videos:
-            parent = QTreeWidgetItem(["Outras videoaulas", "", "", "não indexadas"])
-            parent.setData(0, ROLE_NODE_TYPE, "folder")
-            self._style_folder(parent)
-            parent.setExpanded(not has_any)
-            grouped: dict[str, list[Video]] = {}
-            for video in other_videos:
-                key = video.topic_title or "Sem tópico"
-                grouped.setdefault(key, []).append(video)
-            added = False
-            for title in sorted(grouped, key=lambda x: x.lower()):
-                group_item = QTreeWidgetItem([title, "", "", "tópico"])
-                group_item.setData(0, ROLE_NODE_TYPE, "folder")
-                self._style_folder(group_item)
-                group_item.setExpanded(False)
-                if self.add_video_group(group_item, "", grouped[title], shown, passes, direct=True):
-                    parent.addChild(group_item)
-                    added = True
-            if added:
-                self.video_tree.addTopLevelItem(parent)
-                has_any = True
 
         if not has_any:
             placeholder = QTreeWidgetItem(
@@ -627,86 +955,135 @@ class MainWindow(QMainWindow):
                  "Clique em Sincronizar" if not videos else "Ajuste a busca/filtros"]
             )
             self.video_tree.addTopLevelItem(placeholder)
-        self.video_tree.expandToDepth(0)
+        self.video_tree.expandToDepth(0 if not single_subject else 2)
+
+    def _render_subject(
+        self, subject: Subject, subject_videos: list[Video], query: str,
+        filter_key: str, as_root: bool = False,
+    ) -> bool:
+        """Renderiza uma matéria: árvore módulo->aula->tipo + 'Sem módulo'."""
+        result = match_videos_to_tree(subject.summary_text, subject_videos, subject.title)
+        matched_ids = result.matched_ids
+
+        # Índice tag -> vídeo (primeiro com a hashtag) para casar nós do sumário.
+        tag_map: dict[str, Video] = {}
+        for v in subject_videos:
+            for tag in v.hashtags:
+                tag_map.setdefault("#" + tag.lstrip("#").upper(), v)
+
+        shown: set[int] = set()
+
+        if as_root:
+            subject_root = self.video_tree
+        else:
+            subject_root = self._make_folder(f"📘  {subject.title}", "matéria")
+
+        any_visible = False
+        for node in result.tree.children:
+            if self._add_menu_node(subject_root, node, tag_map, shown, query, filter_key):
+                any_visible = True
+
+        # Vídeos da matéria que não casaram com o sumário -> "Sem módulo".
+        leftover = [
+            v for v in subject_videos
+            if v.id not in shown and v.id not in matched_ids
+            and self._video_passes(v, query, filter_key)
+        ]
+        # Também inclui vídeos casados por tag mas cujo nó não os exibiu (raro).
+        leftover += [
+            v for v in subject_videos
+            if v.id not in shown and v.id in matched_ids
+            and self._video_passes(v, query, filter_key)
+        ]
+        if leftover:
+            folder = self._make_folder("Sem módulo", "módulo")
+            for v in sorted(leftover, key=lambda x: x.message_id):
+                folder.addChild(self._video_item(v))
+                shown.add(v.id)
+            if isinstance(subject_root, QTreeWidget):
+                subject_root.addTopLevelItem(folder)
+            else:
+                subject_root.addChild(folder)
+            any_visible = True
+
+        if as_root:
+            return any_visible
+
+        if any_visible:
+            self.video_tree.addTopLevelItem(subject_root)
+            subject_root.setExpanded(True)
+            return True
+        return False
+
+    def _add_menu_node(
+        self, parent, node, tag_map: dict[str, Video], shown: set[int],
+        query: str, filter_key: str,
+    ) -> bool:
+        item = self._make_folder(node.title, self._level_name(node.level))
+        any_visible = False
+        for child in node.children:
+            if self._add_menu_node(item, child, tag_map, shown, query, filter_key):
+                any_visible = True
+        for tag in node.tags:
+            video = tag_map.get("#" + tag.lstrip("#").upper())
+            if video and video.id not in shown and self._video_passes(video, query, filter_key):
+                item.addChild(self._video_item(video, prefix=tag))
+                shown.add(video.id)
+                any_visible = True
+        if any_visible:
+            if isinstance(parent, QTreeWidget):
+                parent.addTopLevelItem(item)
+            else:
+                parent.addChild(item)
+            return True
+        return False
+
+    @staticmethod
+    def _level_name(level: int) -> str:
+        return {1: "módulo", 2: "aula", 3: "tipo"}.get(level, "módulo")
+
+    def _make_folder(self, title: str, kind: str) -> QTreeWidgetItem:
+        item = QTreeWidgetItem([title, "", "", kind])
+        item.setData(0, ROLE_NODE_TYPE, "folder")
+        font = item.font(0)
+        font.setBold(True)
+        item.setFont(0, font)
+        item.setForeground(0, QColor(palette(self.theme)["text"]))
+        item.setExpanded(False)
+        return item
+
+    def _video_item(self, video: Video, prefix: str | None = None) -> QTreeWidgetItem:
+        star = "★ " if video.favorite else ""
+        check = "✅ " if video.watched_at else "⬜ "
+        title = f"{check}{star}{prefix} — {video.title}" if prefix else f"{check}{star}{video.title}"
+        if video.watched_at:
+            status = "assistida"
+        elif video.progress and video.progress > 0.02:
+            status = f"▶ {int(video.progress * 100)}%"
+        else:
+            status = "pendente"
+        item = QTreeWidgetItem(
+            [title, video.type or "", human_duration(video.duration), status]
+        )
+        item.setData(0, ROLE_VIDEO_ID, video.id)
+        if video.watched_at:
+            item.setForeground(0, QColor(palette(self.theme)["muted"]))
+        return item
 
     def _fmt_date(self, iso: str | None) -> str:
         if not iso:
             return "nunca"
         return iso.replace("T", " ")[:16]
 
-    def _style_folder(self, item: QTreeWidgetItem) -> None:
-        font = item.font(0)
-        font.setBold(True)
-        item.setFont(0, font)
-        item.setForeground(0, QColor(COLORS["text"]))
+    # ================================================== seleção / detalhe da aula
+    def _clear_detail(self) -> None:
+        self.video_title.setText("Nenhuma aula selecionada")
+        self.video_info.setText("Clique em uma aula para ver os detalhes e assistir.")
+        self.resume_bar.hide()
+        self.fav_btn.setText("★ Favorito")
+        self.mark_btn.setText("✓ Assistida")
 
-    def add_video_group(self, parent_item, group_title, videos, shown, passes, direct=False) -> bool:
-        container = parent_item if direct or not group_title else QTreeWidgetItem([group_title, "", "", "módulo"])
-        if container is not parent_item:
-            container.setData(0, ROLE_NODE_TYPE, "folder")
-            self._style_folder(container)
-        added = False
-        for video in videos:
-            if not passes(video):
-                continue
-            container.addChild(self.video_item(video))
-            shown.add(video.id)
-            added = True
-        if added and container is not parent_item:
-            parent_item.addChild(container)
-        return added
-
-    def add_menu_node(self, parent_widget_or_item, node, tag_map, shown, passes) -> bool:
-        item = QTreeWidgetItem([node.title, "", "", "módulo"])
-        item.setData(0, ROLE_NODE_TYPE, "folder")
-        self._style_folder(item)
-        item.setExpanded(False)
-        any_visible = False
-        for child in node.children:
-            if self.add_menu_node(item, child, tag_map, shown, passes):
-                any_visible = True
-        for tag in node.tags:
-            video = tag_map.get(tag.upper())
-            if video:
-                if not passes(video):
-                    continue
-                child_item = self.video_item(video, prefix=tag)
-                item.addChild(child_item)
-                shown.add(video.id)
-                any_visible = True
-        if any_visible:
-            if isinstance(parent_widget_or_item, QTreeWidget):
-                parent_widget_or_item.addTopLevelItem(item)
-            else:
-                parent_widget_or_item.addChild(item)
-            return True
-        return False
-
-    def video_item(self, video: Video, prefix: str | None = None) -> QTreeWidgetItem:
-        star = "★ " if video.favorite else ""
-        title = f"{star}{prefix}  —  {video.title}" if prefix else f"{star}{video.title}"
-        tags = " ".join(video.hashtags[:3])
-        if video.watched_at:
-            status = "✓ assistida"
-        elif video.progress and video.progress > 0.02:
-            status = f"▶ {int(video.progress * 100)}%"
-        else:
-            status = "pendente"
-        item = QTreeWidgetItem([title, tags, human_duration(video.duration), status])
-        item.setData(0, ROLE_VIDEO_ID, video.id)
-        if video.watched_at:
-            item.setForeground(0, QColor(COLORS["muted"]))
-        return item
-
-    def video_matches(self, video: Video, query: str) -> bool:
-        hay = " ".join(
-            [video.title, video.file_name, video.caption or "", " ".join(video.hashtags),
-             video.topic_title or "", video.note or ""]
-        ).lower()
-        return query in hay
-
-    # ================================================== seleção / detalhes da aula
-    def on_tree_item_double_clicked(self, item: QTreeWidgetItem, column: int) -> None:
+    def on_tree_double_clicked(self, item: QTreeWidgetItem, _column: int) -> None:
         video_id = item.data(0, ROLE_VIDEO_ID)
         if video_id:
             self.current_video_id = int(video_id)
@@ -723,11 +1100,10 @@ class MainWindow(QMainWindow):
         video_id = item.data(0, ROLE_VIDEO_ID)
         if not video_id:
             self.current_video_id = None
-            self.video_title.setText(item.text(0).replace("📚  ", ""))
-            children = item.childCount()
+            self.video_title.setText(item.text(0))
             self.video_info.setText(
-                f"Módulo/tópico selecionado · {children} item(ns). "
-                "Clique na seta para abrir/fechar ou escolha uma aula."
+                f"Pasta/agrupamento · {item.childCount()} item(ns). "
+                "Escolha uma aula para ver detalhes."
             )
             self.resume_bar.hide()
             return
@@ -737,21 +1113,32 @@ class MainWindow(QMainWindow):
             return
         self.video_title.setText(("★ " if video.favorite else "") + video.title)
         tags = " ".join(video.hashtags) or "sem hashtags"
-        status = "Assistida" if video.watched_at else (
-            f"{int(video.progress*100)}% assistido" if video.progress > 0.02 else "Não assistida"
-        )
-        note = f"\nAnotação: {video.note}" if video.note else ""
-        self.video_info.setText(
-            f"{human_size(video.size)} · {human_duration(video.duration)} · {status}\n"
-            f"Tópico: {video.topic_title or 'Geral'}\n"
-            f"Tags: {tags}{note}"
-        )
+        if video.watched_at:
+            status = "Assistida"
+        elif video.progress > 0.02:
+            status = f"{int(video.progress * 100)}% assistido"
+        else:
+            status = "Não assistida"
+        subject = self.db.get_subject(video.subject_id) if video.subject_id else None
+        parts = [
+            f"{human_size(video.size)} · {human_duration(video.duration)} · {status}",
+            f"Matéria: {subject.title if subject else 'Sem matéria'}",
+        ]
+        if video.module:
+            parts.append(f"Módulo: {video.module}")
+        if video.type:
+            parts.append(f"Tipo: {video.type}")
+        parts.append(f"Tags: {tags}")
+        if video.note:
+            parts.append(f"Anotação: {video.note}")
+        self.video_info.setText("\n".join(parts))
         if video.progress and 0.02 < video.progress < 0.95:
             self.resume_bar.setValue(int(video.progress * 100))
             self.resume_bar.show()
         else:
             self.resume_bar.hide()
-        self.fav_btn.setText("★ Favorito" if not video.favorite else "☆ Remover favorito")
+        self.fav_btn.setText("☆ Remover favorito" if video.favorite else "★ Favorito")
+        self.mark_btn.setText("↩ Não assistida" if video.watched_at else "✓ Assistida")
 
     def selected_video(self) -> Video | None:
         if not self.current_video_id:
@@ -776,10 +1163,9 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         edit = menu.addAction("✎ Editar aula")
         fav = menu.addAction("☆ Remover favorito" if video.favorite else "★ Favoritar")
-        if video.watched_at:
-            mark = menu.addAction("Marcar como NÃO assistida")
-        else:
-            mark = menu.addAction("✓ Marcar como assistida")
+        mark = menu.addAction(
+            "Marcar como NÃO assistida" if video.watched_at else "✓ Marcar como assistida"
+        )
         copy = menu.addAction("Copiar link temporário")
         menu.addSeparator()
         delete = menu.addAction("Remover da lista")
@@ -793,18 +1179,17 @@ class MainWindow(QMainWindow):
         elif action == fav:
             self.toggle_favorite_selected()
         elif action == mark:
-            if video.watched_at:
-                self.db.mark_unwatched(video.id)
-            else:
-                self.db.mark_watched(video.id)
-            self.render_current_course()
-            self.refresh_courses()
+            self.toggle_watched_selected()
         elif action == copy:
             self.copy_stream_url()
         elif action == delete:
             self.db.delete_video(video.id)
-            self.render_current_course()
-            self.refresh_courses()
+            self._refresh_after_change()
+
+    def _refresh_after_change(self) -> None:
+        self.render_lessons()
+        self.refresh_courses()
+        self.refresh_subjects()
 
     # =================================================================== edições
     def edit_selected_video(self) -> None:
@@ -812,44 +1197,43 @@ class MainWindow(QMainWindow):
         if not video:
             return
         course = self.get_current_course()
-        topics = course.topics() if course else []
-        dlg = EditVideoDialog(video, topics, self)
+        subjects = self.db.list_subjects(course.id) if course else []
+        dlg = EditVideoDialog(video, subjects, self)
         if dlg.exec() != QDialog.Accepted:
             return
         values = dlg.values()
         self.db.rename_video(video.id, values["title"])
-        self.db.set_video_topic(video.id, video.topic_id, values["topic_title"])
+        self.db.set_video_subject(video.id, values["subject_id"])
+        self.db.set_video_meta(
+            video.id, values["module"], values["lesson"], values["type"]
+        )
         self.db.set_video_hashtags(video.id, values["hashtags"])
         self.db.set_video_note(video.id, values["note"])
-        self.render_current_course()
-        self.on_video_selected()
+        self._refresh_after_change()
+        self._reselect_video(video.id)
 
-    def edit_summary(self) -> None:
-        course = self.get_current_course()
-        if not course:
-            QMessageBox.information(self, "Curso", "Selecione um curso primeiro.")
-            return
-        dlg = SummaryEditorDialog(course.topics(), self)
-        if dlg.exec() != QDialog.Accepted:
-            return
-        self.db.set_course_topics(course.id, dlg.result_topics())
-        self.render_current_course()
+    def _reselect_video(self, video_id: int) -> None:
+        self.current_video_id = video_id
+        self.on_video_selected()
 
     def toggle_favorite_selected(self) -> None:
         video = self.selected_video()
         if not video:
             return
         self.db.toggle_favorite(video.id)
-        self.render_current_course()
-        self.on_video_selected()
+        self.render_lessons()
+        self._reselect_video(video.id)
 
-    def mark_selected_watched(self) -> None:
+    def toggle_watched_selected(self) -> None:
         video = self.selected_video()
         if not video:
             return
-        self.db.mark_watched(video.id)
-        self.render_current_course()
-        self.refresh_courses()
+        if video.watched_at:
+            self.db.mark_unwatched(video.id)
+        else:
+            self.db.mark_watched(video.id)
+        self._refresh_after_change()
+        self._reselect_video(video.id)
 
     # =================================================================== player
     def _stream_payload(self, video: Video) -> dict[str, Any]:
@@ -860,12 +1244,10 @@ class MainWindow(QMainWindow):
             "file_name": video.file_name,
             "mime_type": video.mime_type,
             "size": video.size,
+            "start_position_ms": video.position_ms,
         }
 
-    def prepare_stream_for_selected(self) -> dict[str, Any] | None:
-        video = self.selected_video()
-        if not video:
-            return None
+    def _prepare_stream(self, video: Video) -> dict[str, Any] | None:
         result = wait_future(
             self.service.call(self.service.prepare_stream(self._stream_payload(video))),
             "Streaming", "Preparando o link local para o player...", self,
@@ -877,8 +1259,8 @@ class MainWindow(QMainWindow):
         if not video:
             return
         try:
-            stream = self.prepare_stream_for_selected()
-            if not stream or not stream.get("url"):
+            stream = self._prepare_stream(video)
+            if not stream:
                 return
             video_id = video.id
 
@@ -888,22 +1270,31 @@ class MainWindow(QMainWindow):
                 except Exception:  # noqa: BLE001
                     pass
 
+            def open_vlc() -> None:
+                self._launch_vlc(stream.get("stream_url") or stream.get("url"))
+
             try:
                 dlg = VideoPlayerDialog(
-                    video.title, stream.get("url"), stream.get("token"), self.service,
-                    start_position_ms=video.position_ms, on_progress=save_progress, parent=self,
+                    video.title,
+                    stream.get("stream_url") or stream.get("url"),
+                    stream.get("token"),
+                    self.service,
+                    start_position_ms=video.position_ms,
+                    on_progress=save_progress,
+                    on_open_vlc=open_vlc,
+                    player_url=stream.get("player_url"),
+                    parent=self,
                 )
             except Exception as exc:  # noqa: BLE001
-                answer = QMessageBox.question(
+                if QMessageBox.question(
                     self, "Player indisponível",
                     f"Não consegui abrir o player interno ({exc}). Deseja tentar o VLC?",
-                )
-                if answer == QMessageBox.Yes:
+                ) == QMessageBox.Yes:
                     self.watch_selected_vlc()
                 return
             dlg.exec()
-            self.render_current_course()
-            self.refresh_courses()
+            self._refresh_after_change()
+            self._reselect_video(video_id)
         except Exception as exc:  # noqa: BLE001
             log.exception("Erro ao assistir no player interno")
             QMessageBox.critical(self, "Erro no streaming", f"{exc}")
@@ -913,31 +1304,36 @@ class MainWindow(QMainWindow):
         if not video:
             return
         try:
-            stream = self.prepare_stream_for_selected()
-            if not stream or not stream.get("url"):
+            stream = self._prepare_stream(video)
+            if not stream:
                 return
-            url = stream.get("url")
-            vlc_path = find_vlc(self.db.get_setting("vlc_path"))
-            if not vlc_path:
-                answer = QMessageBox.question(
-                    self, "VLC não encontrado",
-                    "Não encontrei o VLC. Deseja abrir a página oficial para instalar?",
-                )
-                if answer == QMessageBox.Yes:
-                    open_vlc_download_page()
-                return
-            launch_vlc(vlc_path, url)
+            self._launch_vlc(stream.get("stream_url") or stream.get("url"))
             self.db.mark_watched(video.id)
-            self.render_current_course()
-            self.refresh_courses()
+            self._refresh_after_change()
         except Exception as exc:  # noqa: BLE001
             log.exception("Erro ao assistir no VLC")
             QMessageBox.critical(self, "Erro no streaming", f"{exc}")
 
+    def _launch_vlc(self, url: str | None) -> None:
+        if not url:
+            return
+        vlc_path = find_vlc(self.db.get_setting("vlc_path"))
+        if not vlc_path:
+            if QMessageBox.question(
+                self, "VLC não encontrado",
+                "Não encontrei o VLC. Deseja abrir a página oficial para instalar?",
+            ) == QMessageBox.Yes:
+                open_vlc_download_page()
+            return
+        launch_vlc(vlc_path, url)
+
     def copy_stream_url(self) -> None:
+        video = self.selected_video()
+        if not video:
+            return
         try:
-            stream = self.prepare_stream_for_selected()
-            url = stream.get("url") if stream else None
+            stream = self._prepare_stream(video)
+            url = (stream.get("stream_url") or stream.get("url")) if stream else None
             if url:
                 QApplication.clipboard().setText(url)
                 QMessageBox.information(
@@ -982,7 +1378,8 @@ class MainWindow(QMainWindow):
             self, "Sobre",
             f"TGClassPlayer v{__version__}\n\n"
             "Organize e assista às videoaulas dos seus cursos no Telegram, "
-            "com player premium e streaming sob demanda (sem armazenar os vídeos).\n\n"
+            "com player premium, streaming sob demanda (sem armazenar os vídeos) "
+            "e módulo de acompanhamento de estudos.\n\n"
             "Nunca compartilhe seu código de login, senha 2FA ou API HASH.",
         )
 
@@ -1008,7 +1405,6 @@ def main() -> None:
     sys.excepthook = excepthook
     app = QApplication(sys.argv)
     app.setApplicationName("TGClassPlayer")
-    app.setStyleSheet(APP_QSS)
     try:
         app.setFont(QFont("Segoe UI", 10))
     except Exception:  # noqa: BLE001

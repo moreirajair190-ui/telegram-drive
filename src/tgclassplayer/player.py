@@ -1,3 +1,17 @@
+"""Diálogo de reprodução premium.
+
+Correção crítica desta versão: a PÁGINA do player é servida pelo MESMO servidor
+local (rota /player/{token}), então carregamos via `web.load(QUrl(player_url))`
+em vez de `setHtml(...)`. Assim a página e o vídeo têm a MESMA ORIGEM e o
+QtWebEngine não bloqueia o `<video>` (problema de mixed-content/origem distinta).
+
+Mantém:
+- Streaming sob demanda em blocos (HTTP Range) — não trava ao dar seek.
+- Resume automático da posição salva + gravação periódica de progresso.
+- Fallback para QtMultimedia quando o WebEngine não está disponível.
+- Botão "Abrir no VLC" na tela de erro do player (comunicado ao app).
+"""
+
 from __future__ import annotations
 
 import json
@@ -43,14 +57,6 @@ except Exception:  # noqa: BLE001
 
 
 class VideoPlayerDialog(QDialog):
-    """Diálogo de reprodução premium.
-
-    Usa o player HTML (QtWebEngine) quando disponível — interface bonita e
-    seek instantâneo. Faz fallback para QtMultimedia se o WebEngine faltar.
-
-    Salva o progresso de reprodução periodicamente via callback `on_progress`.
-    """
-
     def __init__(
         self,
         title: str,
@@ -59,12 +65,16 @@ class VideoPlayerDialog(QDialog):
         service: Any = None,
         start_position_ms: int = 0,
         on_progress: Callable[[int, int], None] | None = None,
+        on_open_vlc: Callable[[], None] | None = None,
+        player_url: str | None = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
         self.token = token
         self.service = service
         self.on_progress = on_progress
+        self.on_open_vlc = on_open_vlc
+        self._vlc_requested = False
         self._last_position = 0
         self._last_duration = 0
         self.setWindowTitle(title)
@@ -78,7 +88,7 @@ class VideoPlayerDialog(QDialog):
 
         if HAS_WEB_PLAYER:
             self.mode = "web"
-            self._build_web(title, url, start_position_ms, layout)
+            self._build_web(title, url, player_url, start_position_ms, layout)
         elif HAS_QT_PLAYER:
             self.mode = "qt"
             self._build_qt(title, url, start_position_ms, layout)
@@ -87,13 +97,12 @@ class VideoPlayerDialog(QDialog):
                 "Nenhum player disponível neste ambiente. Use o VLC como alternativa."
             )
 
-        # Timer que coleta o progresso e o repassa ao app.
         self._poll = QTimer(self)
         self._poll.timeout.connect(self._collect_state)
-        self._poll.start(1500)
+        self._poll.start(1200)
 
     # ------------------------------------------------------------------- web
-    def _build_web(self, title, url, start_position_ms, layout) -> None:
+    def _build_web(self, title, stream_url, player_url, start_position_ms, layout) -> None:
         self.web = QWebEngineView(self)
         try:
             settings = self.web.settings()
@@ -101,11 +110,20 @@ class VideoPlayerDialog(QDialog):
             settings.setAttribute(QWebEngineSettings.FullScreenSupportEnabled, True)
             settings.setAttribute(QWebEngineSettings.ScreenCaptureEnabled, False)
             settings.setAttribute(QWebEngineSettings.JavascriptEnabled, True)
+            settings.setAttribute(QWebEngineSettings.AllowRunningInsecureContent, True)
+            settings.setAttribute(QWebEngineSettings.LocalContentCanAccessRemoteUrls, True)
         except Exception:  # noqa: BLE001
             pass
-        html_text = build_player_html(title, url, start_position_ms)
-        self.web.setHtml(html_text, QUrl("http://127.0.0.1/"))
+
         layout.addWidget(self.web, 1)
+        # CORREÇÃO: carrega a PÁGINA do player pela MESMA origem do vídeo.
+        if player_url:
+            self.web.load(QUrl(player_url))
+        else:
+            # Fallback raríssimo: monta o HTML localmente (mesma origem do stream).
+            html_text = build_player_html(title, stream_url, start_position_ms)
+            origin = stream_url.rsplit("/stream/", 1)[0] + "/" if "/stream/" in stream_url else "http://127.0.0.1/"
+            self.web.setHtml(html_text, QUrl(origin))
 
     def _collect_state(self) -> None:
         if getattr(self, "mode", None) != "web":
@@ -133,6 +151,13 @@ class VideoPlayerDialog(QDialog):
                 self.on_progress(pos, dur)
             except Exception:  # noqa: BLE001
                 pass
+        if data.get("wantVlc") and not self._vlc_requested:
+            self._vlc_requested = True
+            if self.on_open_vlc:
+                try:
+                    self.on_open_vlc()
+                except Exception:  # noqa: BLE001
+                    pass
 
     # -------------------------------------------------------------------- qt
     def _build_qt(self, title, url, start_position_ms, layout) -> None:
@@ -168,6 +193,7 @@ class VideoPlayerDialog(QDialog):
         self.back_btn = QPushButton("↺ 10s")
         self.forward_btn = QPushButton("10s ↻")
         self.full_btn = QPushButton("⛶")
+        self.vlc_btn = QPushButton("Abrir no VLC")
         self.speed_box = QComboBox()
         self.speed_box.addItems(["0.5x", "0.75x", "1x", "1.25x", "1.5x", "1.75x", "2x"])
         self.speed_box.setCurrentText("1x")
@@ -186,6 +212,7 @@ class VideoPlayerDialog(QDialog):
         controls.addStretch(1)
         controls.addWidget(QLabel("Velocidade"))
         controls.addWidget(self.speed_box)
+        controls.addWidget(self.vlc_btn)
         controls.addWidget(self.full_btn)
 
         layout.addWidget(self.position)
@@ -195,6 +222,7 @@ class VideoPlayerDialog(QDialog):
         self.back_btn.clicked.connect(lambda: self.seek_relative(-10_000))
         self.forward_btn.clicked.connect(lambda: self.seek_relative(10_000))
         self.full_btn.clicked.connect(self.toggle_fullscreen)
+        self.vlc_btn.clicked.connect(self._request_vlc)
         self.speed_box.currentTextChanged.connect(self.change_speed)
         self.position.sliderPressed.connect(lambda: setattr(self, "_dragging", True))
         self.position.sliderReleased.connect(self._slider_released)
@@ -207,6 +235,13 @@ class VideoPlayerDialog(QDialog):
             pass
         self.player.setSource(QUrl(url))
         self.player.play()
+
+    def _request_vlc(self) -> None:
+        if self.on_open_vlc:
+            try:
+                self.on_open_vlc()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _slider_released(self) -> None:
         self._dragging = False
@@ -242,7 +277,11 @@ class VideoPlayerDialog(QDialog):
     def on_duration(self, duration: int) -> None:
         self._duration = int(duration or 0)
         self.position.setRange(0, max(self._duration, 0))
-        if not self._resumed and self._start_position_ms and self._duration > self._start_position_ms + 2000:
+        if (
+            not self._resumed
+            and self._start_position_ms
+            and self._duration > self._start_position_ms + 2000
+        ):
             self.player.setPosition(self._start_position_ms)
         self._resumed = True
         self.update_time_label(int(self.player.position()))
@@ -279,7 +318,6 @@ class VideoPlayerDialog(QDialog):
                 pass
 
     def keyPressEvent(self, event) -> None:
-        # No modo web os atalhos são tratados pelo JS.
         if getattr(self, "mode", None) == "qt":
             key = event.key()
             if key == Qt.Key_Space:
