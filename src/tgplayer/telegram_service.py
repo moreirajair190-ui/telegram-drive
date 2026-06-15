@@ -24,6 +24,7 @@ import logging
 import threading
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -31,6 +32,7 @@ from aiohttp import web
 
 from .paths import CACHE_DIR, SESSION_DIR, ensure_dirs
 from .player_html import build_player_html
+from .quality import adaptive_quality, throttle_for
 from .stream_cache import BLOCK_SIZE, StreamSession
 from .summary_parser import looks_like_menu, menu_score
 from .utils import (
@@ -49,7 +51,7 @@ INITIAL_RANGE_CHUNK = 4 * BLOCK_SIZE
 class TelegramService:
     """Pyrogram + servidor HTTP local, no mesmo event loop (thread dedicada)."""
 
-    def __init__(self) -> None:
+    def __init__(self, db: Any = None) -> None:
         ensure_dirs()
         self.loop = asyncio.new_event_loop()
         self.thread = threading.Thread(
@@ -57,6 +59,7 @@ class TelegramService:
         )
         self.thread.start()
         self.client = None
+        self.db = db  # acesso opcional ao banco (cache de moov, configurações).
         self.api_id: int | None = None
         self.api_hash: str | None = None
         self.phone_code_hash: str | None = None
@@ -68,7 +71,80 @@ class TelegramService:
         self.session_meta: dict[str, dict[str, Any]] = {}
         self.stream_cache_dir = CACHE_DIR / "streams"
         self.stream_cache_dir.mkdir(parents=True, exist_ok=True)
+        # Cache de miniaturas (persistente, com poda LRU). Ideia portada de
+        # `preview.rs` (cache de previews com poda preservando o ativo).
+        self.thumbs_dir = CACHE_DIR / "thumbs"
+        self.thumbs_dir.mkdir(parents=True, exist_ok=True)
         self._cleanup_old_cache()
+        # Qualidade de streaming corrente (definida pelo player/configurações).
+        self.streaming_quality: str = "original"
+        self.adaptive_mode: bool = False
+
+    # ----------------------------------------------------- proxy / configurações
+    def _build_proxy(self) -> dict[str, Any] | None:
+        """Lê a configuração de proxy do banco (SOCKS5) para o Pyrogram.
+
+        Ideia portada de `vpn_optimizer.rs` (`ProxyConfig`). Útil para alunos em
+        redes restritas. O Pyrogram aceita `proxy={scheme, hostname, port, ...}`.
+        """
+        if not self.db:
+            return None
+        try:
+            if (self.db.get_setting("proxy_enabled") or "0") != "1":
+                return None
+            scheme = (self.db.get_setting("proxy_type") or "socks5").lower()
+            host = self.db.get_setting("proxy_host") or ""
+            port = self.db.get_setting("proxy_port") or ""
+            if not host or not port:
+                return None
+            proxy: dict[str, Any] = {
+                "scheme": scheme,
+                "hostname": host,
+                "port": int(port),
+            }
+            user = self.db.get_setting("proxy_user")
+            pwd = self.db.get_setting("proxy_pass")
+            if user:
+                proxy["username"] = user
+            if pwd:
+                proxy["password"] = pwd
+            return proxy
+        except Exception:  # noqa: BLE001
+            log.exception("Configuração de proxy inválida; ignorando.")
+            return None
+
+    def _current_throttle_kbps(self) -> int:
+        """Throttle (kbps) atual com base na qualidade escolhida (não-adaptativo)."""
+        if self.adaptive_mode:
+            return 0  # adaptativo ajusta por sessão; começa ilimitado
+        # Limite manual de banda (kbps) tem prioridade quando configurado (>0).
+        if self.db:
+            try:
+                manual = int(self.db.get_setting("bandwidth_limit_kbps") or 0)
+                if manual > 0:
+                    return manual
+            except Exception:  # noqa: BLE001
+                pass
+        return throttle_for(self.streaming_quality)
+
+    def _current_max_retries(self) -> int:
+        """Nº de re-tentativas por bloco. Maior no modo 'conexão instável'."""
+        if not self.db:
+            return 2
+        try:
+            if (self.db.get_setting("unstable_connection") or "0") == "1":
+                return int(self.db.get_setting("network_retries") or 5)
+            return int(self.db.get_setting("network_retries") or 2)
+        except Exception:  # noqa: BLE001
+            return 2
+
+    def set_quality(self, quality: str, adaptive: bool) -> None:
+        """Aplica a qualidade/modo adaptativo a TODAS as sessões ativas."""
+        self.streaming_quality = (quality or "original").lower()
+        self.adaptive_mode = bool(adaptive)
+        kbps = self._current_throttle_kbps()
+        for session in self.sessions.values():
+            session.set_throttle_kbps(kbps)
 
     def _cleanup_old_cache(self) -> None:
         try:
@@ -132,14 +208,19 @@ class TelegramService:
 
         # Mantemos o nome de sess\u00e3o legado ("tgclassplayer") para que usu\u00e1rios
         # que atualizam do TGClassPlayer continuem logados sem refazer login.
-        self.client = Client(
-            "tgclassplayer",
+        proxy = self._build_proxy()
+        client_kwargs: dict[str, Any] = dict(
             api_id=self.api_id,
             api_hash=self.api_hash,
             workdir=str(SESSION_DIR),
             no_updates=True,
             sleep_threshold=60,
         )
+        if proxy:
+            client_kwargs["proxy"] = proxy
+            log.info("Usando proxy %s://%s:%s", proxy.get("scheme"),
+                     proxy.get("hostname"), proxy.get("port"))
+        self.client = Client("tgclassplayer", **client_kwargs)
         await self.client.connect()
         try:
             me = await self.client.get_me()
@@ -587,6 +668,8 @@ class TelegramService:
             size=int(video.get("size") or 0),
             cache_path=cache_path,
             mime_type=video.get("mime_type"),
+            throttle_kbps=self._current_throttle_kbps(),
+            max_retries=self._current_max_retries(),
         )
         self.sessions[token] = session
         # Partida rápida: já dispara o download do início + cauda (moov).
@@ -594,9 +677,43 @@ class TelegramService:
             session.prefetch_start()
         except Exception:  # noqa: BLE001
             log.exception("Falha ao iniciar pré-busca do stream %s", token)
+
+        # ---- Cache de moov: boot instantâneo na 2ª vez --------------------
+        cached_moov = None
+        if self.db:
+            try:
+                cached_moov = self.db.get_moov_cache(
+                    str(video["chat_id"]), int(video["message_id"])
+                )
+            except Exception:  # noqa: BLE001
+                cached_moov = None
+        if cached_moov and cached_moov.get("moov_size"):
+            # Já sabemos onde está o moov: pré-aquece direto, sem redescobrir.
+            session.moov_info = {
+                "found": True,
+                "moov_offset": int(cached_moov.get("moov_offset") or 0),
+                "moov_size": int(cached_moov.get("moov_size") or 0),
+                "located": int(cached_moov.get("located") or 0),
+            }
+            try:
+                session._prewarm_range(
+                    int(cached_moov.get("moov_offset") or 0),
+                    int(cached_moov.get("moov_size") or 0),
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            # Descobre o moov em 2º plano e grava no cache para a próxima vez.
+            asyncio.ensure_future(self._discover_and_cache_moov(token, video))
+
         self.session_meta[token] = {
             "title": video.get("title") or filename,
             "start_position_ms": int(video.get("start_position_ms") or 0),
+            "chat_id": str(video["chat_id"]),
+            "message_id": int(video["message_id"]),
+            "width": video.get("width"),
+            "height": video.get("height"),
+            "duration": video.get("duration"),
         }
         quoted = quote(filename)
         stream_url = f"http://127.0.0.1:{self.port}/stream/{token}/{quoted}"
@@ -608,6 +725,175 @@ class TelegramService:
             "token": token,
             "port": self.port,
         }
+
+    async def _discover_and_cache_moov(self, token: str, video: dict[str, Any]) -> None:
+        """Descobre o átomo `moov` e persiste no cache SQLite (2º plano)."""
+        session = self.sessions.get(token)
+        if not session:
+            return
+        try:
+            info = await session.discover_moov()
+        except Exception:  # noqa: BLE001
+            log.exception("Falha na descoberta do moov para %s", token)
+            return
+        if not info.get("found") or not self.db:
+            return
+        try:
+            self.db.set_moov_cache(
+                str(video["chat_id"]),
+                int(video["message_id"]),
+                file_size=int(video.get("size") or 0) or None,
+                moov_offset=int(info.get("moov_offset") or 0),
+                moov_size=int(info.get("moov_size") or 0),
+                located=int(info.get("located") or 0),
+                duration_ms=(int(video["duration"]) * 1000) if video.get("duration") else None,
+                width=video.get("width"),
+                height=video.get("height"),
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("Falha ao gravar moov_cache para %s", token)
+
+    # ------------------------------------------------------------- miniaturas
+    # Limites do cache de miniaturas (poda LRU). Ideia portada de `preview.rs`.
+    THUMB_CACHE_MAX_FILES = 400
+    THUMB_CACHE_MAX_BYTES = 256 * 1024 * 1024  # 256 MB
+
+    def thumb_path(self, chat_id: str | int, message_id: int) -> Path:
+        return self.thumbs_dir / f"{str(chat_id).lstrip('-')}_{int(message_id)}.jpg"
+
+    def cached_thumb(self, chat_id: str | int, message_id: int) -> str | None:
+        """Acesso síncrono (para a UI): retorna a miniatura já em cache ou None.
+
+        Não dispara download — apenas verifica o disco. A UI pode usar isto sem
+        bloquear, e agendar `ensure_thumbnail` em 2º plano quando faltar.
+        """
+        try:
+            p = self.thumb_path(chat_id, message_id)
+            if p.exists() and p.stat().st_size > 0:
+                return str(p)
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+    async def fetch_video_metadata(self, video: dict[str, Any]) -> dict[str, Any] | None:
+        """Pré-busca metadados (duração/resolução) de uma aula em 2º plano.
+
+        Ideia portada do cache de metadados por arquivo do projeto de
+        referência. Consulta a mensagem do Telegram, extrai width/height/
+        duration do objeto de vídeo e persiste em `moov_cache` para reuso.
+        """
+        if not self.client:
+            return None
+        chat_id = video.get("chat_id")
+        message_id = int(video.get("message_id") or 0)
+        if not chat_id or not message_id:
+            return None
+        try:
+            cid = int(chat_id) if str(chat_id).lstrip("-").isdigit() else chat_id
+            message = await self.client.get_messages(cid, message_id)
+            media = getattr(message, "video", None) or getattr(message, "document", None)
+            if not media:
+                return None
+            meta = {
+                "width": getattr(media, "width", None),
+                "height": getattr(media, "height", None),
+                "duration": getattr(media, "duration", None),
+                "file_size": getattr(media, "file_size", None),
+            }
+            if self.db and (meta["width"] or meta["height"] or meta["duration"]):
+                try:
+                    self.db.set_moov_cache(
+                        str(chat_id),
+                        message_id,
+                        file_size=meta["file_size"],
+                        duration_ms=(int(meta["duration"]) * 1000) if meta["duration"] else None,
+                        width=meta["width"],
+                        height=meta["height"],
+                    )
+                    self.db.set_video_dimensions(
+                        str(chat_id),
+                        message_id,
+                        width=meta["width"],
+                        height=meta["height"],
+                        duration=meta["duration"],
+                    )
+                except Exception:  # noqa: BLE001
+                    log.exception("Falha ao gravar metadados em moov_cache")
+            return meta
+        except Exception:  # noqa: BLE001
+            log.exception("Falha ao buscar metadados de %s/%s", chat_id, message_id)
+            return None
+
+    async def ensure_thumbnail(self, video: dict[str, Any]) -> str | None:
+        """Baixa (e cacheia) a miniatura de uma aula. Retorna o caminho local.
+
+        O Pyrogram expõe `message.video.thumbs`; baixamos o maior thumbnail e
+        gravamos em `cache/thumbs/{chat}_{msg}.jpg`. Faz poda LRU automática.
+        """
+        if not self.client:
+            return None
+        chat_id = video.get("chat_id")
+        message_id = int(video.get("message_id") or 0)
+        if not chat_id or not message_id:
+            return None
+        dest = self.thumb_path(chat_id, message_id)
+        if dest.exists() and dest.stat().st_size > 0:
+            # Toca o arquivo para refletir o uso recente (LRU).
+            try:
+                dest.touch()
+            except Exception:  # noqa: BLE001
+                pass
+            return str(dest)
+        try:
+            cid = int(chat_id) if str(chat_id).lstrip("-").isdigit() else chat_id
+            message = await self.client.get_messages(cid, message_id)
+            media = getattr(message, "video", None) or getattr(message, "document", None)
+            thumbs = getattr(media, "thumbs", None) if media else None
+            if not thumbs:
+                return None
+            # Maior thumbnail disponível.
+            best = max(thumbs, key=lambda t: getattr(t, "file_size", 0) or 0)
+            # O Pyrogram aceita o objeto thumb (ou seu file_id) em download_media.
+            await self.client.download_media(best, file_name=str(dest))
+            self._prune_thumb_cache(keep=dest)
+            return str(dest) if dest.exists() else None
+        except Exception:  # noqa: BLE001
+            log.exception("Falha ao baixar miniatura de %s/%s", chat_id, message_id)
+            return None
+
+    def _prune_thumb_cache(self, keep: Path | None = None) -> None:
+        """Poda o cache de miniaturas (LRU), preservando o arquivo `keep`."""
+        try:
+            files = [p for p in self.thumbs_dir.glob("*.jpg") if p.is_file()]
+        except Exception:  # noqa: BLE001
+            return
+        files.sort(key=lambda p: p.stat().st_mtime)  # mais antigos primeiro
+        total_bytes = sum(p.stat().st_size for p in files)
+        while files and (
+            len(files) > self.THUMB_CACHE_MAX_FILES
+            or total_bytes > self.THUMB_CACHE_MAX_BYTES
+        ):
+            victim = files.pop(0)
+            if keep and victim == keep:
+                continue
+            try:
+                total_bytes -= victim.stat().st_size
+                victim.unlink()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def telegram_message_link(self, username: str | None, message_id: int) -> str | None:
+        """Gera o link nativo t.me de uma mensagem em canal/grupo PÚBLICO.
+
+        Ideia portada do recurso de "copiar link nativo do Telegram" do projeto
+        de referência. Só funciona quando o chat tem `username` (é público).
+        """
+        if not username:
+            return None
+        uname = str(username).lstrip("@").strip()
+        if not uname:
+            return None
+        return f"https://t.me/{uname}/{int(message_id)}"
 
     async def release_stream(self, token: str, delete_file: bool = True) -> dict[str, Any]:
         self.session_meta.pop(token, None)
@@ -624,6 +910,8 @@ class TelegramService:
         app.router.add_get("/stream/{token}/{filename:.*}", self._handle_stream, allow_head=True)
         app.router.add_get("/player/{token}", self._handle_player)
         app.router.add_get("/buffer/{token}", self._handle_buffer)
+        app.router.add_get("/bandwidth/{token}", self._handle_bandwidth)
+        app.router.add_get("/quality/{token}", self._handle_quality)
         app.router.add_get("/health", self._handle_health)
         self.runner = web.AppRunner(app, access_log=None)
         await self.runner.setup()
@@ -670,6 +958,84 @@ class TelegramService:
             return float(session.buffer_ratio())
         except Exception:  # noqa: BLE001
             return 0.0
+
+    def measured_kbps(self, token: str) -> float:
+        """Acesso síncrono à banda medida (usado pelo widget/overlay de debug)."""
+        session = self.sessions.get(token)
+        if not session:
+            return 0.0
+        try:
+            return float(session.measured_kbps())
+        except Exception:  # noqa: BLE001
+            return 0.0
+
+    def total_measured_kbps(self) -> float:
+        """Banda agregada (kbps) de TODAS as sessões ativas (widget da barra)."""
+        total = 0.0
+        for session in list(self.sessions.values()):
+            try:
+                total += float(session.measured_kbps())
+            except Exception:  # noqa: BLE001
+                pass
+        return total
+
+    def active_sessions(self) -> int:
+        """Número de sessões de streaming ativas."""
+        return len(self.sessions)
+
+    def session_info(self, token: str) -> dict[str, Any]:
+        """Resumo síncrono da sessão (banda, throttle, moov) para o overlay debug."""
+        session = self.sessions.get(token)
+        meta = self.session_meta.get(token, {})
+        if not session:
+            return {}
+        return {
+            "kbps": session.measured_kbps(),
+            "throttle_kbps": session.throttle_kbps,
+            "quality": self.streaming_quality,
+            "adaptive": self.adaptive_mode,
+            "buffer_ratio": session.buffer_ratio(),
+            "moov": session.moov_info or {},
+            "size": session.size,
+            "width": meta.get("width"),
+            "height": meta.get("height"),
+        }
+
+    async def _handle_bandwidth(self, request: web.Request) -> web.Response:
+        token = request.match_info.get("token") or ""
+        session = self.sessions.get(token)
+        kbps = float(session.measured_kbps()) if session else 0.0
+        return web.json_response(
+            {"kbps": kbps, "found": bool(session)},
+            headers={"Cache-Control": "no-store", "Access-Control-Allow-Origin": "*"},
+        )
+
+    async def _handle_quality(self, request: web.Request) -> web.Response:
+        """Aplica qualidade/adaptativo a uma sessão (e mede a banda para o auto)."""
+        token = request.match_info.get("token") or ""
+        session = self.sessions.get(token)
+        if not session:
+            return web.json_response({"ok": False}, status=404)
+        quality = request.query.get("quality")
+        adaptive = request.query.get("adaptive")
+        if adaptive is not None:
+            self.adaptive_mode = adaptive in ("1", "true", "yes")
+        if self.adaptive_mode:
+            chosen = adaptive_quality(session.measured_kbps())
+            session.set_throttle_kbps(throttle_for(chosen))
+            return web.json_response(
+                {"ok": True, "quality": chosen, "adaptive": True,
+                 "kbps": session.measured_kbps()},
+                headers={"Access-Control-Allow-Origin": "*"},
+            )
+        if quality:
+            self.streaming_quality = quality.lower()
+            session.set_throttle_kbps(throttle_for(self.streaming_quality))
+        return web.json_response(
+            {"ok": True, "quality": self.streaming_quality, "adaptive": False,
+             "kbps": session.measured_kbps()},
+            headers={"Access-Control-Allow-Origin": "*"},
+        )
 
     async def _handle_player(self, request: web.Request) -> web.Response:
         """Serve a PÁGINA do player na MESMA origem do vídeo (corrige bloqueio)."""

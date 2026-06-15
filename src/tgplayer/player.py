@@ -1,4 +1,4 @@
-"""Diálogo de reprodução PREMIUM do TgPlayer (v6.2).
+"""Diálogo de reprodução PREMIUM do TgPlayer (v6.3).
 
 Objetivos desta versão:
 
@@ -52,6 +52,7 @@ from PySide6.QtWidgets import (
 )
 
 from .player_html import build_player_html
+from .quality import QUALITIES, cap_to_source, label_for
 
 log = logging.getLogger(__name__)
 
@@ -192,6 +193,19 @@ class VideoPlayerDialog(QDialog):
         on_progress: Callable[[int, int], None] | None = None,
         on_open_vlc: Callable[[], None] | None = None,
         player_url: str | None = None,
+        on_next: Callable[[], None] | None = None,
+        on_prev: Callable[[], None] | None = None,
+        current_index: int = 0,
+        total_items: int = 1,
+        source_width: int | None = None,
+        source_height: int | None = None,
+        initial_quality: str = "original",
+        adaptive_mode: bool = False,
+        on_quality_change: Callable[[str, bool], None] | None = None,
+        on_clear_cache: Callable[[], None] | None = None,
+        debug_overlay: bool = False,
+        playback_rate: float = 1.0,
+        on_rate_change: Callable[[float], None] | None = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -199,11 +213,26 @@ class VideoPlayerDialog(QDialog):
         self.service = service
         self.on_progress = on_progress
         self.on_open_vlc = on_open_vlc
+        self.on_next = on_next
+        self.on_prev = on_prev
+        self.on_quality_change = on_quality_change
+        self.on_clear_cache = on_clear_cache
+        self.on_rate_change = on_rate_change
+        self._current_index = int(current_index)
+        self._total_items = max(1, int(total_items))
+        self._source_width = source_width
+        self._source_height = source_height
+        self._quality = (initial_quality or "original").lower()
+        self._adaptive = bool(adaptive_mode)
+        self._debug_on = bool(debug_overlay)
+        self._initial_rate = float(playback_rate or 1.0)
         self._stream_url = url
         self._player_url = player_url
         self._title = title
         self._start_position_ms = max(0, int(start_position_ms))
         self._vlc_requested = False
+        self._auto_next_requested = False
+        self._navigated = False  # próxima/anterior pedida -> não fecha por completo
         self._last_position = 0
         self._last_duration = 0
         self._duration = 0
@@ -213,6 +242,7 @@ class VideoPlayerDialog(QDialog):
         self._volume = 1.0
         self._elapsed_loading = 0.0
         self._is_ready = False
+        self._autoplay_countdown = 0
         self.setWindowTitle(title)
         self.setObjectName("PlayerDialog")
         self.setMinimumSize(1080, 660)
@@ -342,6 +372,27 @@ class VideoPlayerDialog(QDialog):
         box.addLayout(btn_row)
         self.error_overlay.hide()
 
+        # ---- Overlay de DEBUG (tecla D) ------------------------------------
+        self.debug_overlay = QFrame(parent)
+        self.debug_overlay.setObjectName("PlayerDebug")
+        self.debug_overlay.setStyleSheet(
+            "#PlayerDebug { background: rgba(2,4,10,0.82);"
+            " border:1px solid rgba(124,92,255,0.45); border-radius:12px; }"
+            " QLabel { color:#b9f5d0; background:transparent;"
+            " font-family:'Consolas','Menlo',monospace; font-size:9.5pt; }"
+        )
+        dbox = QVBoxLayout(self.debug_overlay)
+        dbox.setContentsMargins(14, 12, 14, 12)
+        dbox.setSpacing(6)
+        self.debug_label = QLabel("debug…")
+        self.debug_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        dbox.addWidget(self.debug_label)
+        self.debug_clear_btn = QPushButton("Limpar cache desta aula")
+        self.debug_clear_btn.setStyleSheet(self._btn_style())
+        self.debug_clear_btn.clicked.connect(self._clear_cache_clicked)
+        dbox.addWidget(self.debug_clear_btn)
+        self.debug_overlay.setVisible(self._debug_on)
+
         # Toast (aviso discreto, ex.: "Retomando de mm:ss").
         self.toast = QLabel("", parent)
         self.toast.setObjectName("PlayerToast")
@@ -355,6 +406,40 @@ class VideoPlayerDialog(QDialog):
         self._toast_timer = QTimer(self)
         self._toast_timer.setSingleShot(True)
         self._toast_timer.timeout.connect(self.toast.hide)
+
+        # ---- Auto-play da próxima aula (countdown) -------------------------
+        self.autoplay_overlay = QFrame(parent)
+        self.autoplay_overlay.setObjectName("PlayerAutoNext")
+        self.autoplay_overlay.setStyleSheet(
+            "#PlayerAutoNext { background: rgba(8,11,22,0.95);"
+            " border:1px solid rgba(124,92,255,0.55); border-radius:14px; }"
+            " QLabel { color:#f8fafc; background:transparent; }"
+        )
+        abox = QVBoxLayout(self.autoplay_overlay)
+        abox.setContentsMargins(22, 18, 22, 18)
+        abox.setSpacing(10)
+        abox.setAlignment(Qt.AlignCenter)
+        self.autoplay_label = QLabel("Próxima aula em 5…")
+        self.autoplay_label.setAlignment(Qt.AlignCenter)
+        self.autoplay_label.setStyleSheet(
+            "font-size:13pt;font-weight:800;background:transparent;"
+        )
+        arow = QHBoxLayout()
+        arow.setAlignment(Qt.AlignCenter)
+        self.autoplay_go = QPushButton("▶ Assistir agora")
+        self.autoplay_go.setObjectName("PrimaryButton")
+        self.autoplay_go.setStyleSheet(self._btn_style(primary=True))
+        self.autoplay_go.clicked.connect(self._autoplay_now)
+        self.autoplay_cancel = QPushButton("Cancelar")
+        self.autoplay_cancel.setStyleSheet(self._btn_style())
+        self.autoplay_cancel.clicked.connect(self._cancel_autoplay)
+        arow.addWidget(self.autoplay_go)
+        arow.addWidget(self.autoplay_cancel)
+        abox.addWidget(self.autoplay_label)
+        abox.addLayout(arow)
+        self.autoplay_overlay.hide()
+        self._autoplay_timer = QTimer(self)
+        self._autoplay_timer.timeout.connect(self._autoplay_tick)
 
         self._reposition_overlays()
         self._show_loading()
@@ -380,6 +465,12 @@ class VideoPlayerDialog(QDialog):
         if hasattr(self, "toast") and self.toast.isVisible():
             tw = self.toast.width()
             self.toast.move((pw - tw) // 2, 28)
+        if hasattr(self, "debug_overlay"):
+            dw, dh = 360, 150
+            self.debug_overlay.setGeometry(pw - dw - 16, 16, dw, dh)
+        if hasattr(self, "autoplay_overlay"):
+            aw, ah = 360, 140
+            self.autoplay_overlay.setGeometry(pw - aw - 24, ph - ah - 110, aw, ah)
 
     def _show_loading(self) -> None:
         if hasattr(self, "loading_overlay"):
@@ -409,6 +500,111 @@ class VideoPlayerDialog(QDialog):
             self._elapsed_loading += 0.3
             if self._elapsed_loading >= 6.0:
                 self.loading_vlc_btn.show()
+        # Atualiza o overlay de debug, se ativo.
+        if self._debug_on:
+            self._update_debug()
+
+    # ----------------------------------------------------------- debug overlay
+    def _fmt_speed(self, kbps: float) -> str:
+        if kbps >= 1000:
+            return f"{kbps / 1000:.2f} Mbps"
+        return f"{kbps:.0f} Kbps"
+
+    def _buffered_seconds(self) -> float:
+        """Segundos no buffer à frente da posição atual (aprox.)."""
+        if not self.service or not self.token or not self._duration:
+            return 0.0
+        try:
+            ratio = float(self.service.buffer_ratio(self.token))
+        except Exception:  # noqa: BLE001
+            return 0.0
+        return max(0.0, (ratio * self._duration - self._last_position) / 1000.0)
+
+    def _update_debug(self) -> None:
+        if not hasattr(self, "debug_label"):
+            return
+        info = {}
+        if self.service and self.token and hasattr(self.service, "session_info"):
+            try:
+                info = self.service.session_info(self.token) or {}
+            except Exception:  # noqa: BLE001
+                info = {}
+        kbps = float(info.get("kbps", 0.0))
+        throttle = int(info.get("throttle_kbps", 0) or 0)
+        moov = info.get("moov", {}) or {}
+        loc = {1: "head", 2: "tail"}.get(int(moov.get("located", 0) or 0), "—")
+        size = int(info.get("size", 0) or 0)
+        cap = "Auto" if self._adaptive else (
+            "ilimitado" if throttle == 0 else f"{throttle} kbps"
+        )
+        lines = [
+            f"Velocidade: {self._fmt_speed(kbps)}",
+            f"Qualidade: {self._quality_badge_text()} (cap: {cap})",
+            f"Buffer: {self._buffered_seconds():.1f}s à frente",
+            f"Modo: {self._mode_badge_text()}",
+            f"Tamanho: {size / (1024*1024):.1f} MiB" if size else "Tamanho: —",
+            f"moov: {loc} @ {moov.get('moov_offset', '—')}",
+        ]
+        self.debug_label.setText("\n".join(lines))
+
+    def _toggle_debug(self) -> None:
+        self._debug_on = not self._debug_on
+        if hasattr(self, "debug_overlay"):
+            self.debug_overlay.setVisible(self._debug_on)
+            self.debug_overlay.raise_()
+        if self._debug_on:
+            self._update_debug()
+        # Persiste a escolha.
+        try:
+            if self.service and getattr(self.service, "db", None):
+                self.service.db.set_setting("debug_overlay", "1" if self._debug_on else "0")
+        except Exception:  # noqa: BLE001
+            pass
+        self._show_toast("Debug ON" if self._debug_on else "Debug OFF", 900)
+
+    def _clear_cache_clicked(self) -> None:
+        if self.on_clear_cache:
+            try:
+                self.on_clear_cache()
+            except Exception:  # noqa: BLE001
+                log.exception("Falha ao limpar cache da aula")
+        self._show_toast("Cache desta aula limpo", 1200)
+
+    # ----------------------------------------------------------- auto-play next
+    def _maybe_offer_autoplay(self) -> None:
+        """Ao chegar perto do fim (≥92%), oferece a próxima aula com countdown."""
+        if self._auto_next_requested or not self.on_next:
+            return
+        if self._current_index >= self._total_items - 1:
+            return
+        if not self._duration or self._last_position <= 0:
+            return
+        if self._last_position < self._duration * 0.92:
+            return
+        self._auto_next_requested = True
+        self._autoplay_countdown = 5
+        self.autoplay_label.setText(f"Próxima aula em {self._autoplay_countdown}…")
+        self._reposition_overlays()
+        self.autoplay_overlay.show()
+        self.autoplay_overlay.raise_()
+        self._autoplay_timer.start(1000)
+
+    def _autoplay_tick(self) -> None:
+        self._autoplay_countdown -= 1
+        if self._autoplay_countdown <= 0:
+            self._autoplay_timer.stop()
+            self._autoplay_now()
+            return
+        self.autoplay_label.setText(f"Próxima aula em {self._autoplay_countdown}…")
+
+    def _autoplay_now(self) -> None:
+        self._autoplay_timer.stop()
+        self.autoplay_overlay.hide()
+        self.go_next()
+
+    def _cancel_autoplay(self) -> None:
+        self._autoplay_timer.stop()
+        self.autoplay_overlay.hide()
 
     # ---------------------------------------------------------------- erro comum
     def _show_error(self, detail: str) -> None:
@@ -449,6 +645,19 @@ class VideoPlayerDialog(QDialog):
         row = QHBoxLayout()
         row.setSpacing(10)
 
+        self.prev_btn = QPushButton("‹")
+        self.prev_btn.setFixedSize(46, 44)
+        self.prev_btn.setToolTip("Aula anterior (P)")
+        self.next_btn = QPushButton("›")
+        self.next_btn.setFixedSize(46, 44)
+        self.next_btn.setToolTip("Próxima aula (N)")
+        for b in (self.prev_btn, self.next_btn):
+            b.setStyleSheet(self._btn_style())
+        self.prev_btn.setEnabled(self.on_prev is not None and self._current_index > 0)
+        self.next_btn.setEnabled(
+            self.on_next is not None and self._current_index < self._total_items - 1
+        )
+
         self.play_btn = QPushButton("❚❚")
         self.play_btn.setObjectName("PrimaryButton")
         self.play_btn.setFixedSize(52, 44)
@@ -479,6 +688,12 @@ class VideoPlayerDialog(QDialog):
         self.speed_box.setCurrentText("1x")
         self.speed_box.setFixedHeight(44)
 
+        # Seletor de qualidade (engrenagem ⚙). Inclui "Auto (adaptativo)".
+        self.quality_box = QComboBox()
+        self.quality_box.setToolTip("Qualidade do streaming")
+        self.quality_box.setFixedHeight(44)
+        self._populate_quality_box()
+
         self.vlc_btn = QPushButton("Abrir no VLC")
         self.vlc_btn.setFixedHeight(44)
         self.vlc_btn.setStyleSheet(self._btn_style())
@@ -486,7 +701,10 @@ class VideoPlayerDialog(QDialog):
         self.full_btn.setFixedSize(46, 44)
         self.full_btn.setStyleSheet(self._btn_style())
 
+        row.addWidget(self.prev_btn)
         row.addWidget(self.play_btn)
+        row.addWidget(self.next_btn)
+        row.addSpacing(4)
         row.addWidget(self.back_btn)
         row.addWidget(self.forward_btn)
         row.addSpacing(6)
@@ -494,6 +712,9 @@ class VideoPlayerDialog(QDialog):
         row.addStretch(1)
         row.addWidget(self.mute_btn)
         row.addWidget(self.volume)
+        row.addSpacing(8)
+        row.addWidget(QLabel("⚙"))
+        row.addWidget(self.quality_box)
         row.addSpacing(8)
         row.addWidget(speed_lbl)
         row.addWidget(self.speed_box)
@@ -505,6 +726,8 @@ class VideoPlayerDialog(QDialog):
         layout.addWidget(self.controls_frame)
 
         # Ligações de UI.
+        self.prev_btn.clicked.connect(self.go_prev)
+        self.next_btn.clicked.connect(self.go_next)
         self.play_btn.clicked.connect(self.toggle_play)
         self.back_btn.clicked.connect(lambda: self.seek_relative(-10_000))
         self.forward_btn.clicked.connect(lambda: self.seek_relative(10_000))
@@ -513,6 +736,66 @@ class VideoPlayerDialog(QDialog):
         self.mute_btn.clicked.connect(self.toggle_mute)
         self.volume.valueChanged.connect(self._on_volume_changed)
         self.speed_box.currentTextChanged.connect(self.change_speed)
+        self.quality_box.currentIndexChanged.connect(self._on_quality_box)
+
+    def _populate_quality_box(self) -> None:
+        """Preenche o seletor de qualidade, evitando upscale acima da fonte."""
+        self.quality_box.blockSignals(True)
+        self.quality_box.clear()
+        self.quality_box.addItem("Auto (adaptativo)", userData="__auto__")
+        for q in QUALITIES:
+            allowed = (q == "original") or cap_to_source(q, self._source_height) == q
+            if not allowed and q != "original":
+                continue
+            self.quality_box.addItem(
+                "Original" if q == "original" else label_for(q), userData=q
+            )
+        if self._adaptive:
+            self.quality_box.setCurrentIndex(0)
+        else:
+            idx = self.quality_box.findData(self._quality)
+            self.quality_box.setCurrentIndex(idx if idx >= 0 else 0)
+        self.quality_box.blockSignals(False)
+
+    def _on_quality_box(self, _index: int) -> None:
+        data = self.quality_box.currentData()
+        if data == "__auto__":
+            self._adaptive = True
+        else:
+            self._adaptive = False
+            self._quality = str(data or "original")
+        self._refresh_badges()
+        if self.on_quality_change:
+            try:
+                self.on_quality_change(self._quality, self._adaptive)
+            except Exception:  # noqa: BLE001
+                log.exception("Falha ao aplicar qualidade")
+        self._show_toast(
+            "Qualidade: Auto" if self._adaptive
+            else f"Qualidade: {label_for(self._quality)}",
+            1100,
+        )
+
+    def go_next(self) -> None:
+        if self.on_next and self._current_index < self._total_items - 1:
+            self._navigated = True
+            self._save_final_progress()
+            try:
+                self.on_next()
+            except Exception:  # noqa: BLE001
+                log.exception("Falha ao ir para a próxima aula")
+            # Fecha este player; o app reabre na aula vizinha.
+            self.close()
+
+    def go_prev(self) -> None:
+        if self.on_prev and self._current_index > 0:
+            self._navigated = True
+            self._save_final_progress()
+            try:
+                self.on_prev()
+            except Exception:  # noqa: BLE001
+                log.exception("Falha ao ir para a aula anterior")
+            self.close()
 
     def _btn_style(self, primary: bool = False) -> str:
         if primary:
@@ -545,15 +828,63 @@ class VideoPlayerDialog(QDialog):
         )
         title_label.setWordWrap(True)
         backend = {"vlc": "VLC", "qt": "Nativo", "web": "Web"}.get(self.mode, "")
-        badge = QLabel(f"⚡ {backend}")
-        badge.setStyleSheet(
-            "color:#cdbcff;background:rgba(124,92,255,0.2);"
-            "border:1px solid rgba(124,92,255,0.5);border-radius:999px;"
-            "padding:5px 12px;font-weight:800;font-size:10pt;"
-        )
+
+        def _badge(text: str) -> QLabel:
+            lab = QLabel(text)
+            lab.setStyleSheet(
+                "color:#cdbcff;background:rgba(124,92,255,0.2);"
+                "border:1px solid rgba(124,92,255,0.5);border-radius:999px;"
+                "padding:5px 12px;font-weight:800;font-size:10pt;"
+            )
+            return lab
+
+        backend_badge = _badge(f"⚡ {backend}")
+        # Badge de qualidade atual (ex.: "720p · 2.5k" / "Auto").
+        self.quality_badge = _badge(self._quality_badge_text())
+        # Badge de resolução (Source / Playing).
+        self.res_badge = _badge(self._res_badge_text())
+        # Badge de modo (Original / Throttled / Auto).
+        self.mode_badge = _badge(self._mode_badge_text())
+        # Indicador de posição na fila (ex.: "3/12").
+        self.pos_badge = _badge(f"{self._current_index + 1}/{self._total_items}")
+
         h.addWidget(title_label, 1)
-        h.addWidget(badge, 0, Qt.AlignRight)
+        h.addWidget(self.pos_badge, 0, Qt.AlignRight)
+        h.addWidget(self.res_badge, 0, Qt.AlignRight)
+        h.addWidget(self.quality_badge, 0, Qt.AlignRight)
+        h.addWidget(self.mode_badge, 0, Qt.AlignRight)
+        h.addWidget(backend_badge, 0, Qt.AlignRight)
         layout.addWidget(self.header)
+
+    # ----------------------------------------------------------- textos de badge
+    def _quality_badge_text(self) -> str:
+        if self._adaptive:
+            return "Auto"
+        return label_for(self._quality)
+
+    def _res_badge_text(self) -> str:
+        sw, sh = self._source_width, self._source_height
+        if sw and sh:
+            return f"Source: {sw}×{sh}"
+        return "Source: —"
+
+    def _mode_badge_text(self) -> str:
+        if self._adaptive:
+            return "Auto (adaptativo)"
+        if self._quality == "original":
+            return "Original"
+        return "Throttled"
+
+    def _refresh_badges(self) -> None:
+        for name, fn in (
+            ("quality_badge", self._quality_badge_text),
+            ("res_badge", self._res_badge_text),
+            ("mode_badge", self._mode_badge_text),
+        ):
+            if hasattr(self, name):
+                getattr(self, name).setText(fn())
+        if hasattr(self, "pos_badge"):
+            self.pos_badge.setText(f"{self._current_index + 1}/{self._total_items}")
 
     # ============================================================ backend: libVLC
     def _build_vlc(self, title, url, layout) -> None:
@@ -758,6 +1089,7 @@ class VideoPlayerDialog(QDialog):
                 self.on_progress(pos, self._duration)
             except Exception:  # noqa: BLE001
                 pass
+        self._maybe_offer_autoplay()
 
     def _on_ended(self) -> None:
         # Ao terminar, marca progresso completo.
@@ -766,6 +1098,11 @@ class VideoPlayerDialog(QDialog):
                 self.on_progress(self._last_duration, self._last_duration)
             except Exception:  # noqa: BLE001
                 pass
+        # Auto-play imediato da próxima aula (sem esperar o countdown).
+        if self.on_next and self._current_index < self._total_items - 1:
+            if not self._auto_next_requested:
+                self._auto_next_requested = True
+                self.go_next()
 
     # =============================================================== comandos UI
     def _request_vlc(self) -> None:
@@ -870,7 +1207,24 @@ class VideoPlayerDialog(QDialog):
             self.vlc.set_rate(rate)
         elif self.mode == "qt":
             self.player.setPlaybackRate(rate)
+        # Velocidade persistente por curso (callback opcional do app).
+        if self.on_rate_change:
+            try:
+                self.on_rate_change(rate)
+            except Exception:  # noqa: BLE001
+                pass
         self._show_toast(f"{text}", 900)
+
+    def _cycle_speed(self, direction: int) -> None:
+        """Atalhos [ e ]: diminui/aumenta a velocidade um passo."""
+        idx = self.speed_box.currentIndex()
+        idx = max(0, min(self.speed_box.count() - 1, idx + direction))
+        self.speed_box.setCurrentIndex(idx)
+
+    def _seek_percent(self, pct: float) -> None:
+        """Atalhos 0–9: pula para uma porcentagem do vídeo."""
+        if self._duration:
+            self._seek_to(int(self._duration * max(0.0, min(1.0, pct))))
 
     # =============================================================== QtMultimedia
     def on_duration(self, duration: int) -> None:
@@ -904,6 +1258,7 @@ class VideoPlayerDialog(QDialog):
                 self.on_progress(int(position), self._duration)
             except Exception:  # noqa: BLE001
                 pass
+        self._maybe_offer_autoplay()
 
     def on_state_changed(self, *_args) -> None:
         try:
@@ -967,11 +1322,11 @@ class VideoPlayerDialog(QDialog):
             self.toggle_play()
             event.accept()
             return
-        if key == Qt.Key_Left:
+        if key in (Qt.Key_Left, Qt.Key_J):
             self.seek_relative(-10_000)
             event.accept()
             return
-        if key == Qt.Key_Right:
+        if key in (Qt.Key_Right, Qt.Key_L):
             self.seek_relative(10_000)
             event.accept()
             return
@@ -993,6 +1348,30 @@ class VideoPlayerDialog(QDialog):
             self.toggle_mute()
             event.accept()
             return
+        if key == Qt.Key_D:
+            self._toggle_debug()
+            event.accept()
+            return
+        if key == Qt.Key_N:
+            self.go_next()
+            event.accept()
+            return
+        if key == Qt.Key_P:
+            self.go_prev()
+            event.accept()
+            return
+        if key == Qt.Key_BracketLeft:
+            self._cycle_speed(-1)
+            event.accept()
+            return
+        if key == Qt.Key_BracketRight:
+            self._cycle_speed(+1)
+            event.accept()
+            return
+        if Qt.Key_0 <= key <= Qt.Key_9:
+            self._seek_percent((key - Qt.Key_0) / 10.0)
+            event.accept()
+            return
         if key == Qt.Key_Escape:
             if self.isFullScreen():
                 self.showNormal()
@@ -1001,7 +1380,9 @@ class VideoPlayerDialog(QDialog):
         super().keyPressEvent(event)
 
     def closeEvent(self, event) -> None:
-        for timer_name in ("_poll", "_save_timer", "_buffer_timer", "_idle_timer"):
+        for timer_name in (
+            "_poll", "_save_timer", "_buffer_timer", "_idle_timer", "_autoplay_timer",
+        ):
             try:
                 getattr(self, timer_name).stop()
             except Exception:  # noqa: BLE001

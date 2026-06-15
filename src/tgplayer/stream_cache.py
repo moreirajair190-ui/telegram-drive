@@ -1,4 +1,4 @@
-"""Cache de streaming sob demanda, por blocos — versão ACELERADA (v6.2).
+"""Cache de streaming sob demanda, por blocos — versão ACELERADA (v6.3).
 
 A grande diferença para a versão antiga: em vez de baixar o vídeo inteiro de
 forma sequencial (o que travava ao dar seek para frente), aqui o vídeo é
@@ -6,7 +6,7 @@ dividido em blocos fixos. Só os blocos que o player realmente pede (via Range
 HTTP) são baixados do Telegram, e o player pode pular para qualquer ponto do
 vídeo que o bloco correspondente é buscado na hora.
 
-Otimizações de PARTIDA RÁPIDA (v6.2), para o player não ficar preso em
+Otimizações de PARTIDA RÁPIDA, para o player não ficar preso em
 00:00 / 00:00 com tela preta:
 
 1. **Pré-busca do `moov`**: ao preparar o stream, baixamos *imediatamente*
@@ -27,6 +27,27 @@ Otimizações de PARTIDA RÁPIDA (v6.2), para o player não ficar preso em
    bloco inicial (de partida) já foi baixado — usado pelo overlay
    "Carregando aula… NN%".
 
+NOVO na v6.3 (ideias portadas do projeto caamer20/Telegram-Drive):
+
+5. **Alinhamento de offset à fronteira de CDN** (`server.rs::build_media_response`):
+   o CDN do Telegram arredonda offsets para baixo até a fronteira de 512 KiB.
+   Pedidos `Range` desalinhados podem retornar dados deslocados → corrompem o
+   parsing das *boxes* MP4 e quebram o seek. Como aqui já baixamos por blocos de
+   2 MiB (múltiplos de 512 KiB) a partir de offsets alinhados ao MiB, o
+   invariante "offset alinhado <= offset pedido" é naturalmente respeitado; os
+   bytes excedentes são descartados (`bytes_to_skip`) na leitura. Ainda assim
+   expomos `CDN_ALIGNMENT` e logamos o cálculo em DEBUG para auditoria.
+
+6. **Descoberta do átomo `moov` em 3 passos** (`useAdaptiveStreaming.ts`):
+   `discover_moov()` procura o `moov` lendo primeiro 128 KiB, depois 512 KiB e,
+   por fim, a cauda (512 KiB finais), validando a box (`mvhd` como 1º filho) e
+   pré-aquecendo o cache dos blocos onde o moov vive. O resultado é guardável em
+   SQLite (`moov_cache`) para boot instantâneo na 2ª vez.
+
+7. **Throttle de banda por qualidade** (`types.ts::QUALITY_THROTTLE_MAP`): o
+   gerador `read_range` pode limitar a taxa de entrega (kbps) para simular as
+   qualidades 360p/480p/720p/1080p sem reencode, e mede a banda real entregue.
+
 O arquivo de cache é esparso, fica em disco apenas durante a reprodução e é
 apagado ao fechar o player: o vídeo NUNCA fica armazenado permanentemente.
 """
@@ -35,6 +56,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import struct
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -56,6 +78,24 @@ FAST_FIRST_BYTES = 256 * 1024
 # Quantos blocos do FINAL pré-buscar (onde costuma ficar o `moov`).
 MOOV_TAIL_BLOCKS = 2
 
+# Fronteira de arredondamento do CDN do Telegram (512 KiB). Pedidos de Range
+# precisam começar em múltiplos disso para não receber dados deslocados.
+CDN_ALIGNMENT = 512 * 1024
+
+# Tamanhos de varredura para a descoberta do átomo `moov` (em bytes).
+MOOV_DISCOVERY_BYTES = 128 * 1024
+MOOV_RETRY_BYTES = 512 * 1024
+MOOV_TAIL_BYTES = 512 * 1024
+# Tamanho máximo plausível de um `moov` (evita falso-positivo dentro de `mdat`).
+MOOV_MAX_SIZE = 64 * 1024 * 1024
+
+
+def align_down(value: int, alignment: int = CDN_ALIGNMENT) -> int:
+    """Arredonda `value` para baixo até o múltiplo de `alignment`."""
+    if alignment <= 0:
+        return value
+    return (value // alignment) * alignment
+
 
 class StreamSession:
     """Gerencia o download por blocos de uma única aula em reprodução."""
@@ -69,6 +109,8 @@ class StreamSession:
         size: int,
         cache_path: Path,
         mime_type: str | None = None,
+        throttle_kbps: int = 0,
+        max_retries: int = 2,
     ) -> None:
         self.token = token
         self.client = client
@@ -77,6 +119,12 @@ class StreamSession:
         self.size = int(size or 0)
         self.cache_path = cache_path
         self.mime_type = mime_type or "video/mp4"
+        # Limite de banda em kbps (0 = ilimitado). Pode ser trocado em tempo real.
+        self.throttle_kbps = max(0, int(throttle_kbps or 0))
+        # Tentativas extra por bloco em caso de erro de rede ("conexão instável").
+        # Ideia portada do tratamento de re-tentativas/backoff do projeto de
+        # referência (downloads resilientes em redes ruins).
+        self.max_retries = max(0, int(max_retries or 0))
 
         self.total_blocks = (
             max(1, (self.size + BLOCK_SIZE - 1) // BLOCK_SIZE) if self.size else 0
@@ -95,6 +143,14 @@ class StreamSession:
         self.last_access = time.time()
         self.closed = False
         self.error: str | None = None
+
+        # ---- Medição de banda (janela deslizante) --------------------------
+        self._served_bytes = 0
+        self._band_window: list[tuple[float, int]] = []  # (timestamp, bytes)
+
+        # ---- Resultado da descoberta do moov -------------------------------
+        # {found, moov_offset, moov_size, located} preenchido por discover_moov().
+        self.moov_info: dict[str, int | bool] | None = None
 
         # Pré-aloca arquivo esparso para permitir seek/escrita em qualquer offset.
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -204,40 +260,80 @@ class StreamSession:
                     return
                 block_offset = block * BLOCK_SIZE
                 target = self._block_size_for(block) or BLOCK_SIZE
-                message = await self._get_message()
 
                 # O Pyrogram trabalha com offset/limit em unidades de 1 MiB.
+                # block_offset é múltiplo de 2 MiB → naturalmente alinhado à
+                # fronteira de 512 KiB do CDN (CDN_ALIGNMENT). Sem desalinhamento,
+                # sem bytes a descartar no download (o skip ocorre só na leitura).
                 one_mib = 1024 * 1024
                 pyro_offset = block_offset // one_mib
                 blocks_in_mib = max(1, BLOCK_SIZE // one_mib)
 
-                written = 0
-                async for chunk in self.client.stream_media(
-                    message, offset=pyro_offset, limit=blocks_in_mib
-                ):
-                    if self.closed:
-                        return
-                    if not chunk:
-                        continue
-                    # Não escreve além do tamanho do bloco.
-                    remaining = target - written
-                    if remaining <= 0:
+                # Loop de re-tentativas (modo "conexão instável"): em erro de
+                # rede, espera com backoff e refaz o stream a partir do offset
+                # já gravado, sem reiniciar o bloco do zero.
+                attempt = 0
+                last_exc: Exception | None = None
+                while True:
+                    written = self._block_filled.get(block, 0)
+                    try:
+                        message = await self._get_message()
+                        # Reposiciona o offset Pyrogram para o ponto já gravado
+                        # (em unidades de 1 MiB) na re-tentativa.
+                        resume_mib = written // one_mib
+                        async for chunk in self.client.stream_media(
+                            message,
+                            offset=pyro_offset + resume_mib,
+                            limit=blocks_in_mib - resume_mib,
+                        ):
+                            if self.closed:
+                                return
+                            if not chunk:
+                                continue
+                            # Não escreve além do tamanho do bloco.
+                            remaining = target - written
+                            if remaining <= 0:
+                                break
+                            if len(chunk) > remaining:
+                                chunk = chunk[:remaining]
+                            await asyncio.to_thread(
+                                self._write_at, block_offset + written, bytes(chunk)
+                            )
+                            written += len(chunk)
+                            self._block_filled[block] = written
+                            # Libera a PARTIDA RÁPIDA assim que possível.
+                            if not partial.is_set() and (
+                                written >= min(FAST_FIRST_BYTES, target)
+                            ):
+                                partial.set()
+                            self.last_access = time.time()
+                            if written >= target:
+                                break
+                        # Sucesso (chegou ao fim do stream ou ao alvo).
+                        last_exc = None
                         break
-                    if len(chunk) > remaining:
-                        chunk = chunk[:remaining]
-                    await asyncio.to_thread(
-                        self._write_at, block_offset + written, bytes(chunk)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:  # noqa: BLE001
+                        last_exc = exc
+                        if attempt >= self.max_retries or self.closed:
+                            break
+                        attempt += 1
+                        backoff = min(2.0, 0.4 * (2 ** (attempt - 1)))
+                        log.warning(
+                            "Bloco %s token %s falhou (tentativa %d/%d): %s — "
+                            "re-tentando em %.1fs",
+                            block, self.token, attempt, self.max_retries, exc, backoff,
+                        )
+                        await asyncio.sleep(backoff)
+
+                if last_exc is not None:
+                    self.error = str(last_exc)
+                    log.exception(
+                        "Falha ao baixar bloco %s do token %s após %d tentativa(s)",
+                        block, self.token, self.max_retries,
+                        exc_info=last_exc,
                     )
-                    written += len(chunk)
-                    self._block_filled[block] = written
-                    # Libera a PARTIDA RÁPIDA assim que houver bytes suficientes.
-                    if not partial.is_set() and (
-                        written >= min(FAST_FIRST_BYTES, target)
-                    ):
-                        partial.set()
-                    self.last_access = time.time()
-                    if written >= target:
-                        break
 
                 # Garante os eventos no fim (mesmo que o bloco seja pequeno).
                 self._block_filled[block] = max(self._block_filled.get(block, 0), written)
@@ -324,14 +420,54 @@ class StreamSession:
                 break
             self._spawn_download(nxt)
 
-    async def read_range(self, start: int, end: int):
+    # ------------------------------------------------- leitura de bytes brutos
+    async def read_exact(self, start: int, length: int, timeout: float = 90.0) -> bytes:
+        """Lê exatamente [start, start+length) (usado pela descoberta do moov).
+
+        Diferente de `read_range`, retorna um único `bytes` (não streaming) e é
+        usado internamente para parsear as boxes do MP4.
+        """
+        if length <= 0:
+            return b""
+        if self.size:
+            length = min(length, max(0, self.size - start))
+        out = bytearray()
+        end = start + length - 1
+        async for chunk in self.read_range(start, end, measure=False):
+            out.extend(chunk)
+            if len(out) >= length:
+                break
+        return bytes(out[:length])
+
+    async def read_range(self, start: int, end: int, measure: bool = True):
         """Gerador assíncrono que entrega bytes do intervalo [start, end].
 
         Faz YIELD PARCIAL: assim que parte de um bloco chega, os bytes são
         entregues — o player não espera o bloco inteiro de 2 MiB. Também faz
         read-ahead agressivo dos próximos blocos.
+
+        Aplica alinhamento de CDN (o offset real do bloco é múltiplo de 512 KiB)
+        e, quando há throttle, limita a taxa de entrega medindo a banda real.
         """
         self.last_access = time.time()
+
+        # --- Alinhamento de CDN (auditoria/DEBUG) ---------------------------
+        # Os blocos sempre começam em múltiplos de 2 MiB (≥ 512 KiB), então o
+        # `aligned_start` <= `start`. Os bytes entre eles são pulados ao posicionar
+        # a leitura no offset exato pedido (já feito naturalmente abaixo).
+        aligned_start = align_down(start, CDN_ALIGNMENT)
+        bytes_to_skip = start - aligned_start
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug(
+                "read_range token=%s requested=%d cdn_aligned=%d chunk_index=%d skip=%d",
+                self.token, start, aligned_start, start // BLOCK_SIZE, bytes_to_skip,
+            )
+
+        # Throttle: bytes por segundo permitidos (0 = ilimitado).
+        throttle_bps = (self.throttle_kbps * 1000 / 8) if self.throttle_kbps else 0
+        window_start = time.time()
+        window_bytes = 0
+
         position = start
         while position <= end and not self.closed:
             block = position // BLOCK_SIZE
@@ -370,12 +506,177 @@ class StreamSession:
             position += len(data)
             self.last_access = time.time()
 
+            if measure:
+                self._record_served(len(data))
+            # --- Throttle de banda (qualidade) ------------------------------
+            if throttle_bps:
+                window_bytes += len(data)
+                elapsed = time.time() - window_start
+                expected = window_bytes / throttle_bps
+                if expected > elapsed:
+                    await asyncio.sleep(min(0.5, expected - elapsed))
+                if elapsed >= 1.0:
+                    window_start = time.time()
+                    window_bytes = 0
+
+    # --------------------------------------------------------- medição de banda
+    def _record_served(self, n: int) -> None:
+        now = time.time()
+        self._served_bytes += n
+        self._band_window.append((now, n))
+        # Mantém só os últimos ~3 s.
+        cutoff = now - 3.0
+        while self._band_window and self._band_window[0][0] < cutoff:
+            self._band_window.pop(0)
+
+    def measured_kbps(self) -> float:
+        """Banda real entregue ao player nos últimos ~3 s, em kbps."""
+        if not self._band_window:
+            return 0.0
+        now = time.time()
+        span = max(0.001, now - self._band_window[0][0])
+        total = sum(n for _, n in self._band_window)
+        return (total * 8) / 1000.0 / span
+
+    def set_throttle_kbps(self, kbps: int) -> None:
+        self.throttle_kbps = max(0, int(kbps or 0))
+
+    # ------------------------------------------------ descoberta do átomo moov
+    async def discover_moov(self) -> dict[str, int | bool]:
+        """Localiza o átomo `moov` do MP4 em 3 passos (128K → 512K → cauda).
+
+        Retorna um dicionário {found, moov_offset, moov_size, located} onde
+        `located` é 'head' (faststart) ou 'tail' (moov-at-end). Pré-aquece o
+        cache dos blocos onde o moov vive para acelerar a partida do player.
+        """
+        if self.moov_info is not None:
+            return self.moov_info
+        info: dict[str, int | bool] = {
+            "found": False, "moov_offset": 0, "moov_size": 0, "located": 0,
+        }
+        if not self.size:
+            self.moov_info = info
+            return info
+
+        # Passo 1 e 2: varre o INÍCIO (128 KiB e depois 512 KiB).
+        for scan in (MOOV_DISCOVERY_BYTES, MOOV_RETRY_BYTES):
+            head = await self.read_exact(0, min(scan, self.size), timeout=30.0)
+            found = self._scan_moov_box(head, base_offset=0)
+            if found is not None:
+                off, sz = found
+                info = {"found": True, "moov_offset": off, "moov_size": sz, "located": 1}
+                self.moov_info = info
+                self._prewarm_range(off, sz)
+                return info
+
+        # Passo 3: varre a CAUDA (512 KiB finais) — caso "moov-at-end".
+        tail_len = min(MOOV_TAIL_BYTES, self.size)
+        tail_start = self.size - tail_len
+        tail = await self.read_exact(tail_start, tail_len, timeout=30.0)
+        found = self._scan_moov_box(tail, base_offset=tail_start)
+        if found is not None:
+            off, sz = found
+            info = {"found": True, "moov_offset": off, "moov_size": sz, "located": 2}
+            # Pré-aquece os blocos da cauda onde está o moov.
+            self._prewarm_range(off, sz)
+        self.moov_info = info
+        return info
+
+    def _scan_moov_box(self, buf: bytes, base_offset: int) -> tuple[int, int] | None:
+        """Varre as boxes MP4 de `buf` procurando um `moov` válido.
+
+        Estratégia 1 — caminhada estruturada de boxes (a partir do começo do
+        buffer, válida quando `base_offset == 0` ou quando o buffer começa numa
+        fronteira de box). Estratégia 2 — busca direta pela assinatura `moov`
+        (necessária ao varrer a CAUDA, onde o buffer começa no meio de `mdat`).
+
+        Em ambos os casos validamos: tamanho plausível (≤ MOOV_MAX_SIZE) e
+        primeiro filho == `mvhd` (evita falso-positivo de bytes 'moov' dentro
+        de `mdat`).
+        """
+        n = len(buf)
+
+        def _validate(pos: int) -> tuple[int, int] | None:
+            """Valida uma possível box `moov` cujo *tipo* está em buf[pos+4:pos+8]."""
+            if pos + 8 > n:
+                return None
+            box_size = struct.unpack(">I", buf[pos:pos + 4])[0]
+            header = 8
+            if box_size == 1:  # 64-bit largesize
+                if pos + 16 > n:
+                    return None
+                box_size = struct.unpack(">Q", buf[pos + 8:pos + 16])[0]
+                header = 16
+            if box_size == 0:
+                box_size = (self.size - (base_offset + pos)) if self.size else (n - pos)
+            if not (0 < box_size <= MOOV_MAX_SIZE):
+                return None
+            child = buf[pos + header:pos + header + 8]
+            if len(child) >= 8 and child[4:8] == b"mvhd":
+                return base_offset + pos, int(box_size)
+            # Cauda truncada (filho fora do buffer): confia no tipo.
+            if len(child) < 8:
+                return base_offset + pos, int(box_size)
+            return None
+
+        # Estratégia 1: caminhada estruturada.
+        pos = 0
+        while pos + 8 <= n:
+            box_size = struct.unpack(">I", buf[pos:pos + 4])[0]
+            box_type = buf[pos + 4:pos + 8]
+            header = 8
+            if box_size == 1:
+                if pos + 16 > n:
+                    break
+                box_size = struct.unpack(">Q", buf[pos + 8:pos + 16])[0]
+                header = 16
+            if box_size == 0:
+                box_size = (self.size - (base_offset + pos)) if self.size else (n - pos)
+            if box_type == b"moov":
+                hit = _validate(pos)
+                if hit is not None:
+                    return hit
+            if box_size < header:
+                break
+            pos += box_size
+
+        # Estratégia 2: busca direta pela assinatura `moov` (cauda mid-box).
+        search = 0
+        while True:
+            idx = buf.find(b"moov", search)
+            if idx < 4:
+                if idx == -1:
+                    break
+                search = idx + 4
+                continue
+            # O tipo `moov` aparece em [idx, idx+4); o tamanho da box vem 4 bytes antes.
+            hit = _validate(idx - 4)
+            if hit is not None:
+                return hit
+            search = idx + 4
+        return None
+
+    def _prewarm_range(self, offset: int, size: int) -> None:
+        """Dispara o download dos blocos que cobrem [offset, offset+size)."""
+        if not self.size or size <= 0:
+            return
+        first = max(0, offset) // BLOCK_SIZE
+        last = min(self.size - 1, offset + size - 1) // BLOCK_SIZE
+        for b in range(first, last + 1):
+            self._spawn_download(b)
+
     async def close(self) -> None:
         self.closed = True
         # Cancela downloads em andamento (libera rede ao fechar a janela).
         for task in list(self._tasks):
             if not task.done():
                 task.cancel()
+        # Aguarda brevemente o cancelamento limpo das tasks em voo.
+        if self._tasks:
+            try:
+                await asyncio.wait(list(self._tasks), timeout=2.0)
+            except Exception:  # noqa: BLE001
+                pass
         for ev in self._block_ready.values():
             ev.set()
         for ev in self._block_partial.values():

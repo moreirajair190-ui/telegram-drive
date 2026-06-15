@@ -4,6 +4,14 @@
 > mudou para **TgPlayer** na v6.2. **Seus dados (login, progresso e
 > configurações) são preservados** ao atualizar.
 
+> **Novidades da v6.3:** streaming à prova de corrupção (alinhamento de CDN +
+> cache do `moov`), **seletor de qualidade** com modo adaptativo, **navegação
+> entre aulas e auto-play**, **miniaturas + resolução** nas listas, seção
+> **"Streaming & Rede"** (proxy SOCKS5/MTProto, limite de banda, modo conexão
+> instável), **widget de banda em tempo real**, **copiar link nativo do
+> Telegram** e **"Continuar assistindo"** com % de progresso por curso.
+> Veja o `CHANGELOG.md` para o mapeamento completo das ideias portadas.
+
 Organize e assista às **videoaulas dos seus cursos no Telegram** dentro de uma
 interface premium, com **streaming sob demanda**: a aula carrega na hora,
 **sem baixar o vídeo inteiro**, **sem armazenar** o arquivo no seu PC e
@@ -48,6 +56,25 @@ tarefas e gráficos).
     **retoma no minuto exato** (se faltar < 5 s para o fim, recomeça do zero) e
     marca a aula como **assistida ✅** ao passar de ~92%.
   - Aviso amigável com **"↻ Tentar de novo"** e **"Abrir no VLC"** em caso de erro.
+- **Streaming reforçado e qualidade adaptativa (v6.3):**
+  - **Alinhamento de offset do CDN (512 KiB)** + **descoberta do `moov` em 3
+    passos** + **cache persistente do `moov`** (boot instantâneo na 2ª vez).
+  - **Seletor de qualidade ⚙** (360/480/720/1080/original) com **modo
+    adaptativo** (mede a banda e ajusta sozinho) e trava anti-*upscale*.
+  - **Badges** de qualidade/resolução/modo e **overlay de debug (D)** com
+    velocidade, buffer e limpar cache.
+  - **Navegação entre aulas (‹ ›) + auto-play da próxima** (contagem de 5 s) e
+    **atalhos** N/P, J/L (±10 s), [ / ] (velocidade), 0–9 (saltar %).
+  - **Velocidade persistente por curso.**
+- **Miniaturas + resolução nas listas (v6.3):** cache de miniaturas com poda LRU
+  e **VideoMetaBadge** (ex.: `1080p`) nas aulas.
+- **Seção "Streaming & Rede" (v6.3):** **proxy SOCKS5/HTTP/MTProto**, **limite de
+  banda (kbps)**, tamanho do bloco, re-tentativas e **modo conexão instável**
+  (resiliência em redes ruins). **Widget de banda em tempo real** no topo.
+- **Copiar link nativo do Telegram (v6.3):** `t.me/{canal}/{id}` para canais
+  públicos (com aviso quando o canal é privado).
+- **Continuar assistindo (v6.3):** filtro **"▶️ Continuar assistindo"** com as
+  aulas em andamento e **% de progresso por curso** na lista de cursos.
 - **Sumário por matéria** no formato hierárquico
   `= Módulo / == Aula / === Tipo / #TAG01 #TAG02`. Cada hashtag liga o item do
   menu à aula com a **mesma hashtag**. Cada matéria tem o **seu próprio** sumário
