@@ -33,7 +33,7 @@ from aiohttp import web
 from .paths import CACHE_DIR, SESSION_DIR, ensure_dirs
 from .player_html import build_player_html
 from .quality import adaptive_quality, throttle_for
-from .stream_cache import BLOCK_SIZE, StreamSession
+from .stream_cache import BLOCK_SIZE, FIRST_CHUNK_SIZE, StreamSession
 from .summary_parser import looks_like_menu, menu_score
 from .utils import (
     ensure_extension,
@@ -706,6 +706,11 @@ class TelegramService:
             # Descobre o moov em 2º plano e grava no cache para a próxima vez.
             asyncio.ensure_future(self._discover_and_cache_moov(token, video))
 
+        # FASTSTART VIRTUAL: monta o cabeçalho ftyp+moov o quanto antes, em 2º
+        # plano. Assim, quando o player fizer o primeiro Range, o header já está
+        # pronto e a partida é quase instantânea.
+        asyncio.ensure_future(self._build_faststart_bg(token))
+
         self.session_meta[token] = {
             "title": video.get("title") or filename,
             "start_position_ms": int(video.get("start_position_ms") or 0),
@@ -725,6 +730,101 @@ class TelegramService:
             "token": token,
             "port": self.port,
         }
+
+    async def _build_faststart_bg(self, token: str) -> None:
+        """Tenta montar o cabeçalho faststart em 2º plano (best-effort)."""
+        session = self.sessions.get(token)
+        if not session:
+            return
+        try:
+            await session.ensure_faststart()
+        except Exception:  # noqa: BLE001
+            log.exception("faststart em 2º plano falhou para %s", token)
+
+    # ------------------------------------------------------- warm-up (pré-busca)
+    async def warm_up_video(self, video: dict[str, Any]) -> dict[str, Any]:
+        """Pré-aquece o INÍCIO de uma aula ao ser SELECIONADA (antes do clique).
+
+        Descobre o `moov`, monta o cabeçalho faststart e baixa os primeiros
+        ~512 KiB do `mdat` numa sessão efêmera. O resultado fica em `moov_cache`,
+        de modo que, ao clicar "Assistir", a partida já está quente.
+
+        É leve e tolerante a cancelamento: se o usuário trocar de aula, o app
+        simplesmente não chama de novo (debounce no lado da UI). A sessão
+        efêmera é liberada ao final.
+        """
+        if not self.client:
+            return {"warmed": False}
+        chat_id = video.get("chat_id")
+        message_id = int(video.get("message_id") or 0)
+        size = int(video.get("size") or 0)
+        if not chat_id or not message_id or not size:
+            return {"warmed": False}
+        await self._ensure_stream_server()
+        token = "warm_" + uuid.uuid4().hex
+        cache_path = self.stream_cache_dir / f"{token}.part"
+        session = StreamSession(
+            token=token,
+            client=self.client,
+            chat_id=chat_id,
+            message_id=message_id,
+            size=size,
+            cache_path=cache_path,
+            mime_type=video.get("mime_type"),
+            throttle_kbps=0,  # warm-up sempre na velocidade máxima
+            max_retries=1,
+        )
+        try:
+            # Reaproveita o moov_cache para não redescobrir.
+            cached_moov = None
+            if self.db:
+                try:
+                    cached_moov = self.db.get_moov_cache(str(chat_id), message_id)
+                except Exception:  # noqa: BLE001
+                    cached_moov = None
+            if cached_moov and cached_moov.get("moov_size"):
+                session.moov_info = {
+                    "found": True,
+                    "moov_offset": int(cached_moov.get("moov_offset") or 0),
+                    "moov_size": int(cached_moov.get("moov_size") or 0),
+                    "located": int(cached_moov.get("located") or 0),
+                }
+            session.prefetch_start()
+            await session.ensure_faststart()
+            # Persiste a descoberta para o boot instantâneo na hora de assistir.
+            info = session.moov_info or {}
+            if info.get("found") and self.db:
+                try:
+                    self.db.set_moov_cache(
+                        str(chat_id), message_id,
+                        file_size=size,
+                        moov_offset=int(info.get("moov_offset") or 0),
+                        moov_size=int(info.get("moov_size") or 0),
+                        located=int(info.get("located") or 0),
+                        duration_ms=(int(video["duration"]) * 1000)
+                        if video.get("duration") else None,
+                        width=video.get("width"),
+                        height=video.get("height"),
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+            # Garante os primeiros ~512 KiB do mdat baixados.
+            try:
+                await asyncio.wait_for(
+                    session._wait_for_bytes(0, FIRST_CHUNK_SIZE), timeout=20.0
+                )
+            except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+                pass
+            return {"warmed": True, "faststart": session.faststart_active}
+        except Exception:  # noqa: BLE001
+            log.exception("Falha no warm-up de %s/%s", chat_id, message_id)
+            return {"warmed": False}
+        finally:
+            # Sessão efêmera: o cache temporário some; o ganho fica no moov_cache.
+            try:
+                await session.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     async def _discover_and_cache_moov(self, token: str, video: dict[str, Any]) -> None:
         """Descobre o átomo `moov` e persiste no cache SQLite (2º plano)."""
@@ -752,6 +852,252 @@ class TelegramService:
             )
         except Exception:  # noqa: BLE001
             log.exception("Falha ao gravar moov_cache para %s", token)
+
+    # =========================================================== Aba "Arquivos"
+    # API de navegação de MÍDIA genérica (vídeo/PDF/imagem/zip/áudio) inspirada
+    # no caamer20/Telegram-Drive: lista, baixa (com progresso), envia (com
+    # progresso) e gera link t.me. Usada por `files_tab.FilesTab`.
+    @staticmethod
+    def _classify_media(message) -> dict[str, Any] | None:
+        """Mapeia uma mensagem Pyrogram para um item de mídia genérico.
+
+        Retorna ``None`` quando a mensagem não carrega mídia suportada.
+        Categorias: ``video``, ``image``, ``pdf``, ``zip``, ``audio``, ``file``.
+        """
+        media = None
+        kind = "file"
+        file_name = ""
+        mime_type = ""
+        size = None
+        duration = None
+        width = height = None
+        has_thumb = False
+
+        if getattr(message, "video", None):
+            media = message.video
+            kind = "video"
+        elif getattr(message, "animation", None):
+            media = message.animation
+            kind = "video"
+        elif getattr(message, "photo", None):
+            media = message.photo
+            kind = "image"
+        elif getattr(message, "audio", None):
+            media = message.audio
+            kind = "audio"
+        elif getattr(message, "voice", None):
+            media = message.voice
+            kind = "audio"
+        elif getattr(message, "document", None):
+            media = message.document
+            mime_type = (getattr(media, "mime_type", None) or "").lower()
+            file_name = (getattr(media, "file_name", None) or "")
+            lower = file_name.lower()
+            if mime_type.startswith("video/") or lower.endswith(
+                (".mp4", ".mkv", ".mov", ".avi", ".webm")
+            ):
+                kind = "video"
+            elif mime_type.startswith("image/") or lower.endswith(
+                (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")
+            ):
+                kind = "image"
+            elif mime_type == "application/pdf" or lower.endswith(".pdf"):
+                kind = "pdf"
+            elif lower.endswith((".zip", ".rar", ".7z", ".tar", ".gz")) or "zip" in mime_type:
+                kind = "zip"
+            elif mime_type.startswith("audio/") or lower.endswith(
+                (".mp3", ".m4a", ".ogg", ".wav", ".flac")
+            ):
+                kind = "audio"
+            else:
+                kind = "file"
+
+        if media is None:
+            return None
+
+        if not file_name:
+            file_name = getattr(media, "file_name", None) or ""
+        if not mime_type:
+            mime_type = (getattr(media, "mime_type", None) or "")
+        size = getattr(media, "file_size", None)
+        duration = getattr(media, "duration", None)
+        width = getattr(media, "width", None)
+        height = getattr(media, "height", None)
+        has_thumb = bool(getattr(media, "thumbs", None)) or kind == "image"
+
+        caption = getattr(message, "caption", None) or ""
+        if not file_name:
+            base = caption.splitlines()[0] if caption else ""
+            ext = {
+                "video": ".mp4", "image": ".jpg", "pdf": ".pdf",
+                "zip": ".zip", "audio": ".mp3",
+            }.get(kind, "")
+            file_name = safe_filename(base or f"{kind}_{message.id}") + (
+                ext if not Path(base or "").suffix else ""
+            )
+
+        date = getattr(message, "date", None)
+        return {
+            "message_id": int(message.id),
+            "kind": kind,
+            "file_name": file_name,
+            "title": safe_filename(file_name, fallback=f"{kind} {message.id}"),
+            "mime_type": mime_type or None,
+            "size": size,
+            "duration": duration,
+            "width": width,
+            "height": height,
+            "has_thumb": has_thumb,
+            "caption": caption,
+            "date": date.isoformat() if date else None,
+        }
+
+    async def list_chat_media(
+        self,
+        chat_id: str | int,
+        limit: int = 300,
+        kinds: tuple[str, ...] | None = None,
+        query: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Lista TODA a mídia de um chat (mais recentes primeiro).
+
+        ``kinds`` filtra por categoria; ``query`` filtra por nome/legenda.
+        """
+        if not self.client:
+            raise RuntimeError("Entre no Telegram primeiro.")
+        cid = int(chat_id) if str(chat_id).lstrip("-").isdigit() else chat_id
+        q = (query or "").strip().lower()
+        items: list[dict[str, Any]] = []
+        async for message in self.client.get_chat_history(cid, limit=limit):
+            entry = self._classify_media(message)
+            if entry is None:
+                continue
+            if kinds and entry["kind"] not in kinds:
+                continue
+            if q and q not in (
+                f"{entry['file_name']} {entry['caption']}".lower()
+            ):
+                continue
+            entry["chat_id"] = str(chat_id)
+            items.append(entry)
+        return items
+
+    async def ensure_media_thumbnail(
+        self, chat_id: str | int, message_id: int
+    ) -> str | None:
+        """Baixa/cacheia a miniatura de QUALQUER mídia (não só vídeo)."""
+        if not self.client:
+            return None
+        dest = self.thumb_path(chat_id, message_id)
+        if dest.exists() and dest.stat().st_size > 0:
+            try:
+                dest.touch()
+            except Exception:  # noqa: BLE001
+                pass
+            return str(dest)
+        try:
+            cid = int(chat_id) if str(chat_id).lstrip("-").isdigit() else chat_id
+            message = await self.client.get_messages(cid, message_id)
+            media = (
+                getattr(message, "video", None)
+                or getattr(message, "photo", None)
+                or getattr(message, "animation", None)
+                or getattr(message, "document", None)
+                or getattr(message, "audio", None)
+            )
+            if media is None:
+                return None
+            # Fotos: o próprio file_id serve como miniatura compacta.
+            if getattr(message, "photo", None):
+                await self.client.download_media(message.photo, file_name=str(dest))
+            else:
+                thumbs = getattr(media, "thumbs", None)
+                if not thumbs:
+                    return None
+                best = max(thumbs, key=lambda t: getattr(t, "file_size", 0) or 0)
+                await self.client.download_media(best, file_name=str(dest))
+            self._prune_thumb_cache(keep=dest)
+            return str(dest) if dest.exists() else None
+        except Exception:  # noqa: BLE001
+            log.exception("Falha ao baixar miniatura de %s/%s", chat_id, message_id)
+            return None
+
+    async def download_media_file(
+        self,
+        chat_id: str | int,
+        message_id: int,
+        dest_path: str,
+        progress_cb: Any = None,
+    ) -> dict[str, Any]:
+        """Baixa a mídia de uma mensagem para ``dest_path`` (com progresso).
+
+        ``progress_cb(current, total)`` é chamado pelo Pyrogram durante o
+        download. Retorna ``{"ok": True, "path": ...}`` ou ``{"ok": False,
+        "error": ...}``.
+        """
+        if not self.client:
+            return {"ok": False, "error": "Entre no Telegram primeiro."}
+        try:
+            cid = int(chat_id) if str(chat_id).lstrip("-").isdigit() else chat_id
+            message = await self.client.get_messages(cid, message_id)
+            dest = Path(dest_path)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            saved = await self.client.download_media(
+                message,
+                file_name=str(dest),
+                progress=progress_cb,
+            )
+            return {"ok": True, "path": str(saved or dest)}
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Falha ao baixar mídia %s/%s", chat_id, message_id)
+            return {"ok": False, "error": str(exc)}
+
+    async def upload_media_file(
+        self,
+        chat_id: str | int,
+        file_path: str,
+        caption: str | None = None,
+        progress_cb: Any = None,
+    ) -> dict[str, Any]:
+        """Envia um arquivo do disco para o chat (com progresso).
+
+        Detecta o tipo (vídeo/foto/áudio/documento) pela extensão. Trata erros
+        de permissão (CHAT_WRITE_FORBIDDEN etc.) com mensagem amigável.
+        """
+        if not self.client:
+            return {"ok": False, "error": "Entre no Telegram primeiro."}
+        path = Path(file_path)
+        if not path.exists():
+            return {"ok": False, "error": "Arquivo não encontrado."}
+        cid = int(chat_id) if str(chat_id).lstrip("-").isdigit() else chat_id
+        suffix = path.suffix.lower()
+        try:
+            if suffix in (".mp4", ".mkv", ".mov", ".avi", ".webm"):
+                msg = await self.client.send_video(
+                    cid, str(path), caption=caption or None, progress=progress_cb
+                )
+            elif suffix in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"):
+                msg = await self.client.send_photo(
+                    cid, str(path), caption=caption or None, progress=progress_cb
+                )
+            elif suffix in (".mp3", ".m4a", ".ogg", ".wav", ".flac"):
+                msg = await self.client.send_audio(
+                    cid, str(path), caption=caption or None, progress=progress_cb
+                )
+            else:
+                msg = await self.client.send_document(
+                    cid, str(path), caption=caption or None, progress=progress_cb
+                )
+            return {"ok": True, "message_id": int(getattr(msg, "id", 0))}
+        except Exception as exc:  # noqa: BLE001
+            text = str(exc)
+            if "FORBIDDEN" in text.upper() or "permission" in text.lower():
+                text = (
+                    "Sem permissão para enviar mensagens neste chat "
+                    "(canal somente leitura ou restrição de administrador)."
+                )
+            log.exception("Falha ao enviar arquivo para %s", chat_id)
+            return {"ok": False, "error": text}
 
     # ------------------------------------------------------------- miniaturas
     # Limites do cache de miniaturas (poda LRU). Ideia portada de `preview.rs`.
@@ -1064,7 +1410,17 @@ class TelegramService:
             return web.Response(status=404, text="Stream expirado ou inexistente.")
         session.last_access = time.time()
 
-        total = session.size
+        # FASTSTART VIRTUAL (v6.4): para o PRIMEIRO acesso, tentamos montar o
+        # cabeçalho ftyp+moov em memória (moov reposicionado para o início) de
+        # modo que o player nativo comece a tocar sem esperar a cauda. É um
+        # no-op barato se o arquivo já for faststart ou se já tiver sido tentado.
+        # Falhas caem automaticamente no modo legado (servir o arquivo original).
+        try:
+            await session.ensure_faststart()
+        except Exception:  # noqa: BLE001
+            log.exception("faststart: ensure falhou; seguindo no modo legado")
+
+        total = session.logical_size
         range_header = request.headers.get("Range")
         start, end = self._parse_range(range_header, total)
 
@@ -1098,7 +1454,9 @@ class TelegramService:
         response = web.StreamResponse(status=status, headers=headers)
         await response.prepare(request)
         try:
-            async for data in session.read_range(start, end):
+            # read_logical_range serve o header faststart (se ativo) e mapeia o
+            # restante para o mdat físico; sem faststart, delega a read_range.
+            async for data in session.read_logical_range(start, end):
                 if session.closed:
                     break
                 await response.write(data)

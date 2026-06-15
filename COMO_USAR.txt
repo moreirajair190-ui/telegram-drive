@@ -1,11 +1,25 @@
 ============================================================
-  TgPlayer v6.3 - COMO USAR (guia rapido, em portugues)
+  TgPlayer v6.4 - COMO USAR (guia rapido, em portugues)
 ============================================================
 
 O TgPlayer organiza e reproduz as videoaulas dos seus cursos do
 Telegram, com player premium e streaming sob demanda (o video NAO fica
 salvo no seu computador). Tem temas claro/escuro, navegacao por materias
 e uma aba de Acompanhamento de estudos (Pomodoro, tarefas e graficos).
+
+NOVO na v6.4:
+  - PARTIDA RAPIDA: o video agora comeca em 2 a 5 segundos (antes podia
+    levar quase 1 minuto). O app reorganiza o cabecalho do MP4 em memoria
+    (faststart virtual) e ja "aquece" o inicio assim que voce SELECIONA a
+    aula. Se algo falhar, ele volta ao modo antigo sem quebrar.
+  - PLAYER REDESENHADO: uma so cor de destaque, um menu de engrenagem (⚙)
+    que reune Qualidade, Velocidade e "Abrir no VLC", barra de progresso
+    com faixa de buffer e dica de tempo, cabecalho limpo e um indicador
+    de carregamento giratorio com porcentagem. Os atalhos sao os mesmos.
+  - NOVA ABA "🗂️ Arquivos": navegue por TODA a midia de um chat
+    (videos, PDFs, imagens, ZIP, audios) com miniaturas, busca e filtros;
+    baixe para o disco e envie arquivos com barra de progresso; pre-veja
+    imagens, abra videos no player interno e copie o link t.me.
 
 
 ------------------------------------------------------------
@@ -92,12 +106,38 @@ NOVO na v6.3 - dentro do player:
   D (overlay de debug com banda e buffer).
 - A velocidade de reproducao e lembrada POR CURSO.
 
+NOVO na v6.4 - dentro do player:
+- A engrenagem (⚙) agora reune Qualidade, Velocidade e "Abrir no VLC"
+  num so menu escuro, deixando a barra de controles bem limpa.
+- O cabecalho mostra apenas posicao na playlist, resolucao e o backend
+  (ex.: ⚡ Nativo), sem badges repetidos.
+- Enquanto carrega, aparece um indicador giratorio com a porcentagem.
+
 NOVO na v6.3 - na lista de aulas:
 - A resolucao aparece como badge (ex.: 1080p) quando conhecida.
 - O filtro "Continuar assistindo" (lista de materias) reune as aulas em
   andamento; a lista de cursos mostra o % concluido de cada curso.
 - No botao direito da aula: "Copiar link do Telegram (t.me)" gera o link
   nativo (somente para canais/grupos PUBLICOS).
+
+------------------------------------------------------------
+5B) ABA "🗂️ Arquivos" (NOVO na v6.4)
+------------------------------------------------------------
+A aba "Arquivos" transforma qualquer chat sincronizado numa especie de
+"nuvem" navegavel:
+- Escolha o CHAT no seletor do topo e clique em "Atualizar".
+- Os arquivos aparecem em GRADE com miniaturas. Use a BUSCA (por nome ou
+  legenda) e os FILTROS por tipo: Tudo / Videos / Imagens / PDFs /
+  Compactados / Audios / Outros.
+- Clique 2x num item:
+    * Video  -> abre no player interno;
+    * Imagem -> abre a pre-visualizacao;
+    * Outros -> oferece salvar no disco.
+- Botao direito num item: "Baixar para o disco" (com barra de progresso)
+  e "Copiar link t.me" (chats publicos).
+- Botao "Enviar arquivo": escolha um arquivo do seu PC para enviar ao
+  chat, com barra de progresso. Se o chat nao permitir envio (somente
+  leitura), o app avisa de forma amigavel.
 
 
 ------------------------------------------------------------

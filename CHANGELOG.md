@@ -1,5 +1,61 @@
 # Changelog — TgPlayer
 
+## v6.4.0
+
+Foco desta versão: **partida quase instantânea** do vídeo, um **player
+redesenhado** com identidade visual única e uma nova aba **🗂️ Arquivos** que
+transforma qualquer chat numa "nuvem" navegável. Tudo continua em
+Python/PySide6/Pyrogram/aiohttp — sem Rust/React. A arquitetura de streaming
+(servidor aiohttp local + `stream_cache.py` + backends de player) foi
+preservada.
+
+### 🔴 Partida rápida (2–5 s em vez de ~60 s)
+- **Faststart virtual:** quando o `moov` está no FIM do arquivo (não-faststart),
+  montamos em memória um cabeçalho `ftyp + moov` com os offsets de chunk
+  (`stco`/`co64`) corrigidos e servimos a ordem `ftyp → moov → mdat`. O servidor
+  mapeia offsets lógicos → físicos sob demanda, sem baixar a cauda inteira.
+  Implementado em `src/tgplayer/mp4_faststart.py`.
+- **Sintonia de início:** primeiro bloco de **512 KiB**, **8 downloads
+  paralelos** no arranque e **orçamento de 2 MiB** para os primeiros bytes,
+  reduzindo a latência do primeiro frame.
+- **Warm-up ao SELECIONAR a aula** (debounce ~400 ms): aquece o início e monta o
+  cabeçalho faststart em 2º plano; ao clicar em "Assistir", a partida já está
+  quente.
+- **Fallback seguro:** se a análise faststart falhar por qualquer motivo, o
+  streaming volta ao comportamento anterior — a reprodução nunca quebra.
+
+### 🟠 Player redesenhado
+- **Cor de acento única** (índigo `#7c5cff`): removidos os tons ciano/azul/
+  amarelo conflitantes.
+- **Menu de engrenagem ⚙:** Qualidade, Velocidade e "Abrir no VLC" reunidos num
+  único pop-up escuro, deixando a barra de controles limpa.
+- **Barra de progresso premium:** faixa de buffer, *tooltip* de tempo e
+  *thumb* com realce ao passar o mouse.
+- **Cabeçalho sem duplicidade:** título + `posição` · `resolução` · `⚡ backend`
+  (sem badges repetidos).
+- **Overlay de carregamento** com **spinner animado + porcentagem**.
+- Todos os atalhos preservados (Espaço, ←/→, J/L, ↑/↓, F, M, Esc, D, [ ], 0–9,
+  N/P). O mesmo visual foi aplicado ao `player_html.py`.
+
+### 🟢 Nova aba 🗂️ Arquivos
+- Navegação de **toda a mídia** de um chat (vídeo/PDF/imagem/zip/áudio) em
+  **grade com miniaturas**, **busca** e **filtros por tipo**.
+- **Baixar para o disco com progresso** e **enviar arquivo do disco com
+  progresso** (com mensagem amigável quando faltam permissões de envio).
+- **Pré-visualização de imagem**; **vídeo abre no player interno**; **copiar
+  link t.me** para chats públicos. Inspirada em `caamer20/Telegram-Drive`.
+
+### 🔧 Build mais robusto
+- `build_exe.bat` **nunca fecha sozinho** em erro (ponto de saída único com
+  `pause`), **verifica o venv** (`where python`) e afrouxa o Pyrogram para
+  `>=2.0.106,<2.1`.
+- `run_dev.bat` com a mesma proteção e checagem de ativação do venv.
+- Novo `build_exe.ps1` (alternativa em PowerShell, com `Read-Host` no final).
+
+### Testes
+- Novos `tests/test_faststart.py` (cabeçalho faststart + mapeamento lógico/
+  físico) e `tests/test_files_tab.py` (classificação de mídia + filtros da aba).
+
 ## v6.3.0
 
 Foco desta versão: **portar ideias e lógica** do projeto de referência
