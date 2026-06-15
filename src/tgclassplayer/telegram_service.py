@@ -325,42 +325,34 @@ class TelegramService:
 
     # ---- A) Fórum: cada tópico = uma matéria --------------------------------
     async def _sync_forum(self, chat, limit, progress_cb):
-        topics = await self._raw_get_forum_topics(chat, limit=200)
-        topic_titles = {int(t["id"]): t["title"] for t in topics}
+        """Sincroniza um fórum percorrendo CADA tópico SEPARADAMENTE.
+
+        Esta é a correção central do bug "tudo caiu em General": em vez de
+        varrer o histórico inteiro e tentar adivinhar o tópico de cada mensagem
+        (o Pyrogram do PyPI não preenche message_thread_id de forma confiável no
+        histórico), nós pedimos o histórico de CADA tópico com o parâmetro
+        `message_thread_id=tid`. Assim, cada vídeo e cada sumário pertencem ao
+        tópico correto — cada tópico = uma matéria com o SEU próprio sumário.
+        """
+        topics = await self._raw_get_forum_topics(chat, limit=400)
+        history_limit = max(0, int(limit or 0))
+        per_topic_limit = history_limit if history_limit else 0  # 0 = tudo
 
         videos: list[dict[str, Any]] = []
-        # candidatos de sumário por tópico: {topic_id: [(score, text, mid)]}
-        candidates: dict[int, list[tuple[int, str, int]]] = {}
-        scanned = 0
-        history_limit = max(0, int(limit or 0))
-
-        async for message in self.client.get_chat_history(chat.id, limit=history_limit):
-            scanned += 1
-            if progress_cb and scanned % 200 == 0:
-                try:
-                    progress_cb(scanned, len(videos))
-                except Exception:  # noqa: BLE001
-                    pass
-            tid = self._message_topic_id_int(message)
-            text = self._message_text(message)
-            if text and looks_like_menu(text):
-                candidates.setdefault(tid, []).append((menu_score(text), text, message.id))
-            video = self._message_to_video(message, chat.id, tid)
-            if video:
-                videos.append(video)
-
-        # Sumário fixado de cada tópico (prioritário sobre candidatas).
-        pinned_summaries = await self._collect_topic_pins(chat, list(topic_titles))
-
         subjects: list[dict[str, Any]] = []
+        scanned = 0
+
         for order, t in enumerate(topics):
             tid = int(t["id"])
             title = t["title"]
-            summary = pinned_summaries.get(tid)
-            if not summary:
-                cand = candidates.get(tid) or []
-                cand.sort(key=lambda c: c[0], reverse=True)
-                summary = cand[0][1] if cand else ""
+            topic_videos, summary, topic_scanned = await self._scan_topic(
+                chat, tid, per_topic_limit, progress_cb, scanned
+            )
+            scanned += topic_scanned
+
+            # Anexa os vídeos deste tópico (cada um marcado com o topic_id).
+            videos.extend(topic_videos)
+
             subjects.append(
                 {
                     "telegram_topic_id": str(tid),
@@ -370,28 +362,76 @@ class TelegramService:
                 }
             )
 
-        videos.reverse()
+        # Remove tópicos completamente vazios (sem vídeos e sem sumário), exceto
+        # quando o usuário pode querer mantê-los; preferimos manter só os úteis.
+        used_topic_ids = {v["telegram_topic_id"] for v in videos}
+        subjects = [
+            s
+            for s in subjects
+            if s["telegram_topic_id"] in used_topic_ids or s["summary_text"]
+        ] or subjects
+
         return subjects, videos, scanned
 
-    async def _collect_topic_pins(self, chat, topic_ids: list[int]) -> dict[int, str]:
-        """Tenta obter a mensagem fixada de cada tópico do fórum."""
-        pins: dict[int, str] = {}
-        for tid in topic_ids:
+    async def _scan_topic(self, chat, tid: int, limit: int, progress_cb, base_scanned: int):
+        """Lê o histórico de UM tópico do fórum (via message_thread_id).
+
+        Retorna (videos, summary, scanned). O sumário é a mensagem fixada do
+        tópico ou, na falta dela, a melhor candidata a "menu" dentro do tópico.
+        """
+        topic_videos: list[dict[str, Any]] = []
+        best_summary = ""
+        best_score = -1
+        scanned = 0
+
+        async def _consume(iterator):
+            nonlocal scanned, best_summary, best_score
+            async for message in iterator:
+                scanned += 1
+                if progress_cb and (base_scanned + scanned) % 200 == 0:
+                    try:
+                        progress_cb(base_scanned + scanned, len(topic_videos))
+                    except Exception:  # noqa: BLE001
+                        pass
+                text = self._message_text(message)
+                if text and looks_like_menu(text):
+                    bonus = 80 if getattr(message, "pinned", False) else 0
+                    score = menu_score(text) + bonus
+                    if score > best_score:
+                        best_score = score
+                        best_summary = text
+                video = self._message_to_video(message, chat.id, tid)
+                if video:
+                    topic_videos.append(video)
+
+        # Estratégia 1: histórico filtrado pelo tópico (preferida e correta).
+        ok = False
+        try:
+            await _consume(
+                self.client.get_chat_history(
+                    chat.id, limit=limit, message_thread_id=tid
+                )
+            )
+            ok = True
+        except TypeError:
+            # Versão do Pyrogram sem o parâmetro message_thread_id.
+            ok = False
+        except Exception:  # noqa: BLE001
+            log.exception("Falha ao ler histórico do tópico %s", tid)
+            ok = False
+
+        # Estratégia 2 (fallback): get_discussion_replies do tópico raiz.
+        if not ok:
             try:
-                # get_chat_history com message_thread_id traz só o tópico;
-                # a 1ª mensagem fixada costuma aparecer com flag pinned.
-                async for msg in self.client.get_chat_history(
-                    chat.id, limit=60, message_thread_id=tid
-                ):
-                    if getattr(msg, "pinned", False):
-                        text = self._message_text(msg)
-                        if text and looks_like_menu(text):
-                            pins[tid] = text
-                            break
+                await _consume(
+                    self.client.get_discussion_replies(chat.id, tid, limit=limit)
+                )
+                ok = True
             except Exception:  # noqa: BLE001
-                # message_thread_id pode não ser suportado em todas as versões.
-                continue
-        return pins
+                ok = False
+
+        topic_videos.reverse()
+        return topic_videos, best_summary, scanned
 
     # ---- B) Grupo/supergrupo normal: uma matéria ----------------------------
     async def _sync_group(self, chat, limit, progress_cb):

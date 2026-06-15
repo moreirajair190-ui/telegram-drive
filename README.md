@@ -24,11 +24,13 @@ tarefas e gráficos).
   vídeo que você está assistindo (cache em blocos), com leitura antecipada
   (*read-ahead*) e *seek* instantâneo. O arquivo temporário é apagado ao fechar
   o player — **nada do vídeo fica salvo de forma permanente**.
-- **Player premium em HTML5** (QtWebEngine) servido pelo **mesmo servidor local**
-  do vídeo (mesma origem) — isso corrige o bloqueio do `<video>` que existia
-  antes. Tem ±10s, velocidade, volume, tela cheia, *autoplay* e botão
-  **"Abrir no VLC"** na tela de erro. Fallback automático para o player nativo
-  (QtMultimedia) quando necessário.
+- **Player nativo (QtMultimedia)** como reprodutor **principal**: usa os
+  **codecs do próprio Windows** (Media Foundation), então reproduz H.264/AAC sem
+  o erro `DEMUXER_ERROR_NO_SUPPORTED_STREAMS` que ocorria no player HTML5.
+  Tem ±10s, velocidade, volume, tela cheia e botão **"Abrir no VLC"**, além de um
+  aviso amigável com **"Tentar de novo"** quando algum formato não é suportado.
+  O player HTML5 (QtWebEngine), servido pelo mesmo servidor local, fica como
+  *fallback* automático.
 - **Sumário por matéria** no formato hierárquico
   `= Módulo / == Aula / === Tipo / #TAG01 #TAG02`. Cada hashtag liga o item do
   menu à aula com a **mesma hashtag**. Cada matéria tem o **seu próprio** sumário
@@ -56,11 +58,15 @@ tarefas e gráficos).
 
 ## 🚀 Gerar o executável (.exe) no Windows — passo a passo
 
-1. Instale o **Python 3.10, 3.11 ou 3.12 (64 bits)** em
+1. Instale o **Python 3.11 ou 3.12 (64 bits)** em
    <https://www.python.org/downloads/> e **marque "Add Python to PATH"**.
+   > Evite o **Python 3.13** por enquanto: o `TgCrypto` ainda pode não ter
+   > *wheel* pronto nele (o build continua mesmo assim, mas sem essa otimização).
 2. Baixe/extraia esta pasta do projeto.
 3. Dê **duplo clique** em **`build_exe.bat`**. Ele cria um ambiente virtual,
    instala as dependências e gera o executável.
+   > Se aparecer um **aviso** dizendo que o TgCrypto não foi instalado, **tudo
+   > bem** — é opcional e o aplicativo funciona normalmente.
 4. Ao final, o app estará em **`dist\TGClassPlayer\TGClassPlayer.exe`**.
    Para distribuir, copie a **pasta inteira** `dist\TGClassPlayer`.
 
@@ -159,7 +165,7 @@ src/tgclassplayer/
   db.py                     # banco SQLite (cursos, matérias, aulas, estudo)
   telegram_service.py       # Telegram (detecção fórum/grupo/canal + streaming)
   summary_parser.py         # parser do sumário por matéria
-  player.py                 # player HTML5 (mesma origem) + fallback QtMultimedia
+  player.py                 # player QtMultimedia (principal) + fallback HTML5
   player_html.py            # página HTML do player
   study_tab.py              # aba Acompanhamento (Pomodoro, tarefas, gráficos)
   charts.py                 # gráficos em QPainter (sem QtCharts)

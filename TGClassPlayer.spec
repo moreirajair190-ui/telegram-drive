@@ -1,10 +1,14 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
-PyInstaller spec do TGClassPlayer v6.
+PyInstaller spec do TGClassPlayer v6 (compatível com PyInstaller 6.x).
 
 Gera um executável de pasta única (onedir) — é a forma MAIS confiável para
-apps com QtWebEngine (o player HTML5). O modo "onefile" também é possível,
+apps com QtWebEngine / QtMultimedia. O modo "onefile" também é possível,
 mas o WebEngine costuma falhar/ficar lento; por isso o padrão aqui é onedir.
+
+IMPORTANTE: o PyInstaller 6.x REMOVEU os argumentos antigos
+``win_no_prefer_redirects``, ``win_private_assemblies``, ``cipher`` e
+``block_cipher``. Este .spec NÃO os usa mais (era a causa do build falhar).
 
 Build:
     pyinstaller --noconfirm TGClassPlayer.spec
@@ -14,15 +18,8 @@ Resultado:
 """
 
 import os
-import sys
 
-from PyInstaller.utils.hooks import (
-    collect_all,
-    collect_data_files,
-    collect_submodules,
-)
-
-block_cipher = None
+from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 # ---------------------------------------------------------------------------
 # Coleta de dependências "pesadas" que o PyInstaller não detecta sozinho.
@@ -31,8 +28,10 @@ datas = []
 binaries = []
 hiddenimports = []
 
-# Pyrogram + TgCrypto: muitos submódulos carregados dinamicamente.
-for pkg in ("pyrogram", "tgcrypto"):
+
+def _collect(pkg):
+    """collect_all tolerante a falha (pacote ausente não quebra o build)."""
+    global datas, binaries, hiddenimports
     try:
         d, b, h = collect_all(pkg)
         datas += d
@@ -41,23 +40,23 @@ for pkg in ("pyrogram", "tgcrypto"):
     except Exception:
         pass
 
+
+# Pyrogram (TgCrypto é opcional — só coletamos se existir).
+_collect("pyrogram")
+_collect("tgcrypto")
+
 # aiohttp.
-hiddenimports += collect_submodules("aiohttp")
+try:
+    hiddenimports += collect_submodules("aiohttp")
+except Exception:
+    pass
 
 # QtWebEngine: precisa do QtWebEngineProcess + recursos (.pak, locales, ICU).
-# collect_all garante que o processo auxiliar e os dados venham junto.
 for pkg in (
     "PySide6.QtWebEngineCore",
     "PySide6.QtWebEngineWidgets",
-    "PySide6.QtWebEngineQuick",
 ):
-    try:
-        d, b, h = collect_all(pkg)
-        datas += d
-        binaries += b
-        hiddenimports += h
-    except Exception:
-        pass
+    _collect(pkg)
 
 # Submódulos PySide6 usados explicitamente.
 hiddenimports += [
@@ -72,18 +71,14 @@ hiddenimports += [
 ]
 
 # QtCharts é OPCIONAL: os gráficos da aba "Acompanhamento" usam QPainter puro
-# (módulo charts.py), então o app NÃO depende de QtCharts. Mas, se o pacote
-# estiver instalado, coletamos para não atrapalhar quem queira usá-lo.
-try:
-    d, b, h = collect_all("PySide6.QtCharts")
-    datas += d
-    binaries += b
-    hiddenimports += h
-except Exception:
-    pass
+# (módulo charts.py). Se o pacote estiver instalado, coletamos; senão, ignora.
+_collect("PySide6.QtCharts")
 
 # Pacote da própria aplicação (em src/).
-hiddenimports += collect_submodules("tgclassplayer")
+try:
+    hiddenimports += collect_submodules("tgclassplayer")
+except Exception:
+    pass
 
 # Ícone opcional (assets/icon.ico).
 icon_path = os.path.join("assets", "icon.ico")
@@ -106,17 +101,11 @@ a = Analysis(
         "numpy",
         "PIL",
         "pytest",
-        "PySide6.QtQuick3D",
-        "PySide6.QtDataVisualization",
-        "PySide6.Qt3DCore",
     ],
-    win_no_prefer_redirects=False,
-    win_private_assemblies=False,
-    cipher=block_cipher,
     noarchive=False,
 )
 
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+pyz = PYZ(a.pure, a.zipped_data)
 
 exe = EXE(
     pyz,

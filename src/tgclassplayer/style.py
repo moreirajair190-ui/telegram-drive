@@ -246,7 +246,8 @@ QMenu::separator {{ height: 1px; background: {c['border_soft']}; margin: 6px 8px
 
 QDialog {{ background: {c['bg']}; }}
 QCheckBox {{ color: {c['text']}; spacing: 8px; }}
-QLabel {{ color: {c['text']}; }}
+/* Rótulos SEM fundo opaco — evita "caixas" cobrindo o texto. */
+QLabel {{ color: {c['text']}; background: transparent; }}
 #PlayerDialog {{ background: #000; }}
 """
 
