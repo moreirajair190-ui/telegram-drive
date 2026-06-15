@@ -1,6 +1,6 @@
 @echo off
 REM ============================================================================
-REM  TGClassPlayer v5 - Gerador do executavel (.exe) para Windows
+REM  TGClassPlayer v6 - Gerador do executavel (.exe) para Windows
 REM ----------------------------------------------------------------------------
 REM  Basta dar DUPLO CLIQUE neste arquivo (ou rodar no Prompt de Comando).
 REM  Requisitos: Python 3.10/3.11/3.12 (64 bits) instalado e no PATH.
@@ -11,7 +11,7 @@ cd /d "%~dp0"
 
 echo.
 echo ============================================================
-echo   TGClassPlayer v5 - Build do executavel (.exe)
+echo   TGClassPlayer v6 - Build do executavel (.exe)
 echo ============================================================
 echo.
 

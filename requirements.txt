@@ -1,4 +1,4 @@
-# TGClassPlayer v5 — dependências
+# TGClassPlayer v6 — dependências
 #
 # Instale com:
 #     pip install -r requirements.txt
@@ -10,6 +10,9 @@ PySide6>=6.6,<6.9
 
 # Player HTML5 premium (player principal). Pacote separado no PySide6 6.8+.
 PySide6-Addons>=6.6,<6.9
+
+# Observação: a aba "Acompanhamento" desenha os gráficos com QPainter puro
+# (módulo charts.py). NÃO é necessário instalar PySide6-Charts/QtCharts.
 
 # Cliente do Telegram (MTProto).
 Pyrogram>=2.0.106

@@ -1,3 +1,22 @@
+"""Camada assíncrona: Pyrogram + servidor HTTP local (streaming + player).
+
+Principais responsabilidades:
+- Login no Telegram (API ID/HASH do próprio usuário).
+- DETECÇÃO AUTOMÁTICA do tipo de chat ao sincronizar:
+    A) Supergrupo com FÓRUM (tópicos) -> cada tópico vira uma MATÉRIA.
+       Usa a RAW API `raw.functions.channels.GetForumTopics` (o Pyrogram do
+       PyPI não tem método de alto nível). Para cada tópico, lista os vídeos
+       daquele tópico (filtrando por message_thread_id / reply_to.top_message)
+       e pega o sumário daquele tópico (mensagem fixada do tópico ou a melhor
+       candidata a "menu").
+    B) Supergrupo/grupo NORMAL (sem fórum) -> uma matéria única; sumário = pin
+       do grupo (ou melhor candidata a menu); aulas = todos os vídeos.
+    C) Canal (broadcast) -> lista linear de aulas (cronológica); sumário = pin.
+- Streaming sob demanda em blocos (HTTP Range) servido em http://127.0.0.1:PORTA.
+- Player HTML servido PELO MESMO servidor (rota /player/{token}) para que a
+  página e o vídeo tenham a MESMA ORIGEM (corrige bloqueio do QtWebEngine).
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -11,18 +30,11 @@ from urllib.parse import quote
 from aiohttp import web
 
 from .paths import CACHE_DIR, SESSION_DIR, ensure_dirs
+from .player_html import build_player_html
 from .stream_cache import BLOCK_SIZE, StreamSession
-from .summary_parser import (
-    compact_summary_text,
-    derive_menu_title,
-    looks_like_menu,
-    menu_score,
-    split_summary_candidates,
-    tag_prefix,
-)
+from .summary_parser import looks_like_menu, menu_score
 from .utils import (
     ensure_extension,
-    extract_hashtags,
     first_non_empty,
     infer_hashtags,
     safe_filename,
@@ -30,13 +42,12 @@ from .utils import (
 
 log = logging.getLogger(__name__)
 
-# Tamanho do bloco entregue por requisição quando o player não pede um range
-# específico. Mantido pequeno para iniciar a reprodução rapidamente.
+# Tamanho do bloco entregue quando o player não pede um range específico.
 INITIAL_RANGE_CHUNK = 4 * BLOCK_SIZE
 
 
 class TelegramService:
-    """Camada assíncrona: Pyrogram + servidor HTTP local, no mesmo event loop."""
+    """Pyrogram + servidor HTTP local, no mesmo event loop (thread dedicada)."""
 
     def __init__(self) -> None:
         ensure_dirs()
@@ -54,12 +65,12 @@ class TelegramService:
         self.site: web.TCPSite | None = None
         self.port: int | None = None
         self.sessions: dict[str, StreamSession] = {}
+        self.session_meta: dict[str, dict[str, Any]] = {}
         self.stream_cache_dir = CACHE_DIR / "streams"
         self.stream_cache_dir.mkdir(parents=True, exist_ok=True)
         self._cleanup_old_cache()
 
     def _cleanup_old_cache(self) -> None:
-        """Remove restos de cache de execuções anteriores (vídeos não ficam guardados)."""
         try:
             for item in self.stream_cache_dir.glob("*"):
                 try:
@@ -128,7 +139,6 @@ class TelegramService:
             sleep_threshold=60,
         )
         await self.client.connect()
-
         try:
             me = await self.client.get_me()
             return {"authorized": True, "me": self._user_to_dict(me)}
@@ -192,7 +202,8 @@ class TelegramService:
             if chat.type not in allowed:
                 continue
             title = first_non_empty(
-                [getattr(chat, "title", None), getattr(chat, "first_name", None)], str(chat.id)
+                [getattr(chat, "title", None), getattr(chat, "first_name", None)],
+                str(chat.id),
             )
             courses.append(
                 {
@@ -200,227 +211,275 @@ class TelegramService:
                     "title": title,
                     "username": getattr(chat, "username", None),
                     "chat_type": str(chat.type).split(".")[-1],
+                    "is_forum": 1 if getattr(chat, "is_forum", False) else 0,
                 }
             )
         courses.sort(key=lambda item: item["title"].lower())
         return courses
 
+    # ------------------------------------------------------- detecção de fórum
+    async def _is_forum(self, chat) -> bool:
+        """Detecta fórum via flag do chat; confirma com GetForumTopics."""
+        if getattr(chat, "is_forum", False):
+            return True
+        # Algumas versões não preenchem is_forum; tentamos a RAW API.
+        try:
+            await self._raw_get_forum_topics(chat, limit=1)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def _raw_get_forum_topics(self, chat, limit: int = 100) -> list[dict[str, Any]]:
+        """Lista tópicos do fórum usando a RAW API do Telegram.
+
+        Retorna [{id, title}] para cada tópico. Lança exceção (ex.:
+        CHANNEL_FORUM_MISSING) quando o chat não é um fórum.
+        """
+        from pyrogram.raw import functions, types as raw_types
+
+        peer = await self.client.resolve_peer(chat.id)
+        topics: list[dict[str, Any]] = []
+        offset_date = 0
+        offset_id = 0
+        offset_topic = 0
+        guard = 0
+        while True:
+            guard += 1
+            if guard > 50:
+                break
+            result = await self.client.invoke(
+                functions.channels.GetForumTopics(
+                    channel=peer,
+                    offset_date=offset_date,
+                    offset_id=offset_id,
+                    offset_topic=offset_topic,
+                    limit=min(100, max(1, limit)),
+                )
+            )
+            page = getattr(result, "topics", []) or []
+            if not page:
+                break
+            for topic in page:
+                # Tópicos normais têm id e title; pula tópicos "deletados".
+                if isinstance(topic, getattr(raw_types, "ForumTopicDeleted", tuple)):
+                    continue
+                tid = getattr(topic, "id", None)
+                title = getattr(topic, "title", None)
+                if tid is None:
+                    continue
+                topics.append({"id": int(tid), "title": title or f"Tópico {tid}"})
+                offset_topic = int(tid)
+            # Atualiza offsets de paginação a partir das mensagens retornadas.
+            messages = getattr(result, "messages", []) or []
+            if messages:
+                last = messages[-1]
+                offset_id = getattr(last, "id", offset_id) or offset_id
+                date = getattr(last, "date", None)
+                if date:
+                    offset_date = int(date) if isinstance(date, int) else offset_date
+            if len(page) < min(100, max(1, limit)) or len(topics) >= limit:
+                break
+        # Garante o "General" (tópico 1) caso não venha listado.
+        if not any(t["id"] == 1 for t in topics):
+            topics.insert(0, {"id": 1, "title": "Geral"})
+        return topics
+
+    # ------------------------------------------------------------ sincronização
     async def sync_course(
         self, chat_id: str | int, limit: int = 99999, progress_cb=None
     ) -> dict[str, Any]:
-        """Sincroniza vídeos e múltiplos menus/sumários por tópico/matéria."""
+        """Sincroniza um curso, detectando automaticamente o tipo do chat."""
         if not self.client:
             raise RuntimeError("Entre no Telegram primeiro.")
+        from pyrogram.enums import ChatType
+
         chat_id = int(chat_id) if str(chat_id).lstrip("-").isdigit() else chat_id
         chat = await self.client.get_chat(chat_id)
+        chat_type = getattr(chat, "type", None)
+        is_forum = False
+        if chat_type == ChatType.SUPERGROUP:
+            is_forum = await self._is_forum(chat)
+
+        if is_forum:
+            subjects, videos, scanned = await self._sync_forum(chat, limit, progress_cb)
+        elif chat_type == ChatType.CHANNEL:
+            subjects, videos, scanned = await self._sync_channel(chat, limit, progress_cb)
+        else:
+            subjects, videos, scanned = await self._sync_group(chat, limit, progress_cb)
+
+        return {
+            "chat": {
+                "chat_id": str(chat.id),
+                "title": getattr(chat, "title", None) or str(chat.id),
+                "username": getattr(chat, "username", None),
+                "chat_type": str(chat_type).split(".")[-1] if chat_type else "",
+                "is_forum": 1 if is_forum else 0,
+            },
+            "subjects": subjects,
+            "videos": videos,
+            "scanned": scanned,
+            "detected": "forum" if is_forum else (
+                "channel" if chat_type == ChatType.CHANNEL else "group"
+            ),
+        }
+
+    # ---- A) Fórum: cada tópico = uma matéria --------------------------------
+    async def _sync_forum(self, chat, limit, progress_cb):
+        topics = await self._raw_get_forum_topics(chat, limit=200)
+        topic_titles = {int(t["id"]): t["title"] for t in topics}
 
         videos: list[dict[str, Any]] = []
-        candidates: list[dict[str, Any]] = []
-        topic_titles: dict[str, str] = {}
+        # candidatos de sumário por tópico: {topic_id: [(score, text, mid)]}
+        candidates: dict[int, list[tuple[int, str, int]]] = {}
         scanned = 0
         history_limit = max(0, int(limit or 0))
 
-        pinned = getattr(chat, "pinned_message", None)
-        if pinned:
-            text = self._message_text(pinned)
-            if looks_like_menu(text):
-                topic_id = self._message_topic_id(pinned)
-                title = self._message_topic_title(pinned, chat, topic_id)
-                topic_titles[topic_id] = title
-                self._add_summary_candidate(
-                    candidates, topic_id, title, text, getattr(pinned, "id", 0)
-                )
-
-        async for message in self.client.get_chat_history(chat_id, limit=history_limit):
+        async for message in self.client.get_chat_history(chat.id, limit=history_limit):
             scanned += 1
             if progress_cb and scanned % 200 == 0:
                 try:
                     progress_cb(scanned, len(videos))
                 except Exception:  # noqa: BLE001
                     pass
-            topic_id = self._message_topic_id(message)
-            topic_title = self._message_topic_title(message, chat, topic_id)
-            if topic_title:
-                topic_titles[topic_id] = topic_title
-
+            tid = self._message_topic_id_int(message)
             text = self._message_text(message)
-            if looks_like_menu(text):
-                self._add_summary_candidate(
-                    candidates, topic_id, topic_titles.get(topic_id, topic_title), text, message.id
-                )
-
-            video = self._message_to_video(
-                message, chat_id, topic_id, topic_titles.get(topic_id, topic_title)
-            )
+            if text and looks_like_menu(text):
+                candidates.setdefault(tid, []).append((menu_score(text), text, message.id))
+            video = self._message_to_video(message, chat.id, tid)
             if video:
                 videos.append(video)
 
-        # Busca complementar por hashtags (menus antigos/fixados).
-        try:
-            async for msg in self.client.search_messages(chat_id, query="#", limit=1000):
-                text = self._message_text(msg)
-                if not looks_like_menu(text):
-                    continue
-                topic_id = self._message_topic_id(msg)
-                topic_title = self._message_topic_title(msg, chat, topic_id)
-                if topic_title:
-                    topic_titles[topic_id] = topic_title
-                self._add_summary_candidate(
-                    candidates, topic_id, topic_titles.get(topic_id, topic_title), text, msg.id
-                )
-        except Exception:  # noqa: BLE001
-            log.exception("Não foi possível pesquisar mensagens com hashtags")
+        # Sumário fixado de cada tópico (prioritário sobre candidatas).
+        pinned_summaries = await self._collect_topic_pins(chat, list(topic_titles))
 
-        topics = self._build_topics(candidates, topic_titles)
-        videos.reverse()
-        return {
-            "chat": {
-                "chat_id": str(chat.id),
-                "title": getattr(chat, "title", None) or str(chat.id),
-                "username": getattr(chat, "username", None),
-                "chat_type": str(getattr(chat, "type", "")).split(".")[-1],
-            },
-            "summary_text": compact_summary_text(topics),
-            "topics": topics,
-            "videos": videos,
-            "scanned": scanned,
-        }
-
-    def _message_text(self, message) -> str:
-        return (getattr(message, "text", None) or getattr(message, "caption", None) or "").strip()
-
-    def _add_summary_candidate(
-        self,
-        candidates: list[dict[str, Any]],
-        topic_id: str,
-        topic_title: str | None,
-        text: str | None,
-        message_id: int,
-    ) -> None:
-        if not text:
-            return
-        text = text.strip()
-        if not text:
-            return
-        parts = split_summary_candidates(text)
-        if not parts:
-            parts = [(derive_menu_title(text, topic_title or "Sumário"), text)]
-        for part_title, part_text in parts:
-            tags = extract_hashtags(part_text)
-            candidates.append(
+        subjects: list[dict[str, Any]] = []
+        for order, t in enumerate(topics):
+            tid = int(t["id"])
+            title = t["title"]
+            summary = pinned_summaries.get(tid)
+            if not summary:
+                cand = candidates.get(tid) or []
+                cand.sort(key=lambda c: c[0], reverse=True)
+                summary = cand[0][1] if cand else ""
+            subjects.append(
                 {
-                    "topic_id": topic_id or "general",
-                    "topic_title": part_title or topic_title or "Geral",
-                    "summary_text": part_text,
-                    "message_id": int(message_id or 0),
-                    "score": menu_score(part_text),
-                    "prefix": tag_prefix(part_text),
-                    "tags": tags,
-                }
-            )
-
-    def _build_topics(
-        self, candidates: list[dict[str, Any]], topic_titles: dict[str, str]
-    ) -> list[dict[str, Any]]:
-        unique: dict[str, dict[str, Any]] = {}
-        for c in candidates:
-            text_key = " ".join((c.get("summary_text") or "").split())
-            prefix = str(c.get("prefix") or "").upper()
-            key = f"{prefix}:{text_key[:2200]}"
-            prev = unique.get(key)
-            if not prev or c.get("score", 0) > prev.get("score", 0):
-                unique[key] = c
-        clean = sorted(
-            unique.values(),
-            key=lambda item: (item.get("topic_title") or "", -int(item.get("score") or 0)),
-        )
-        if not clean:
-            return []
-
-        has_real_topic = any((c.get("topic_id") or "general") != "general" for c in clean)
-        grouped: dict[str, dict[str, Any]] = {}
-        for c in clean:
-            topic_id = c.get("topic_id") or "general"
-            prefix = c.get("prefix") or derive_menu_title(
-                c.get("summary_text"), c.get("topic_title") or "Sumário"
-            )
-            if has_real_topic and topic_id != "general":
-                key = f"topic:{topic_id}:prefix:{str(prefix).upper()}"
-            else:
-                key = f"menu:{str(prefix).upper()}"
-            prev = grouped.get(key)
-            if not prev or int(c.get("score") or 0) > int(prev.get("score") or 0):
-                grouped[key] = c
-
-        topics: list[dict[str, Any]] = []
-        for key, c in grouped.items():
-            raw_topic_id = c.get("topic_id") or "general"
-            title = c.get("topic_title")
-            if not title or title == "Geral" or str(title).startswith("Tópico "):
-                title = derive_menu_title(c.get("summary_text"), title or "Sumário")
-            tags = c.get("tags") or extract_hashtags(c.get("summary_text"))
-            topics.append(
-                {
-                    "id": key if key.startswith("menu:") else str(raw_topic_id),
-                    "telegram_topic_id": str(raw_topic_id),
+                    "telegram_topic_id": str(tid),
                     "title": title,
-                    "summary_text": c.get("summary_text") or "",
-                    "tags": tags,
-                    "tag_count": len(tags),
-                    "message_id": c.get("message_id"),
-                    "score": c.get("score"),
-                    "prefix": c.get("prefix"),
+                    "summary_text": summary or "",
+                    "sort_order": order,
                 }
             )
-        topics.sort(key=lambda t: (self._topic_sort_key(t), str(t.get("title") or "").lower()))
-        return topics
 
-    def _topic_sort_key(self, topic: dict[str, Any]) -> tuple[int, str]:
-        title = str(topic.get("title") or "").upper()
-        prefix = str(topic.get("prefix") or "").upper()
-        common = [
-            "ANAT", "CIR", "INF", "ATB", "CAR", "DER", "END", "GAS", "GIN", "HEM",
-            "HEP", "NEF", "NEU", "OBS", "OFT", "ORT", "PED", "PNE", "PSI", "REU", "VMED",
+        videos.reverse()
+        return subjects, videos, scanned
+
+    async def _collect_topic_pins(self, chat, topic_ids: list[int]) -> dict[int, str]:
+        """Tenta obter a mensagem fixada de cada tópico do fórum."""
+        pins: dict[int, str] = {}
+        for tid in topic_ids:
+            try:
+                # get_chat_history com message_thread_id traz só o tópico;
+                # a 1ª mensagem fixada costuma aparecer com flag pinned.
+                async for msg in self.client.get_chat_history(
+                    chat.id, limit=60, message_thread_id=tid
+                ):
+                    if getattr(msg, "pinned", False):
+                        text = self._message_text(msg)
+                        if text and looks_like_menu(text):
+                            pins[tid] = text
+                            break
+            except Exception:  # noqa: BLE001
+                # message_thread_id pode não ser suportado em todas as versões.
+                continue
+        return pins
+
+    # ---- B) Grupo/supergrupo normal: uma matéria ----------------------------
+    async def _sync_group(self, chat, limit, progress_cb):
+        videos, summary, scanned = await self._scan_linear(chat, limit, progress_cb)
+        subjects = [
+            {
+                "telegram_topic_id": "general",
+                "title": getattr(chat, "title", None) or "Aulas",
+                "summary_text": summary or "",
+                "sort_order": 0,
+            }
         ]
-        for i, item in enumerate(common):
-            if prefix == item or title.startswith(item):
-                return (i, item)
-        return (999, title)
+        return subjects, videos, scanned
 
-    def _message_topic_id(self, message) -> str:
-        for attr in ("message_thread_id", "reply_to_top_message_id", "top_msg_id", "topic_id"):
+    # ---- C) Canal broadcast: lista linear -----------------------------------
+    async def _sync_channel(self, chat, limit, progress_cb):
+        videos, summary, scanned = await self._scan_linear(chat, limit, progress_cb)
+        subjects = [
+            {
+                "telegram_topic_id": "general",
+                "title": getattr(chat, "title", None) or "Aulas",
+                "summary_text": summary or "",
+                "sort_order": 0,
+            }
+        ]
+        return subjects, videos, scanned
+
+    async def _scan_linear(self, chat, limit, progress_cb):
+        """Varre o histórico inteiro (sem tópicos) e escolhe o melhor sumário."""
+        videos: list[dict[str, Any]] = []
+        best_summary = ""
+        best_score = -1
+        scanned = 0
+        history_limit = max(0, int(limit or 0))
+
+        # Sumário fixado tem prioridade.
+        pinned = getattr(chat, "pinned_message", None)
+        if pinned:
+            text = self._message_text(pinned)
+            if text and looks_like_menu(text):
+                best_summary = text
+                best_score = menu_score(text) + 50  # bônus por ser o pin
+
+        async for message in self.client.get_chat_history(chat.id, limit=history_limit):
+            scanned += 1
+            if progress_cb and scanned % 200 == 0:
+                try:
+                    progress_cb(scanned, len(videos))
+                except Exception:  # noqa: BLE001
+                    pass
+            text = self._message_text(message)
+            if text and looks_like_menu(text):
+                score = menu_score(text)
+                if score > best_score:
+                    best_score = score
+                    best_summary = text
+            video = self._message_to_video(message, chat.id, None)
+            if video:
+                videos.append(video)
+
+        videos.reverse()
+        return videos, best_summary, scanned
+
+    # ---- helpers de mensagem ------------------------------------------------
+    def _message_text(self, message) -> str:
+        return (
+            getattr(message, "text", None) or getattr(message, "caption", None) or ""
+        ).strip()
+
+    def _message_topic_id_int(self, message) -> int:
+        """Id do tópico (thread) de uma mensagem em fórum. 1 = Geral."""
+        for attr in ("message_thread_id", "topic_id"):
             value = getattr(message, attr, None)
             if value:
-                return str(value)
+                return int(value)
         reply_to = getattr(message, "reply_to_message", None)
-        if reply_to:
-            for attr in ("message_thread_id", "reply_to_top_message_id", "top_msg_id", "topic_id"):
+        if reply_to is not None:
+            for attr in ("message_thread_id", "top_message_id"):
                 value = getattr(reply_to, attr, None)
                 if value:
-                    return str(value)
-        if getattr(message, "forum_topic_created", None):
-            return str(getattr(message, "id", "general") or "general")
-        return "general"
+                    return int(value)
+        # Pyrogram às vezes expõe reply_to.reply_to_top_id via objeto interno.
+        rt = getattr(message, "reply_to", None) or getattr(message, "reply_to_top_message_id", None)
+        if isinstance(rt, int) and rt:
+            return int(rt)
+        return 1
 
-    def _message_topic_title(self, message, chat, topic_id: str) -> str:
-        created = getattr(message, "forum_topic_created", None)
-        for obj in (created, getattr(message, "forum_topic", None), getattr(message, "topic", None)):
-            if not obj:
-                continue
-            title = getattr(obj, "title", None) or getattr(obj, "name", None)
-            if title:
-                return str(title)
-        if topic_id and topic_id != "general":
-            return f"Tópico {topic_id}"
-        return "Geral"
-
-    def _message_to_video(
-        self,
-        message,
-        chat_id: str | int,
-        topic_id: str | None = None,
-        topic_title: str | None = None,
-    ) -> dict[str, Any] | None:
+    def _message_to_video(self, message, chat_id, topic_id: int | None) -> dict[str, Any] | None:
         media = None
         media_kind = None
         if getattr(message, "video", None):
@@ -445,7 +504,8 @@ class TelegramService:
         caption = getattr(message, "caption", None) or ""
         file_name = getattr(media, "file_name", None) or ""
         title = first_non_empty(
-            [file_name, caption.splitlines()[0] if caption else None], f"video_{message.id}.mp4"
+            [file_name, caption.splitlines()[0] if caption else None],
+            f"video_{message.id}.mp4",
         )
         mime_type = getattr(media, "mime_type", None) or (
             "video/mp4" if media_kind == "video" else None
@@ -456,7 +516,7 @@ class TelegramService:
         return {
             "chat_id": str(chat_id),
             "message_id": int(message.id),
-            "title": safe_filename(title, fallback=f"Video {message.id}"),
+            "title": safe_filename(title, fallback=f"Aula {message.id}"),
             "file_name": file_name,
             "mime_type": mime_type,
             "size": getattr(media, "file_size", None),
@@ -466,8 +526,7 @@ class TelegramService:
             "date": date.isoformat() if date else None,
             "hashtags": tags,
             "caption": caption,
-            "topic_id": topic_id or "general",
-            "topic_title": topic_title or "Geral",
+            "telegram_topic_id": str(topic_id) if topic_id else "general",
         }
 
     # --------------------------------------------------------------- streaming
@@ -488,11 +547,23 @@ class TelegramService:
             mime_type=video.get("mime_type"),
         )
         self.sessions[token] = session
+        self.session_meta[token] = {
+            "title": video.get("title") or filename,
+            "start_position_ms": int(video.get("start_position_ms") or 0),
+        }
         quoted = quote(filename)
-        url = f"http://127.0.0.1:{self.port}/stream/{token}/{quoted}"
-        return {"url": url, "token": token, "port": self.port}
+        stream_url = f"http://127.0.0.1:{self.port}/stream/{token}/{quoted}"
+        player_url = f"http://127.0.0.1:{self.port}/player/{token}"
+        return {
+            "stream_url": stream_url,
+            "player_url": player_url,
+            "url": stream_url,  # compat
+            "token": token,
+            "port": self.port,
+        }
 
     async def release_stream(self, token: str, delete_file: bool = True) -> dict[str, Any]:
+        self.session_meta.pop(token, None)
         session = self.sessions.pop(token, None)
         if not session:
             return {"released": False}
@@ -504,6 +575,7 @@ class TelegramService:
             return
         app = web.Application(client_max_size=1024**3)
         app.router.add_get("/stream/{token}/{filename:.*}", self._handle_stream, allow_head=True)
+        app.router.add_get("/player/{token}", self._handle_player)
         app.router.add_get("/health", self._handle_health)
         self.runner = web.AppRunner(app, access_log=None)
         await self.runner.setup()
@@ -517,6 +589,26 @@ class TelegramService:
 
     async def _handle_health(self, request: web.Request) -> web.Response:
         return web.json_response({"ok": True, "time": time.time()})
+
+    async def _handle_player(self, request: web.Request) -> web.Response:
+        """Serve a PÁGINA do player na MESMA origem do vídeo (corrige bloqueio)."""
+        token = request.match_info.get("token") or ""
+        if token not in self.sessions:
+            return web.Response(status=404, text="Player expirado ou inexistente.")
+        meta = self.session_meta.get(token, {})
+        filename = quote(safe_filename(meta.get("title") or "video.mp4"))
+        stream_url = f"/stream/{token}/{filename}"  # relativo = mesma origem
+        html_text = build_player_html(
+            title=meta.get("title") or "Aula",
+            url=stream_url,
+            start_position_ms=int(meta.get("start_position_ms") or 0),
+        )
+        return web.Response(
+            text=html_text,
+            content_type="text/html",
+            charset="utf-8",
+            headers={"Cache-Control": "no-store"},
+        )
 
     async def _handle_stream(self, request: web.Request) -> web.StreamResponse:
         token = request.match_info.get("token")
@@ -558,7 +650,6 @@ class TelegramService:
 
         response = web.StreamResponse(status=status, headers=headers)
         await response.prepare(request)
-
         try:
             async for data in session.read_range(start, end):
                 if session.closed:
@@ -577,7 +668,6 @@ class TelegramService:
         return response
 
     def _parse_range(self, header: str | None, total: int) -> tuple[int, int]:
-        """Interpreta o header Range. Sem range, entrega só o bloco inicial."""
         default_end = (
             max(total - 1, 0)
             if total and total < INITIAL_RANGE_CHUNK
@@ -599,7 +689,6 @@ class TelegramService:
             if end_s:
                 end = int(end_s)
             else:
-                # Range aberto: entrega um pedaço a partir de start, sem travar.
                 end = (
                     total - 1
                     if total and total < start + INITIAL_RANGE_CHUNK

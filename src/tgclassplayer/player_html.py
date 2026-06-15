@@ -132,6 +132,10 @@ def build_player_html(title: str, url: str, start_position_ms: int = 0) -> str:
     <div class="err" id="err">
       <h3>Não foi possível reproduzir esta aula</h3>
       <p id="errmsg">Tente reabrir a aula ou use o VLC pela janela principal.</p>
+      <div style="margin-top:14px;display:flex;gap:10px;justify-content:center;">
+        <button class="ctl" id="retry">↻ Tentar de novo</button>
+        <button class="ctl" id="openvlc" style="background:rgba(124,92,255,.4)">Abrir no VLC</button>
+      </div>
     </div>
 
     <div class="controls" id="controls">
@@ -182,13 +186,15 @@ const badge=document.getElementById('badge');
 const START={start_seconds};
 let dragging=false, idleTimer=null, resumed=false;
 
-// Estado lido pelo lado Python (progresso/posição) através do título do documento.
-window.__tg_state = {{position:0, duration:0, paused:true, ended:false}};
+// Estado lido pelo lado Python (progresso/posição/comandos) via runJavaScript.
+window.__tg_state = {{position:0, duration:0, paused:true, ended:false, wantVlc:false}};
 function pushState(){{
+  const s = window.__tg_state || {{}};
   window.__tg_state = {{
     position: Math.floor((v.currentTime||0)*1000),
     duration: Math.floor((v.duration||0)*1000),
-    paused: v.paused, ended: v.ended
+    paused: v.paused, ended: v.ended,
+    wantVlc: !!s.wantVlc
   }};
 }}
 
@@ -230,6 +236,13 @@ function showErr(e){{
 
 play.onclick=toggle; big.onclick=toggle;
 stage.addEventListener('click',(e)=>{{ if(e.target===stage||e.target===v) toggle(); }});
+
+// Botões da tela de erro
+document.getElementById('retry').onclick=()=>{{
+  err.style.display='none'; spinner.classList.add('show');
+  try{{ v.load(); v.play().catch(showErr); }}catch(e){{ showErr(e); }} }};
+document.getElementById('openvlc').onclick=()=>{{
+  window.__tg_state = Object.assign(window.__tg_state||{{}}, {{wantVlc:true}}); }};
 
 document.getElementById('back').onclick=()=>{{ v.currentTime=Math.max(0,v.currentTime-10); showToast('↺ 10s'); }};
 document.getElementById('fwd').onclick=()=>{{ v.currentTime=Math.min((v.duration||1e9),v.currentTime+10); showToast('10s ↻'); }};

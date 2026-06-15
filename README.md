@@ -1,153 +1,175 @@
-# TGClassPlayer v5 — Player Premium de Videoaulas do Telegram
+# TGClassPlayer v6 — Player Premium de Videoaulas do Telegram
 
 Organize e assista às **videoaulas dos seus cursos no Telegram** dentro de uma
 interface premium, com **streaming sob demanda**: a aula carrega na hora,
 **sem baixar o vídeo inteiro**, **sem armazenar** o arquivo no seu PC e
-**sem travar** ao avançar/retroceder.
+**sem travar** ao avançar/retroceder. Agora com **temas claro/escuro**,
+navegação por **matérias** e uma aba de **Acompanhamento de estudos** (Pomodoro,
+tarefas e gráficos).
 
-> Proposta central: você conecta o app à sua própria API do Telegram e ele
-> transforma seus **cursos (supergrupos)** em uma videoteca organizada por
-> **tópicos → sumários → aulas**, com tudo editável.
+> Proposta central: você conecta o app à sua própria conta do Telegram e ele
+> transforma seus **cursos (grupos, canais e fóruns)** em uma videoteca
+> organizada por **matérias → módulos → aulas**, com tudo editável.
 
 ---
 
 ## ✨ Principais recursos
 
+- **Detecção automática do tipo do chat** (sem você configurar nada):
+  - **Supergrupo com fórum (tópicos):** cada **tópico vira uma matéria**, com o
+    seu próprio sumário (mensagem fixada do tópico) e a sua própria lista de aulas.
+  - **Grupo/supergrupo normal:** uma única matéria; sumário = mensagem fixada.
+  - **Canal (broadcast):** lista linear de aulas em ordem cronológica.
 - **Streaming sob demanda (sem download completo):** baixa só os pedaços do
   vídeo que você está assistindo (cache em blocos), com leitura antecipada
   (*read-ahead*) e *seek* instantâneo. O arquivo temporário é apagado ao fechar
   o player — **nada do vídeo fica salvo de forma permanente**.
-- **Player premium em HTML5** (QtWebEngine): barra de progresso com prévia de
-  buffer, ±10s, velocidade, volume, Picture-in-Picture, tela cheia e atalhos de
-  teclado. Fallback automático para o player nativo (QtMultimedia) se necessário.
-- **Cursos = supergrupos do Telegram**, separados em **tópicos**, com **sumários**
-  e um **guia** explicando como as aulas estão organizadas.
-- **Tudo editável:** renomear/excluir cursos, criar/renomear/reordenar/excluir
-  tópicos, editar o texto do sumário, e editar cada aula (título, tópico,
-  hashtags, anotações, favorito, marcar como assistida/não assistida).
+- **Player premium em HTML5** (QtWebEngine) servido pelo **mesmo servidor local**
+  do vídeo (mesma origem) — isso corrige o bloqueio do `<video>` que existia
+  antes. Tem ±10s, velocidade, volume, tela cheia, *autoplay* e botão
+  **"Abrir no VLC"** na tela de erro. Fallback automático para o player nativo
+  (QtMultimedia) quando necessário.
+- **Sumário por matéria** no formato hierárquico
+  `= Módulo / == Aula / === Tipo / #TAG01 #TAG02`. Cada hashtag liga o item do
+  menu à aula com a **mesma hashtag**. Cada matéria tem o **seu próprio** sumário
+  (sem misturar matérias).
+- **Tudo editável:** renomear/cor/reordenar/excluir **cursos**;
+  criar/renomear/reordenar/excluir **matérias** e editar o texto do sumário;
+  editar cada **aula** (título, matéria, módulo, tipo, hashtags, anotações,
+  favorito, marcar assistida/pendente). Menus de contexto (botão direito) em
+  cursos, matérias e aulas.
+- **Barra de progresso geral** no topo (aulas assistidas/total e horas).
+- **Filtros**: Todas / Assistidas / Pendentes / ★ Favoritas + busca por título,
+  hashtag ou módulo.
 - **Retomar de onde parou:** o progresso de cada aula é salvo automaticamente.
-- **Organização por hashtags:** o sumário usa o formato
-  `= Módulo / == Aula / === Tipo / #TAG01 #TAG02` para montar o menu e ligar as
-  hashtags às aulas.
-- **Interface premium dark**, busca, filtros (favoritos / pendentes) e menus de
-  contexto (botão direito) em cursos e aulas.
-- **Também abre no VLC** (opcional), caso você prefira.
+- **Temas Claro 🌞 e Escuro 🌙** bem calibrados, com alternância no topo e
+  **persistência** (o app lembra a sua escolha).
+- **Aba "Acompanhamento" 📊:**
+  - ⏱️ **Pomodoro** configurável (foco / pausa curta / pausa longa), com
+    iniciar/pausar/zerar, ciclos e registro de sessões.
+  - ✅ **Tarefas/checklist** (A fazer / Feito) com prioridade e prazo opcional.
+  - 📈 **Gráficos** (tempo de estudo por dia, aulas concluídas por curso e anel
+    de progresso) desenhados com QPainter — **sem dependências frágeis**.
+  - Cartões de resumo: sequência de dias (*streak*), horas totais e % do curso.
 
 ---
 
 ## 🚀 Gerar o executável (.exe) no Windows — passo a passo
 
 1. Instale o **Python 3.10, 3.11 ou 3.12 (64 bits)** em
-   <https://www.python.org/downloads/> — durante a instalação **marque
-   "Add Python to PATH"**.
+   <https://www.python.org/downloads/> e **marque "Add Python to PATH"**.
 2. Baixe/extraia esta pasta do projeto.
-3. Dê **duplo clique** em **`build_exe.bat`** (ou rode no Prompt de Comando).
-   O script cria um ambiente virtual, instala as dependências e gera o `.exe`.
-4. Ao terminar, o aplicativo estará em:
+3. Dê **duplo clique** em **`build_exe.bat`**. Ele cria um ambiente virtual,
+   instala as dependências e gera o executável.
+4. Ao final, o app estará em **`dist\TGClassPlayer\TGClassPlayer.exe`**.
+   Para distribuir, copie a **pasta inteira** `dist\TGClassPlayer`.
 
-   ```
-   dist\TGClassPlayer\TGClassPlayer.exe
-   ```
+> O build usa o modo **onedir** (pasta única) porque é o mais confiável para
+> apps com **QtWebEngine** (o player HTML5).
 
-5. Para distribuir/levar para outro PC, copie a **pasta inteira**
-   `dist\TGClassPlayer` (não apenas o `.exe`).
+### Rodar a partir do código-fonte (sem gerar .exe)
 
-> 💡 Usamos o modo *onedir* (pasta única) porque é o mais confiável para apps
-> com player HTML5 (QtWebEngine).
-
-### Rodar a partir do código-fonte (sem gerar o .exe)
-
-- **Windows:** duplo clique em `run_dev.bat`, ou:
-  ```bat
-  python -m venv .venv
-  .venv\Scripts\activate
-  pip install -r requirements.txt
-  python TGClassPlayer.py
-  ```
-- **Linux/macOS (modo dev):**
-  ```bash
-  python3 -m venv .venv
-  source .venv/bin/activate
-  pip install -r requirements.txt
-  python TGClassPlayer.py
-  ```
+Dê **duplo clique** em **`run_dev.bat`** (cria o `.venv` na primeira vez e
+executa `python TGClassPlayer.py`).
 
 ---
 
-## 🔑 Como conseguir API ID e API HASH (Telegram)
+## 🔑 Como obter o API ID e o API HASH (Telegram)
 
-1. Acesse <https://my.telegram.org> e faça login com seu número.
-2. Entre em **API development tools**.
-3. Crie um app (qualquer nome) e copie o **App api_id** e o **App api_hash**.
+1. Acesse <https://my.telegram.org> e entre com o seu número.
+2. Vá em **API development tools**.
+3. Crie um app (qualquer nome). Você verá o **api_id** (número) e o
+   **api_hash** (texto).
 4. No TGClassPlayer, clique em **Conectar**, informe **API ID**, **API HASH** e
-   seu **telefone**, depois o **código** que o Telegram enviar (e a **senha 2FA**,
-   se você tiver).
+   seu **telefone com DDI** (ex.: `+5547999999999`). O **código de login** chega
+   no próprio Telegram. Se você usa verificação em duas etapas, informe a senha.
 
-> ⚠️ **Segurança:** nunca compartilhe seu **API HASH**, código de login ou senha
-> 2FA. Esses dados ficam apenas no seu computador.
+> ⚠️ **Nunca compartilhe** seu código de login, senha 2FA ou API HASH com
+> ninguém. O app guarda a sessão localmente, no seu computador.
 
 ---
 
-## 🧠 Como organizar um curso (sumário)
+## 🧭 Como o app detecta fórum × grupo × canal
 
-No sumário de um tópico, use este formato para gerar o menu e ligar as aulas:
+Ao **Sincronizar**, o app identifica o tipo do chat automaticamente:
+
+- **Fórum** (supergrupo com tópicos): usa a API bruta
+  `channels.GetForumTopics` para listar os tópicos. **Cada tópico = uma matéria.**
+  As aulas são filtradas pelo tópico (thread) e o sumário é a mensagem **fixada**
+  daquele tópico (ou a melhor "candidata a menu" encontrada nele).
+- **Grupo/supergrupo normal:** matéria única; sumário = fixado do grupo.
+- **Canal:** lista linear (cronológica); sumário = fixado, se houver.
+
+Você não precisa configurar nada — mas pode **editar** matérias, sumários e
+aulas depois, manualmente.
+
+---
+
+## 🗂️ Como organizar o sumário (menu) de cada matéria
+
+O sumário liga as **hashtags** das aulas a um menu organizado. Formato:
 
 ```
-= Módulo 1 — Introdução
-== Aula 1 — Boas-vindas
-=== Vídeo
-#PY01
+= Módulo 1 - Introdução
+== Aula 1 - Boas-vindas
+=== Videoaula
+#AULA01
+=== Resumo
+#RESUMO01
 
-== Aula 2 — Configurando o ambiente
-=== Vídeo
-#PY02
+== Aula 2 - Conceitos
+=== Videoaula
+#AULA02
 ```
 
-- `=` é módulo, `==` é aula, `===` é o tipo de conteúdo.
-- As **hashtags** (`#PY01`, `#PY02`, ...) ligam cada item do menu ao vídeo
-  correspondente que tenha a mesma hashtag.
+- `=` Módulo, `==` Aula, `===` Tipo (Videoaula/Resumo/Bônus...).
+- As linhas com `#TAG` ligam o item do menu à aula que tem a **mesma hashtag**
+  (na legenda, no nome do arquivo ou no texto).
+- Aulas sem correspondência aparecem em **"Sem módulo"**.
+- Texto decorativo (ex.: "Clique aqui", "⚠️ Atenção ⚠️") é ignorado.
+
+Edite o sumário em **Editar matérias/sumários** (na barra lateral) ou clicando
+com o **botão direito** na matéria.
 
 ---
 
 ## 📁 Onde ficam os dados
 
-- **No .exe:** em `%LOCALAPPDATA%\TGClassPlayer` (banco SQLite, sessão e logs).
-- **No código-fonte:** na pasta `data/` do projeto.
-- O **cache de vídeo é temporário** e é apagado ao fechar o player.
+- Rodando como **.exe**, os dados ficam em
+  `%LOCALAPPDATA%\TGClassPlayer` (banco SQLite, sessão e logs).
+- O **cache de vídeo** é temporário e **apagado** ao fechar o player.
+
+---
+
+## 🔒 Restrições e privacidade
+
+- O app **não armazena** os vídeos de forma permanente (streaming sob demanda;
+  apenas cache temporário).
+- Use somente com **conteúdo a que você tem acesso legítimo**.
+- A sua sessão e suas credenciais ficam **somente no seu computador**.
 
 ---
 
 ## 🛠️ Estrutura do projeto
 
 ```
-TGClassPlayer.py          # ponto de entrada
-TGClassPlayer.spec        # configuração do PyInstaller (gera o .exe)
-build_exe.bat             # gera o executável (Windows)
-run_dev.bat              # roda o código-fonte (Windows)
-requirements.txt          # dependências
+TGClassPlayer.py            # ponto de entrada
 src/tgclassplayer/
-  app.py                  # janela principal (UI premium, edição de tudo)
-  telegram_service.py     # Pyrogram + servidor HTTP local (streaming)
-  stream_cache.py         # cache em blocos sob demanda (sem download total)
-  player.py / player_html.py  # player premium (HTML5) + fallback
-  db.py                   # banco SQLite com edição completa
-  dialogs.py              # login, seleção de cursos, editor de sumário/aula
-  style.py                # tema premium dark
-  summary_parser.py       # parser do menu/sumário (hashtags)
-  utils.py / paths.py / vlc_locator.py / logging_setup.py
+  app.py                    # janela principal (UI nova, abas, tema, progresso)
+  db.py                     # banco SQLite (cursos, matérias, aulas, estudo)
+  telegram_service.py       # Telegram (detecção fórum/grupo/canal + streaming)
+  summary_parser.py         # parser do sumário por matéria
+  player.py                 # player HTML5 (mesma origem) + fallback QtMultimedia
+  player_html.py            # página HTML do player
+  study_tab.py              # aba Acompanhamento (Pomodoro, tarefas, gráficos)
+  charts.py                 # gráficos em QPainter (sem QtCharts)
+  dialogs.py                # login, seleção de cursos, editores
+  style.py                  # temas claro/escuro (QSS + paletas)
+  stream_cache.py, paths.py, utils.py, vlc_locator.py, logging_setup.py
+requirements.txt, TGClassPlayer.spec, build_exe.bat, run_dev.bat
 ```
 
 ---
 
-## ❓ Problemas comuns
-
-- **"Python não encontrado":** reinstale o Python marcando *Add Python to PATH*.
-- **O player não abre o vídeo:** garanta que o `TgCrypto` foi instalado (acelera
-  o Telegram) — ele já está no `requirements.txt`.
-- **Build falhou no QtWebEngine:** rode novamente o `build_exe.bat`; o `.spec` já
-  coleta automaticamente os recursos do WebEngine.
-
----
-
-Feito com PySide6 + Pyrogram. **Use apenas com conteúdo ao qual você tem acesso
-legítimo.**
+Feito para ser **simples para quem não é técnico** e **poderoso para estudar**.
+Bons estudos! 📚

@@ -24,14 +24,17 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .db import Database
-from .summary_parser import extract_hashtags
+from .db import Database, Subject, Video
+from .summary_parser import all_tags, extract_hashtags, parse_summary
 from .telegram_service import TelegramService
 
 log = logging.getLogger(__name__)
 
 
-def wait_future(future, title: str, message: str, parent: QWidget | None = None, timeout_ms: int | None = None):
+def wait_future(
+    future, title: str, message: str, parent: QWidget | None = None, timeout_ms: int | None = None
+):
+    """Espera um future do event loop assíncrono mostrando um diálogo de progresso."""
     dialog = QProgressDialog(message, "", 0, 0, parent)
     dialog.setWindowTitle(title)
     dialog.setWindowModality(Qt.ApplicationModal)
@@ -156,7 +159,9 @@ class LoginDialog(QDialog):
                 self.code.show()
                 self.step = "code"
                 self.next_btn.setText("Confirmar código")
-                self.status.setText("Digite o código recebido no Telegram. Nunca compartilhe esse código.")
+                self.status.setText(
+                    "Digite o código recebido no Telegram. Nunca compartilhe esse código."
+                )
                 return
 
             if self.step == "code":
@@ -168,7 +173,9 @@ class LoginDialog(QDialog):
                     self.password.show()
                     self.step = "password"
                     self.next_btn.setText("Confirmar senha")
-                    self.status.setText("Sua conta tem verificação em duas etapas. Digite sua senha 2FA.")
+                    self.status.setText(
+                        "Sua conta tem verificação em duas etapas. Digite sua senha 2FA."
+                    )
                     return
                 if result.get("authorized"):
                     self.accept()
@@ -211,8 +218,12 @@ class SelectCoursesDialog(QDialog):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(22, 22, 22, 22)
-        label = QLabel("Cada grupo, canal ou supergrupo do Telegram vira um curso no app.")
+        label = QLabel(
+            "Cada grupo, canal ou supergrupo do Telegram vira um curso. "
+            "Fóruns (com tópicos) viram cursos com várias matérias automaticamente."
+        )
         label.setObjectName("Muted")
+        label.setWordWrap(True)
         layout.addWidget(label)
         layout.addWidget(self.search)
         layout.addWidget(self.list, 1)
@@ -226,11 +237,23 @@ class SelectCoursesDialog(QDialog):
     def populate(self) -> None:
         query = self.search.text().strip().lower()
         self.list.clear()
+        type_names = {
+            "SUPERGROUP": "Supergrupo",
+            "GROUP": "Grupo",
+            "CHANNEL": "Canal",
+        }
         for course in self.courses:
             title = course.get("title") or str(course.get("chat_id"))
-            if query and query not in title.lower() and query not in str(course.get("username") or "").lower():
+            if (
+                query
+                and query not in title.lower()
+                and query not in str(course.get("username") or "").lower()
+            ):
                 continue
-            item = QListWidgetItem(f"{title}   ·   {course.get('chat_type', '')}")
+            kind = type_names.get(course.get("chat_type", ""), course.get("chat_type", ""))
+            if course.get("is_forum"):
+                kind += " · Fórum 🗂️"
+            item = QListWidgetItem(f"{title}   ·   {kind}")
             item.setCheckState(Qt.Unchecked)
             item.setData(Qt.UserRole, course)
             self.list.addItem(item)
@@ -244,21 +267,31 @@ class SelectCoursesDialog(QDialog):
         return selected
 
 
-# ---------------------------------------------------- Editor de sumários/tópicos
-class SummaryEditorDialog(QDialog):
-    """Editor completo dos sumários por tópico.
+# --------------------------------------------------- Editor de matérias/sumários
+class SubjectsEditorDialog(QDialog):
+    """Editor completo das MATÉRIAS de um curso e dos seus sumários.
 
-    Permite: criar, renomear, excluir tópicos; editar o texto do sumário (guia
-    de organização das aulas) com formato hierárquico `= Módulo / == Aula /
-    #TAG`. Tudo é salvo no banco e reflete na árvore de aulas.
+    Permite criar/renomear/reordenar/excluir matérias e editar o texto do
+    sumário (`= Módulo / == Aula / === Tipo / #TAG`) de cada matéria. As
+    operações são aplicadas direto no banco ao salvar (via callbacks do app).
     """
 
-    def __init__(self, topics: list[dict[str, Any]], parent: QWidget | None = None):
+    def __init__(self, subjects: list[Subject], parent: QWidget | None = None):
         super().__init__(parent)
-        self.setWindowTitle("Editar sumários e tópicos")
+        self.setWindowTitle("Editar matérias e sumários")
         self.setMinimumSize(1040, 700)
-        # Cópia editável dos tópicos.
-        self.topics: list[dict[str, Any]] = [dict(t) for t in (topics or [])]
+        # Cópia editável: cada item é um dict {id, title, summary_text, manual}.
+        self.subjects: list[dict[str, Any]] = [
+            {
+                "id": s.id,
+                "title": s.title,
+                "summary_text": s.summary_text or "",
+                "telegram_topic_id": s.telegram_topic_id,
+                "manual": s.manual,
+            }
+            for s in (subjects or [])
+        ]
+        self.deleted_ids: list[int] = []
         self._current_index = -1
 
         outer = QVBoxLayout(self)
@@ -268,20 +301,20 @@ class SummaryEditorDialog(QDialog):
         root.setSpacing(14)
         outer.addLayout(root, 1)
 
-        # Coluna esquerda: lista de tópicos + ações
+        # Coluna esquerda: lista de matérias + ações.
         left = QFrame()
         left.setObjectName("Card")
         left.setMinimumWidth(280)
         left.setMaximumWidth(340)
         ll = QVBoxLayout(left)
         ll.setContentsMargins(14, 14, 14, 14)
-        ll.addWidget(self._title("Tópicos / matérias"))
-        self.topic_list = QListWidget()
-        self.topic_list.currentRowChanged.connect(self.on_select)
-        ll.addWidget(self.topic_list, 1)
+        ll.addWidget(self._title("Matérias / tópicos"))
+        self.subject_list = QListWidget()
+        self.subject_list.currentRowChanged.connect(self.on_select)
+        ll.addWidget(self.subject_list, 1)
         btns = QHBoxLayout()
-        add_btn = QPushButton("+ Novo")
-        add_btn.clicked.connect(self.add_topic)
+        add_btn = QPushButton("+ Nova")
+        add_btn.clicked.connect(self.add_subject)
         up_btn = QPushButton("↑")
         up_btn.setObjectName("IconButton")
         up_btn.clicked.connect(lambda: self.move(-1))
@@ -290,7 +323,7 @@ class SummaryEditorDialog(QDialog):
         down_btn.clicked.connect(lambda: self.move(1))
         del_btn = QPushButton("Excluir")
         del_btn.setObjectName("DangerButton")
-        del_btn.clicked.connect(self.delete_topic)
+        del_btn.clicked.connect(self.delete_subject)
         btns.addWidget(add_btn)
         btns.addWidget(up_btn)
         btns.addWidget(down_btn)
@@ -298,18 +331,19 @@ class SummaryEditorDialog(QDialog):
         btns.addWidget(del_btn)
         ll.addLayout(btns)
 
-        # Coluna direita: edição do tópico atual
+        # Coluna direita: edição da matéria atual.
         right = QFrame()
         right.setObjectName("Card")
         rl = QVBoxLayout(right)
         rl.setContentsMargins(14, 14, 14, 14)
-        rl.addWidget(self._title("Título do tópico"))
+        rl.addWidget(self._title("Nome da matéria"))
         self.title_edit = QLineEdit()
         self.title_edit.textChanged.connect(self.on_title_changed)
         rl.addWidget(self.title_edit)
         hint = QLabel(
-            "Guia de organização das aulas. Use o formato:\n"
-            "= Módulo\n== Aula\n#TAG01 #TAG02   (hashtags ligam o item ao vídeo)"
+            "Sumário desta matéria (liga as hashtags às aulas):\n"
+            "= Módulo\n== Aula\n=== Tipo (Videoaula / Resumo / Bônus)\n"
+            "#TAG01 #TAG02"
         )
         hint.setObjectName("Muted2")
         rl.addWidget(hint)
@@ -323,7 +357,6 @@ class SummaryEditorDialog(QDialog):
         root.addWidget(left)
         root.addWidget(right, 1)
 
-        # Rodapé
         bottom = QHBoxLayout()
         bottom.addStretch(1)
         cancel = QPushButton("Cancelar")
@@ -336,136 +369,145 @@ class SummaryEditorDialog(QDialog):
         outer.addLayout(bottom)
 
         self.refresh_list()
-        if self.topics:
-            self.topic_list.setCurrentRow(0)
+        if self.subjects:
+            self.subject_list.setCurrentRow(0)
 
     def _title(self, text: str) -> QLabel:
         lbl = QLabel(text)
         lbl.setObjectName("SectionTitle")
         return lbl
 
+    def _tag_count(self, summary: str | None) -> int:
+        return len(all_tags(parse_summary(summary)))
+
     def refresh_list(self) -> None:
-        cur = self.topic_list.currentRow()
-        self.topic_list.blockSignals(True)
-        self.topic_list.clear()
-        for topic in self.topics:
-            title = topic.get("title") or "Sumário"
-            count = len(topic.get("tags") or extract_hashtags(topic.get("summary_text")))
-            self.topic_list.addItem(QListWidgetItem(f"{title}   ·   {count} tags"))
-        self.topic_list.blockSignals(False)
-        if 0 <= cur < len(self.topics):
-            self.topic_list.setCurrentRow(cur)
+        cur = self.subject_list.currentRow()
+        self.subject_list.blockSignals(True)
+        self.subject_list.clear()
+        for subject in self.subjects:
+            title = subject.get("title") or "Matéria"
+            count = self._tag_count(subject.get("summary_text"))
+            self.subject_list.addItem(QListWidgetItem(f"{title}   ·   {count} tags"))
+        self.subject_list.blockSignals(False)
+        if 0 <= cur < len(self.subjects):
+            self.subject_list.setCurrentRow(cur)
 
     def on_select(self, row: int) -> None:
         self._current_index = row
-        if not (0 <= row < len(self.topics)):
+        if not (0 <= row < len(self.subjects)):
             self.title_edit.setText("")
             self.text_edit.setPlainText("")
             return
-        topic = self.topics[row]
+        subject = self.subjects[row]
         self.title_edit.blockSignals(True)
         self.text_edit.blockSignals(True)
-        self.title_edit.setText(topic.get("title") or "")
-        self.text_edit.setPlainText(topic.get("summary_text") or "")
+        self.title_edit.setText(subject.get("title") or "")
+        self.text_edit.setPlainText(subject.get("summary_text") or "")
         self.title_edit.blockSignals(False)
         self.text_edit.blockSignals(False)
         self._update_tags()
 
     def on_title_changed(self, text: str) -> None:
-        if 0 <= self._current_index < len(self.topics):
-            self.topics[self._current_index]["title"] = text
-            item = self.topic_list.item(self._current_index)
+        if 0 <= self._current_index < len(self.subjects):
+            self.subjects[self._current_index]["title"] = text
+            item = self.subject_list.item(self._current_index)
             if item:
-                count = len(self.topics[self._current_index].get("tags") or [])
-                item.setText(f"{text or 'Sumário'}   ·   {count} tags")
+                count = self._tag_count(self.subjects[self._current_index].get("summary_text"))
+                item.setText(f"{text or 'Matéria'}   ·   {count} tags")
 
     def on_text_changed(self) -> None:
-        if 0 <= self._current_index < len(self.topics):
+        if 0 <= self._current_index < len(self.subjects):
             text = self.text_edit.toPlainText()
-            self.topics[self._current_index]["summary_text"] = text
-            tags = extract_hashtags(text)
-            self.topics[self._current_index]["tags"] = tags
-            self.topics[self._current_index]["tag_count"] = len(tags)
+            self.subjects[self._current_index]["summary_text"] = text
             self._update_tags()
-            item = self.topic_list.item(self._current_index)
+            item = self.subject_list.item(self._current_index)
             if item:
-                title = self.topics[self._current_index].get("title") or "Sumário"
-                item.setText(f"{title}   ·   {len(tags)} tags")
+                title = self.subjects[self._current_index].get("title") or "Matéria"
+                item.setText(f"{title}   ·   {self._tag_count(text)} tags")
 
     def _update_tags(self) -> None:
-        if 0 <= self._current_index < len(self.topics):
-            tags = self.topics[self._current_index].get("tags") or []
+        if 0 <= self._current_index < len(self.subjects):
+            tags = all_tags(parse_summary(self.subjects[self._current_index].get("summary_text")))
             self.tag_label.setText(
-                f"{len(tags)} hashtag(s): " + " ".join(tags[:30]) if tags else "Nenhuma hashtag detectada."
+                f"{len(tags)} hashtag(s): " + " ".join(tags[:30])
+                if tags
+                else "Nenhuma hashtag detectada."
             )
 
-    def add_topic(self) -> None:
-        title, ok = QInputDialog.getText(self, "Novo tópico", "Nome do tópico/matéria:")
+    def add_subject(self) -> None:
+        title, ok = QInputDialog.getText(self, "Nova matéria", "Nome da matéria:")
         if not ok or not title.strip():
             return
-        self.topics.append(
+        self.subjects.append(
             {
-                "id": f"manual:{len(self.topics)}",
-                "telegram_topic_id": "manual",
+                "id": None,
                 "title": title.strip(),
                 "summary_text": f"= {title.strip()}\n",
-                "tags": [],
-                "tag_count": 0,
-                "manual": True,
+                "telegram_topic_id": None,
+                "manual": 1,
             }
         )
         self.refresh_list()
-        self.topic_list.setCurrentRow(len(self.topics) - 1)
+        self.subject_list.setCurrentRow(len(self.subjects) - 1)
 
-    def delete_topic(self) -> None:
-        row = self.topic_list.currentRow()
-        if not (0 <= row < len(self.topics)):
+    def delete_subject(self) -> None:
+        row = self.subject_list.currentRow()
+        if not (0 <= row < len(self.subjects)):
             return
-        title = self.topics[row].get("title") or "tópico"
-        if QMessageBox.question(self, "Excluir", f"Excluir o tópico “{title}”?") != QMessageBox.Yes:
+        title = self.subjects[row].get("title") or "matéria"
+        if QMessageBox.question(self, "Excluir", f"Excluir a matéria “{title}”?") != QMessageBox.Yes:
             return
-        self.topics.pop(row)
+        removed = self.subjects.pop(row)
+        if removed.get("id"):
+            self.deleted_ids.append(int(removed["id"]))
         self._current_index = -1
         self.refresh_list()
-        if self.topics:
-            self.topic_list.setCurrentRow(min(row, len(self.topics) - 1))
+        if self.subjects:
+            self.subject_list.setCurrentRow(min(row, len(self.subjects) - 1))
         else:
             self.title_edit.setText("")
             self.text_edit.setPlainText("")
 
     def move(self, delta: int) -> None:
-        row = self.topic_list.currentRow()
+        row = self.subject_list.currentRow()
         new = row + delta
-        if not (0 <= row < len(self.topics)) or not (0 <= new < len(self.topics)):
+        if not (0 <= row < len(self.subjects)) or not (0 <= new < len(self.subjects)):
             return
-        self.topics[row], self.topics[new] = self.topics[new], self.topics[row]
+        self.subjects[row], self.subjects[new] = self.subjects[new], self.subjects[row]
         self.refresh_list()
-        self.topic_list.setCurrentRow(new)
+        self.subject_list.setCurrentRow(new)
 
-    def result_topics(self) -> list[dict[str, Any]]:
-        return self.topics
+    def result(self) -> tuple[list[dict[str, Any]], list[int]]:
+        """Retorna (matérias editadas em ordem, ids excluídos)."""
+        return self.subjects, self.deleted_ids
 
 
 # ----------------------------------------------------- Editor de aula (vídeo)
 class EditVideoDialog(QDialog):
-    def __init__(self, video, topics: list[dict[str, Any]], parent: QWidget | None = None):
+    def __init__(self, video: Video, subjects: list[Subject], parent: QWidget | None = None):
         super().__init__(parent)
         self.setWindowTitle("Editar aula")
-        self.setMinimumWidth(520)
+        self.setMinimumWidth(540)
         self.video = video
+        self.subjects = subjects or []
 
         self.title_edit = QLineEdit(video.title)
-        self.topic_box = QComboBox()
-        self.topic_box.setEditable(True)
-        existing_titles = []
-        for t in topics or []:
-            tt = t.get("title")
-            if tt and tt not in existing_titles:
-                existing_titles.append(tt)
-        if video.topic_title and video.topic_title not in existing_titles:
-            existing_titles.insert(0, video.topic_title)
-        self.topic_box.addItems(existing_titles or ["Geral"])
-        self.topic_box.setCurrentText(video.topic_title or "Geral")
+
+        self.subject_box = QComboBox()
+        self.subject_box.addItem("— Sem matéria —", None)
+        selected_idx = 0
+        for i, s in enumerate(self.subjects, start=1):
+            self.subject_box.addItem(s.title, s.id)
+            if video.subject_id == s.id:
+                selected_idx = i
+        self.subject_box.setCurrentIndex(selected_idx)
+
+        self.module_edit = QLineEdit(video.module or "")
+        self.lesson_edit = QLineEdit(video.lesson or "")
+        self.type_box = QComboBox()
+        self.type_box.setEditable(True)
+        self.type_box.addItems(["", "Videoaula", "Resumo", "Bônus", "Revisão", "Exercícios"])
+        self.type_box.setCurrentText(video.type or "")
 
         self.tags_edit = QLineEdit(" ".join(video.hashtags))
         self.note_edit = QPlainTextEdit(video.note or "")
@@ -475,12 +517,15 @@ class EditVideoDialog(QDialog):
         form = QFormLayout()
         form.setSpacing(10)
         form.addRow("Título da aula", self.title_edit)
-        form.addRow("Tópico / matéria", self.topic_box)
+        form.addRow("Matéria", self.subject_box)
+        form.addRow("Módulo", self.module_edit)
+        form.addRow("Aula", self.lesson_edit)
+        form.addRow("Tipo", self.type_box)
         form.addRow("Hashtags", self.tags_edit)
         form.addRow("Anotações", self.note_edit)
 
         info = QLabel(
-            f"Arquivo: {video.file_name}\nMensagem #{video.message_id} · Tópico atual: {video.topic_title or 'Geral'}"
+            f"Arquivo: {video.file_name}\nMensagem #{video.message_id}"
         )
         info.setObjectName("Muted2")
         info.setWordWrap(True)
@@ -508,12 +553,14 @@ class EditVideoDialog(QDialog):
     def values(self) -> dict[str, Any]:
         tags = extract_hashtags(self.tags_edit.text())
         if not tags:
-            # aceita também tags separadas por espaço sem #
             raw = [w.strip() for w in self.tags_edit.text().replace(",", " ").split() if w.strip()]
             tags = ["#" + w.lstrip("#").upper() for w in raw]
         return {
             "title": self.title_edit.text().strip() or self.video.title,
-            "topic_title": self.topic_box.currentText().strip() or "Geral",
+            "subject_id": self.subject_box.currentData(),
+            "module": self.module_edit.text().strip() or None,
+            "lesson": self.lesson_edit.text().strip() or None,
+            "type": self.type_box.currentText().strip() or None,
             "hashtags": tags,
             "note": self.note_edit.toPlainText().strip() or None,
         }

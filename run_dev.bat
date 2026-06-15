@@ -1,6 +1,6 @@
 @echo off
 REM ============================================================================
-REM  TGClassPlayer v5 - Rodar a partir do codigo-fonte (sem gerar .exe)
+REM  TGClassPlayer v6 - Rodar a partir do codigo-fonte (sem gerar .exe)
 REM  Util para testar rapidamente. Cria o .venv na primeira execucao.
 REM ============================================================================
 
