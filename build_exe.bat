@@ -47,12 +47,26 @@ call ".venv\Scripts\activate.bat"
 REM ---- 3) Instala dependencias ---------------------------------------------
 echo.
 echo [2/4] Atualizando pip e instalando dependencias ...
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+python -m pip install --upgrade pip setuptools wheel
+
+REM Instala as dependencias OBRIGATORIAS. PySide6 ja inclui QtMultimedia,
+REM QtWebEngine e demais "Addons" (nao instale PySide6-Addons separado).
+python -m pip install "PySide6>=6.6,<6.9" "Pyrogram==2.0.106" "aiohttp>=3.9" "pyinstaller>=6.3"
 if errorlevel 1 (
-    echo [ERRO] Falha ao instalar as dependencias.
+    echo [ERRO] Falha ao instalar as dependencias obrigatorias.
+    echo        Verifique sua conexao com a internet e a versao do Python.
     pause
     exit /b 1
+)
+
+REM TgCrypto e OPCIONAL (so acelera). Se falhar (ex.: Python 3.13 sem wheel),
+REM o build CONTINUA normalmente — o app funciona sem ele.
+echo.
+echo [2/4] Instalando TgCrypto (opcional, acelera o streaming) ...
+python -m pip install "TgCrypto>=1.2.5"
+if errorlevel 1 (
+    echo [AVISO] Nao foi possivel instalar o TgCrypto. Sem problema:
+    echo         o aplicativo funciona mesmo assim ^(apenas um pouco mais lento^).
 )
 
 REM ---- 4) Limpa builds anteriores ------------------------------------------

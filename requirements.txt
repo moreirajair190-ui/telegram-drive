@@ -3,22 +3,27 @@
 # Instale com:
 #     pip install -r requirements.txt
 #
-# Observação: instale com Python 3.10, 3.11 ou 3.12 (64 bits no Windows).
+# Observação: use Python 3.10, 3.11 ou 3.12 (64 bits no Windows).
+# (Python 3.13 pode dar problema com TgCrypto/Pyrogram — prefira 3.11/3.12.)
 
-# Interface gráfica (Qt para Python). Inclui QtMultimedia (player fallback).
+# Interface gráfica (Qt para Python).
+# O pacote "PySide6" JÁ inclui PySide6-Essentials + PySide6-Addons
+# (QtMultimedia, QtWebEngine, etc.). NÃO liste PySide6-Addons separado:
+# isso causa conflito de versões no pip e quebra o build do .exe.
 PySide6>=6.6,<6.9
-
-# Player HTML5 premium (player principal). Pacote separado no PySide6 6.8+.
-PySide6-Addons>=6.6,<6.9
 
 # Observação: a aba "Acompanhamento" desenha os gráficos com QPainter puro
 # (módulo charts.py). NÃO é necessário instalar PySide6-Charts/QtCharts.
 
 # Cliente do Telegram (MTProto).
-Pyrogram>=2.0.106
+Pyrogram==2.0.106
 
-# Acelera a criptografia do Pyrogram (recomendado/quase obrigatório p/ vídeo).
-TgCrypto>=1.2.5
+# Acelera a criptografia do Pyrogram (recomendado).
+# É OPCIONAL: o app funciona sem ele (apenas um pouco mais lento). Em alguns
+# Pythons (ex.: 3.13) o TgCrypto não tem "wheel" pronto e tenta compilar em C,
+# o que pode falhar. Se a instalação do TgCrypto falhar, o build_exe.bat
+# continua mesmo assim e o app roda normalmente.
+TgCrypto>=1.2.5 ; python_version < "3.13"
 
 # Servidor HTTP local assíncrono usado para o streaming sob demanda.
 aiohttp>=3.9

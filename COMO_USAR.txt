@@ -11,13 +11,16 @@ e uma aba de Acompanhamento de estudos (Pomodoro, tarefas e graficos).
 ------------------------------------------------------------
 1) GERAR O APLICATIVO (.EXE) NO WINDOWS
 ------------------------------------------------------------
-1. Instale o Python 3.10, 3.11 ou 3.12 (64 bits):
+1. Instale o Python 3.11 ou 3.12 (64 bits):
    https://www.python.org/downloads/
    IMPORTANTE: marque a opcao "Add Python to PATH" na instalacao.
+   (Evite o Python 3.13 por enquanto - o TgCrypto pode nao instalar nele.)
 
 2. De DUPLO CLIQUE em "build_exe.bat".
    - Ele cria um ambiente virtual, instala tudo e gera o executavel.
    - Pode demorar alguns minutos na primeira vez.
+   - Se aparecer um AVISO de que o TgCrypto nao foi instalado, tudo bem:
+     ele e opcional e o aplicativo funciona normalmente sem ele.
 
 3. O aplicativo ficara em:
        dist\TGClassPlayer\TGClassPlayer.exe
@@ -74,7 +77,9 @@ Voce nao precisa configurar nada. Depois pode editar tudo manualmente.
 - Use a busca e os filtros: Todas / Assistidas / Pendentes / Favoritas.
 - Clique em uma aula e em "Assistir agora" (ou clique 2x na aula).
 - O player retoma de onde voce parou e salva o progresso.
-- Se o player interno falhar, use o botao "Abrir no VLC".
+- O player usa os codecs do proprio Windows (reproduz MP4/H.264 sem problema).
+- Se mesmo assim alguma aula nao tocar, clique em "Tentar de novo" ou no
+  botao "Abrir no VLC" (instale o VLC gratis em https://www.videolan.org/).
 
 
 ------------------------------------------------------------

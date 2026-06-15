@@ -1,5 +1,36 @@
 # Changelog — TGClassPlayer
 
+## v6.1.0
+
+Correções a partir do feedback de uso real (capturas enviadas pelo usuário).
+
+### Corrigido
+- **Sincronização de fórum (bug grave "tudo caiu em General"):** agora cada
+  tópico do fórum é lido **separadamente** via
+  `get_chat_history(message_thread_id=tid)` (com fallback para
+  `get_discussion_replies`). Antes, o histórico inteiro era varrido de uma vez e
+  o Pyrogram não preenchia o `message_thread_id` de forma confiável, jogando
+  **todos os vídeos e todos os sumários no tópico "General"**. Resultado: **cada
+  tópico = uma matéria com o SEU próprio sumário e as SUAS próprias aulas.**
+- **Player interno não reproduzia (`DEMUXER_ERROR_NO_SUPPORTED_STREAMS`):** o
+  player **principal** passou a ser o **QtMultimedia**, que usa os **codecs
+  nativos do Windows** (Media Foundation) e suporta H.264/AAC. O QtWebEngine
+  (que vem **sem** codecs proprietários) virou apenas *fallback*. Adicionado um
+  **aviso amigável** com "↻ Tentar de novo" e "Abrir no VLC" em caso de erro.
+- **"Caixas pretas" cobrindo textos/widgets:** desativada a composição por GPU
+  do Qt/QtWebEngine (`QTWEBENGINE_CHROMIUM_FLAGS=--disable-gpu` +
+  `AA_ShareOpenGLContexts` / `AA_UseSoftwareOpenGL`) e garantido
+  `background: transparent` nos rótulos (`QLabel`) — some o artefato de
+  retângulos pretos em placas/drivers problemáticos e em builds empacotados.
+- **Geração do .exe não funcionava:** o `TGClassPlayer.spec` usava argumentos
+  **removidos no PyInstaller 6.x** (`win_no_prefer_redirects`,
+  `win_private_assemblies`, `cipher`/`block_cipher`), o que abortava o build.
+  Spec reescrito para o PyInstaller 6.x. Além disso, `requirements.txt` deixou
+  de listar **`PySide6-Addons` separado** (causava conflito de versões no pip —
+  o `PySide6` já o inclui) e o **TgCrypto virou opcional** (não trava o build em
+  Pythons sem *wheel*, ex.: 3.13). O `build_exe.bat` instala as dependências de
+  forma resiliente (TgCrypto com aviso, sem abortar).
+
 ## v6.0.0
 
 Reconstrução completa da interface (do zero) e correção dos bugs críticos,

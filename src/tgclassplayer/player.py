@@ -1,15 +1,19 @@
 """Diálogo de reprodução premium.
 
-Correção crítica desta versão: a PÁGINA do player é servida pelo MESMO servidor
-local (rota /player/{token}), então carregamos via `web.load(QUrl(player_url))`
-em vez de `setHtml(...)`. Assim a página e o vídeo têm a MESMA ORIGEM e o
-QtWebEngine não bloqueia o `<video>` (problema de mixed-content/origem distinta).
+Correção crítica desta versão (v6.1):
+- O player PRINCIPAL agora é o **QtMultimedia** (QMediaPlayer + QVideoWidget),
+  porque ele usa os codecs NATIVOS do sistema operacional (no Windows, o Media
+  Foundation, que SUPORTA H.264/AAC). O QtWebEngine, ao contrário, vem SEM os
+  codecs proprietários compilados e, por isso, falhava com
+  ``DEMUXER_ERROR_NO_SUPPORTED_STREAMS`` na maioria dos .mp4.
+- O QtWebEngine fica como FALLBACK (caso o QtMultimedia não esteja disponível).
+- Em QUALQUER erro de reprodução mostramos um aviso amigável com os botões
+  "Tentar de novo" e "Abrir no VLC".
 
 Mantém:
 - Streaming sob demanda em blocos (HTTP Range) — não trava ao dar seek.
 - Resume automático da posição salva + gravação periódica de progresso.
-- Fallback para QtMultimedia quando o WebEngine não está disponível.
-- Botão "Abrir no VLC" na tela de erro do player (comunicado ao app).
+- Botão "Abrir no VLC" sempre acessível.
 """
 
 from __future__ import annotations
@@ -28,21 +32,12 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSlider,
     QVBoxLayout,
+    QWidget,
 )
 
 from .player_html import build_player_html
 
 log = logging.getLogger(__name__)
-
-try:
-    from PySide6.QtWebEngineWidgets import QWebEngineView
-    from PySide6.QtWebEngineCore import QWebEngineSettings
-
-    HAS_WEB_PLAYER = True
-except Exception:  # noqa: BLE001
-    QWebEngineView = None  # type: ignore
-    QWebEngineSettings = None  # type: ignore
-    HAS_WEB_PLAYER = False
 
 try:
     from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
@@ -54,6 +49,16 @@ except Exception:  # noqa: BLE001
     QMediaPlayer = None  # type: ignore
     QVideoWidget = None  # type: ignore
     HAS_QT_PLAYER = False
+
+try:
+    from PySide6.QtWebEngineWidgets import QWebEngineView
+    from PySide6.QtWebEngineCore import QWebEngineSettings
+
+    HAS_WEB_PLAYER = True
+except Exception:  # noqa: BLE001
+    QWebEngineView = None  # type: ignore
+    QWebEngineSettings = None  # type: ignore
+    HAS_WEB_PLAYER = False
 
 
 class VideoPlayerDialog(QDialog):
@@ -74,6 +79,9 @@ class VideoPlayerDialog(QDialog):
         self.service = service
         self.on_progress = on_progress
         self.on_open_vlc = on_open_vlc
+        self._stream_url = url
+        self._player_url = player_url
+        self._start_position_ms = max(0, int(start_position_ms))
         self._vlc_requested = False
         self._last_position = 0
         self._last_duration = 0
@@ -86,12 +94,13 @@ class VideoPlayerDialog(QDialog):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        if HAS_WEB_PLAYER:
-            self.mode = "web"
-            self._build_web(title, url, player_url, start_position_ms, layout)
-        elif HAS_QT_PLAYER:
+        # PRIORIDADE: QtMultimedia (codecs nativos do SO) -> WebEngine (fallback).
+        if HAS_QT_PLAYER:
             self.mode = "qt"
-            self._build_qt(title, url, start_position_ms, layout)
+            self._build_qt(title, url, self._start_position_ms, layout)
+        elif HAS_WEB_PLAYER:
+            self.mode = "web"
+            self._build_web(title, url, player_url, self._start_position_ms, layout)
         else:
             raise RuntimeError(
                 "Nenhum player disponível neste ambiente. Use o VLC como alternativa."
@@ -100,6 +109,81 @@ class VideoPlayerDialog(QDialog):
         self._poll = QTimer(self)
         self._poll.timeout.connect(self._collect_state)
         self._poll.start(1200)
+
+    # ------------------------------------------------------------ overlay de erro
+    def _build_error_overlay(self, parent: QWidget) -> None:
+        self.error_overlay = QFrame(parent)
+        self.error_overlay.setObjectName("PlayerErrorOverlay")
+        self.error_overlay.setStyleSheet(
+            "#PlayerErrorOverlay { background: rgba(120,20,20,0.92);"
+            " border-radius: 16px; }"
+            " QLabel { color: #fff; background: transparent; }"
+        )
+        box = QVBoxLayout(self.error_overlay)
+        box.setContentsMargins(28, 24, 28, 24)
+        box.setSpacing(10)
+        box.setAlignment(Qt.AlignCenter)
+
+        self.error_title = QLabel("Não foi possível reproduzir esta aula")
+        self.error_title.setStyleSheet(
+            "color:#fff;font-size:15pt;font-weight:800;background:transparent;"
+        )
+        self.error_title.setAlignment(Qt.AlignCenter)
+        self.error_detail = QLabel("")
+        self.error_detail.setWordWrap(True)
+        self.error_detail.setAlignment(Qt.AlignCenter)
+        self.error_detail.setStyleSheet(
+            "color:#ffe2e2;font-size:10pt;background:transparent;"
+        )
+
+        btn_row = QHBoxLayout()
+        btn_row.setAlignment(Qt.AlignCenter)
+        retry = QPushButton("↻ Tentar de novo")
+        retry.clicked.connect(self._retry_play)
+        vlc = QPushButton("Abrir no VLC")
+        vlc.setObjectName("PrimaryButton")
+        vlc.clicked.connect(self._request_vlc)
+        btn_row.addWidget(retry)
+        btn_row.addWidget(vlc)
+
+        box.addWidget(self.error_title)
+        box.addWidget(self.error_detail)
+        box.addLayout(btn_row)
+        self.error_overlay.hide()
+
+    def _show_error(self, detail: str) -> None:
+        if not hasattr(self, "error_overlay"):
+            return
+        self.error_detail.setText(detail or "Formato não suportado.")
+        parent = self.error_overlay.parentWidget()
+        if parent:
+            w = min(640, parent.width() - 60)
+            h = 220
+            self.error_overlay.setGeometry(
+                (parent.width() - w) // 2, (parent.height() - h) // 2, w, h
+            )
+        self.error_overlay.show()
+        self.error_overlay.raise_()
+
+    def _hide_error(self) -> None:
+        if hasattr(self, "error_overlay"):
+            self.error_overlay.hide()
+
+    def _retry_play(self) -> None:
+        self._hide_error()
+        if getattr(self, "mode", None) == "qt":
+            try:
+                self.player.stop()
+                self.player.setSource(QUrl(self._stream_url))
+                self.player.play()
+            except Exception:  # noqa: BLE001
+                log.exception("Falha ao tentar reproduzir novamente")
+        elif getattr(self, "mode", None) == "web":
+            try:
+                if self._player_url:
+                    self.web.load(QUrl(self._player_url))
+            except Exception:  # noqa: BLE001
+                pass
 
     # ------------------------------------------------------------------- web
     def _build_web(self, title, stream_url, player_url, start_position_ms, layout) -> None:
@@ -116,13 +200,15 @@ class VideoPlayerDialog(QDialog):
             pass
 
         layout.addWidget(self.web, 1)
-        # CORREÇÃO: carrega a PÁGINA do player pela MESMA origem do vídeo.
         if player_url:
             self.web.load(QUrl(player_url))
         else:
-            # Fallback raríssimo: monta o HTML localmente (mesma origem do stream).
             html_text = build_player_html(title, stream_url, start_position_ms)
-            origin = stream_url.rsplit("/stream/", 1)[0] + "/" if "/stream/" in stream_url else "http://127.0.0.1/"
+            origin = (
+                stream_url.rsplit("/stream/", 1)[0] + "/"
+                if "/stream/" in stream_url
+                else "http://127.0.0.1/"
+            )
             self.web.setHtml(html_text, QUrl(origin))
 
     def _collect_state(self) -> None:
@@ -153,36 +239,43 @@ class VideoPlayerDialog(QDialog):
                 pass
         if data.get("wantVlc") and not self._vlc_requested:
             self._vlc_requested = True
-            if self.on_open_vlc:
-                try:
-                    self.on_open_vlc()
-                except Exception:  # noqa: BLE001
-                    pass
+            self._request_vlc()
 
     # -------------------------------------------------------------------- qt
     def _build_qt(self, title, url, start_position_ms, layout) -> None:
         self._duration = 0
         self._dragging = False
-        self._start_position_ms = max(0, int(start_position_ms))
         self._resumed = False
+
+        # Container do vídeo (preto) com overlay de erro por cima.
+        self.video_container = QWidget()
+        self.video_container.setStyleSheet("background:#000;")
+        container_layout = QVBoxLayout(self.video_container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
 
         header = QHBoxLayout()
         header.setContentsMargins(16, 14, 16, 0)
         title_label = QLabel(title)
         title_label.setObjectName("PlayerTitle")
-        title_label.setStyleSheet("color:#fff;font-size:15pt;font-weight:800;")
+        title_label.setStyleSheet(
+            "color:#fff;font-size:15pt;font-weight:800;background:transparent;"
+        )
         title_label.setWordWrap(True)
         header.addWidget(title_label, 1)
         layout.addLayout(header)
 
         self.video = QVideoWidget()
         self.video.setStyleSheet("background:#000;")
+        container_layout.addWidget(self.video)
+        layout.addWidget(self.video_container, 1)
+
+        self._build_error_overlay(self.video_container)
+
         self.audio = QAudioOutput(self)
         self.audio.setVolume(1.0)
         self.player = QMediaPlayer(self)
         self.player.setAudioOutput(self.audio)
         self.player.setVideoOutput(self.video)
-        layout.addWidget(self.video, 1)
 
         self.position = QSlider(Qt.Horizontal)
         self.position.setRange(0, 0)
@@ -210,7 +303,9 @@ class VideoPlayerDialog(QDialog):
         controls.addSpacing(10)
         controls.addWidget(self.time_label)
         controls.addStretch(1)
-        controls.addWidget(QLabel("Velocidade"))
+        speed_lbl = QLabel("Velocidade")
+        speed_lbl.setStyleSheet("color:#cbd5e1;")
+        controls.addWidget(speed_lbl)
         controls.addWidget(self.speed_box)
         controls.addWidget(self.vlc_btn)
         controls.addWidget(self.full_btn)
@@ -233,10 +328,42 @@ class VideoPlayerDialog(QDialog):
             self.player.playbackStateChanged.connect(self.on_state_changed)
         except Exception:  # noqa: BLE001
             pass
+        try:
+            self.player.errorOccurred.connect(self._on_media_error)
+        except Exception:  # noqa: BLE001
+            # Versões antigas usam mediaStatusChanged/error.
+            try:
+                self.player.errorChanged.connect(self._on_media_error_legacy)
+            except Exception:  # noqa: BLE001
+                pass
         self.player.setSource(QUrl(url))
         self.player.play()
 
+    def _on_media_error(self, error, error_string: str = "") -> None:
+        # error == NoError (0) é ignorado.
+        try:
+            if int(error) == 0:
+                return
+        except Exception:  # noqa: BLE001
+            pass
+        detail = error_string or "Formato de mídia não suportado por este player."
+        log.warning("Erro de mídia (QtMultimedia): %s", detail)
+        self._show_error(
+            f"Detalhe: {detail}\nVocê pode tentar novamente ou abrir no VLC."
+        )
+
+    def _on_media_error_legacy(self, *_args) -> None:
+        try:
+            detail = self.player.errorString()
+        except Exception:  # noqa: BLE001
+            detail = ""
+        if detail:
+            self._on_media_error(1, detail)
+
     def _request_vlc(self) -> None:
+        if self._vlc_requested:
+            return
+        self._vlc_requested = True
         if self.on_open_vlc:
             try:
                 self.on_open_vlc()
@@ -248,7 +375,10 @@ class VideoPlayerDialog(QDialog):
         self.player.setPosition(self.position.value())
 
     def toggle_play(self) -> None:
-        playing = getattr(QMediaPlayer, "PlayingState", None) or QMediaPlayer.PlaybackState.PlayingState
+        playing = (
+            getattr(QMediaPlayer, "PlayingState", None)
+            or QMediaPlayer.PlaybackState.PlayingState
+        )
         if self.player.playbackState() == playing:
             self.player.pause()
         else:
@@ -291,12 +421,24 @@ class VideoPlayerDialog(QDialog):
             self.position.setValue(int(position))
         self._last_position = int(position)
         self._last_duration = self._duration
+        if position > 0:
+            self._hide_error()  # reproduzindo: some com o aviso, se houver
         self.update_time_label(int(position))
+        if self.on_progress and position:
+            try:
+                self.on_progress(int(position), self._duration)
+            except Exception:  # noqa: BLE001
+                pass
 
     def on_state_changed(self, *_args) -> None:
         try:
-            playing = getattr(QMediaPlayer, "PlayingState", None) or QMediaPlayer.PlaybackState.PlayingState
-            self.play_btn.setText("❚❚" if self.player.playbackState() == playing else "▶")
+            playing = (
+                getattr(QMediaPlayer, "PlayingState", None)
+                or QMediaPlayer.PlaybackState.PlayingState
+            )
+            self.play_btn.setText(
+                "❚❚" if self.player.playbackState() == playing else "▶"
+            )
         except Exception:  # noqa: BLE001
             pass
 
@@ -316,6 +458,11 @@ class VideoPlayerDialog(QDialog):
                 self.on_progress(self._last_position, self._last_duration)
             except Exception:  # noqa: BLE001
                 pass
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if hasattr(self, "error_overlay") and self.error_overlay.isVisible():
+            self._show_error(self.error_detail.text())
 
     def keyPressEvent(self, event) -> None:
         if getattr(self, "mode", None) == "qt":
@@ -353,7 +500,9 @@ class VideoPlayerDialog(QDialog):
             pass
         try:
             if self.service and self.token:
-                self.service.call(self.service.release_stream(self.token, delete_file=True))
+                self.service.call(
+                    self.service.release_stream(self.token, delete_file=True)
+                )
         except Exception:  # noqa: BLE001
             pass
         super().closeEvent(event)

@@ -1400,9 +1400,39 @@ def excepthook(exc_type, exc, tb):
         pass
 
 
+def _configure_rendering() -> None:
+    """Evita "caixas pretas" sobre o texto/widgets em alguns PCs Windows.
+
+    Em muitas placas de vídeo/drivers (e em builds empacotados com PyInstaller),
+    a composição por GPU do Qt/QtWebEngine desenha retângulos pretos por cima de
+    widgets. Forçar a composição por software e compartilhar o contexto OpenGL
+    resolve o problema de forma confiável, com impacto mínimo de desempenho.
+    """
+    import os
+
+    from PySide6.QtCore import QCoreApplication
+
+    # Flags do Chromium do QtWebEngine: desliga GPU (causa das caixas pretas).
+    flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
+    extra = "--disable-gpu --disable-gpu-compositing --disable-software-rasterizer"
+    if extra not in flags:
+        os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (flags + " " + extra).strip()
+
+    try:
+        QCoreApplication.setAttribute(Qt.AA_ShareOpenGLContexts, True)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        # Renderização por software do próprio Qt (corrige artefatos de overlay).
+        QCoreApplication.setAttribute(Qt.AA_UseSoftwareOpenGL, True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def main() -> None:
     setup_logging()
     sys.excepthook = excepthook
+    _configure_rendering()
     app = QApplication(sys.argv)
     app.setApplicationName("TGClassPlayer")
     try:
