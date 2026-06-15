@@ -6,6 +6,7 @@ from typing import Any
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QComboBox,
     QDialog,
     QFormLayout,
@@ -20,6 +21,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressDialog,
     QPushButton,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -564,3 +566,145 @@ class EditVideoDialog(QDialog):
             "hashtags": tags,
             "note": self.note_edit.toPlainText().strip() or None,
         }
+
+
+class StreamingSettingsDialog(QDialog):
+    """Seção "Streaming & Rede": qualidade, proxy SOCKS5/MTProto e tuning de rede.
+
+    Ideias portadas do projeto de referência: proxy configurável, ajuste de
+    chunk/concorrência, limite de banda e um modo "conexão instável" (mais
+    re-tentativas para redes ruins). Todos os valores persistem via
+    get_setting/set_setting.
+    """
+
+    QUALITY_OPTIONS = ["360p", "480p", "720p", "1080p", "original"]
+    PROXY_TYPES = ["socks5", "socks4", "http", "mtproto"]
+
+    def __init__(self, db: Database, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.db = db
+        self.setWindowTitle("Streaming & Rede")
+        self.setMinimumWidth(560)
+
+        g = self.db.get_setting
+
+        # ---- Qualidade -----------------------------------------------------
+        self.quality_box = QComboBox()
+        self.quality_box.addItems(self.QUALITY_OPTIONS)
+        self.quality_box.setCurrentText((g("streaming_quality") or "original").lower())
+
+        self.adaptive_chk = QCheckBox("Qualidade adaptativa (ajusta pela banda medida)")
+        self.adaptive_chk.setChecked((g("adaptive_mode") or "0") == "1")
+
+        # ---- Limite de banda / tuning -------------------------------------
+        self.bandwidth_spin = QSpinBox()
+        self.bandwidth_spin.setRange(0, 100000)
+        self.bandwidth_spin.setSingleStep(250)
+        self.bandwidth_spin.setSuffix(" kbps")
+        self.bandwidth_spin.setSpecialValueText("Ilimitado")
+        self.bandwidth_spin.setValue(self._int(g("bandwidth_limit_kbps"), 0))
+
+        self.chunk_spin = QSpinBox()
+        self.chunk_spin.setRange(256, 8192)
+        self.chunk_spin.setSingleStep(256)
+        self.chunk_spin.setSuffix(" KB")
+        self.chunk_spin.setValue(self._int(g("chunk_size_kb"), 2048))
+
+        self.retries_spin = QSpinBox()
+        self.retries_spin.setRange(0, 20)
+        self.retries_spin.setValue(self._int(g("network_retries"), 2))
+
+        self.unstable_chk = QCheckBox(
+            "Modo conexão instável (mais re-tentativas e backoff)"
+        )
+        self.unstable_chk.setChecked((g("unstable_connection") or "0") == "1")
+
+        # ---- Proxy ---------------------------------------------------------
+        self.proxy_chk = QCheckBox("Usar proxy (SOCKS5 / HTTP / MTProto)")
+        self.proxy_chk.setChecked((g("proxy_enabled") or "0") == "1")
+
+        self.proxy_type = QComboBox()
+        self.proxy_type.addItems(self.PROXY_TYPES)
+        self.proxy_type.setCurrentText((g("proxy_type") or "socks5").lower())
+
+        self.proxy_host = QLineEdit(g("proxy_host") or "")
+        self.proxy_host.setPlaceholderText("ex.: 127.0.0.1")
+        self.proxy_port = QLineEdit(g("proxy_port") or "")
+        self.proxy_port.setPlaceholderText("ex.: 1080")
+        self.proxy_user = QLineEdit(g("proxy_user") or "")
+        self.proxy_user.setPlaceholderText("(opcional)")
+        self.proxy_pass = QLineEdit(g("proxy_pass") or "")
+        self.proxy_pass.setEchoMode(QLineEdit.Password)
+        self.proxy_pass.setPlaceholderText("(opcional)")
+
+        form = QFormLayout()
+        form.setSpacing(9)
+        form.addRow("Qualidade padrão", self.quality_box)
+        form.addRow("", self.adaptive_chk)
+        form.addRow("Limite de banda", self.bandwidth_spin)
+        form.addRow("Tamanho do bloco", self.chunk_spin)
+        form.addRow("Re-tentativas de rede", self.retries_spin)
+        form.addRow("", self.unstable_chk)
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        form.addRow(sep)
+        form.addRow("", self.proxy_chk)
+        form.addRow("Tipo de proxy", self.proxy_type)
+        form.addRow("Host", self.proxy_host)
+        form.addRow("Porta", self.proxy_port)
+        form.addRow("Usuário", self.proxy_user)
+        form.addRow("Senha", self.proxy_pass)
+
+        note = QLabel(
+            "Alterações de proxy entram em vigor na próxima conexão (reinicie a "
+            "sessão se já estiver conectado). O modo conexão instável aumenta a "
+            "resiliência em redes ruins, ao custo de mais latência."
+        )
+        note.setObjectName("Muted2")
+        note.setWordWrap(True)
+
+        save = QPushButton("Salvar")
+        save.setObjectName("PrimaryButton")
+        cancel = QPushButton("Cancelar")
+        save.clicked.connect(self._save)
+        cancel.clicked.connect(self.reject)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(cancel)
+        row.addWidget(save)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 22, 22, 22)
+        title = QLabel("Streaming & Rede")
+        title.setObjectName("PanelTitle")
+        layout.addWidget(title)
+        layout.addLayout(form)
+        layout.addWidget(note)
+        layout.addSpacing(6)
+        layout.addLayout(row)
+
+    @staticmethod
+    def _int(value: str | None, default: int) -> int:
+        try:
+            return int(value) if value not in (None, "") else default
+        except (TypeError, ValueError):
+            return default
+
+    def _save(self) -> None:
+        s = self.db.set_setting
+        s("streaming_quality", self.quality_box.currentText())
+        s("adaptive_mode", "1" if self.adaptive_chk.isChecked() else "0")
+        s("bandwidth_limit_kbps", str(self.bandwidth_spin.value()))
+        s("chunk_size_kb", str(self.chunk_spin.value()))
+        s("network_retries", str(self.retries_spin.value()))
+        s("unstable_connection", "1" if self.unstable_chk.isChecked() else "0")
+        s("proxy_enabled", "1" if self.proxy_chk.isChecked() else "0")
+        s("proxy_type", self.proxy_type.currentText())
+        s("proxy_host", self.proxy_host.text().strip())
+        s("proxy_port", self.proxy_port.text().strip())
+        s("proxy_user", self.proxy_user.text().strip())
+        s("proxy_pass", self.proxy_pass.text())
+        self.accept()
+
+    def result_quality(self) -> tuple[str, bool]:
+        return self.quality_box.currentText(), self.adaptive_chk.isChecked()

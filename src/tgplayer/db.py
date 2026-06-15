@@ -19,13 +19,23 @@ Princípios:
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterator
 
 from .paths import DB_PATH, ensure_dirs
+
+log = logging.getLogger(__name__)
+
+# Quantas entradas manter no cache de metadados `moov` (cursos têm muitas aulas).
+MOOV_CACHE_LIMIT = 200
+# Tentativas/backoff ao abrir o banco (anti "database is locked").
+DB_OPEN_RETRIES = 5
+DB_OPEN_BACKOFF = 0.15
 
 
 # --------------------------------------------------------------------------- DTOs
@@ -69,6 +79,8 @@ class Video:
     size: int | None
     duration: int | None
     date: str | None
+    width: int | None = None
+    height: int | None = None
     hashtags: list[str] = field(default_factory=list)
     caption: str | None = None
     watched_at: str | None = None
@@ -92,14 +104,39 @@ class Database:
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(self.path)
+        """Abre a conexão com RETRY + BACKOFF exponencial.
+
+        Ideia portada de `db.rs` do projeto de referência: bancos SQLite em WAL
+        podem retornar "database is locked" sob concorrência (sincronização +
+        salvamento de progresso). Tentamos algumas vezes com espera crescente
+        antes de desistir, tornando a abertura resiliente.
+        """
+        conn = self._connect_with_retry()
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=4000")
         try:
             yield conn
             conn.commit()
         finally:
             conn.close()
+
+    def _connect_with_retry(self) -> sqlite3.Connection:
+        last_exc: Exception | None = None
+        for attempt in range(DB_OPEN_RETRIES):
+            try:
+                return sqlite3.connect(self.path, timeout=5.0)
+            except sqlite3.OperationalError as exc:  # noqa: PERF203
+                last_exc = exc
+                wait = DB_OPEN_BACKOFF * (2 ** attempt)
+                log.warning(
+                    "Banco ocupado (tentativa %d/%d): %s — aguardando %.2fs",
+                    attempt + 1, DB_OPEN_RETRIES, exc, wait,
+                )
+                time.sleep(wait)
+        # Esgotou as tentativas: propaga o último erro.
+        assert last_exc is not None
+        raise last_exc
 
     # ------------------------------------------------------------------ schema
     def init(self) -> None:
@@ -202,6 +239,25 @@ class Database:
                     subject_id INTEGER
                 );
                 CREATE INDEX IF NOT EXISTS idx_studylog_day ON study_log(day);
+
+                -- Cache de metadados do átomo `moov` do MP4 (boot instantâneo na
+                -- 2ª vez). Ideia portada de `moovCache.ts` (IndexedDB/LRU).
+                CREATE TABLE IF NOT EXISTS moov_cache (
+                    chat_id      TEXT NOT NULL,
+                    message_id   INTEGER NOT NULL,
+                    file_size    INTEGER,
+                    moov_offset  INTEGER,
+                    moov_size    INTEGER,
+                    located      INTEGER DEFAULT 0,
+                    duration_ms  INTEGER,
+                    width        INTEGER,
+                    height       INTEGER,
+                    codec        TEXT,
+                    tracks       INTEGER,
+                    updated_at   REAL NOT NULL,
+                    PRIMARY KEY(chat_id, message_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_moov_updated ON moov_cache(updated_at);
                 """
             )
             # ---- Migrações suaves de bancos antigos (v4/v5) -----------------
@@ -218,6 +274,10 @@ class Database:
             self._ensure_column(conn, "videos", "note", "TEXT")
             self._ensure_column(conn, "videos", "sort_order", "INTEGER DEFAULT 0")
             self._ensure_column(conn, "videos", "manual", "INTEGER DEFAULT 0")
+            # Migração v6.2 -> v6.3: resolução + timestamp do último acesso.
+            self._ensure_column(conn, "videos", "width", "INTEGER")
+            self._ensure_column(conn, "videos", "height", "INTEGER")
+            self._ensure_column(conn, "videos", "last_watched_at", "TEXT")
             # Migração v5 -> v6: campos antigos topic_id/topic_title viram subjects.
             self._migrate_topics_to_subjects(conn)
 
@@ -292,6 +352,88 @@ class Database:
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (key, value),
             )
+
+    # --------------------------------------------------------------- moov_cache
+    def get_moov_cache(self, chat_id: str, message_id: int) -> dict[str, Any] | None:
+        """Retorna os metadados `moov` cacheados desta aula (ou None)."""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM moov_cache WHERE chat_id=? AND message_id=?",
+                (str(chat_id), int(message_id)),
+            ).fetchone()
+            if not row:
+                return None
+            # Atualiza o "last access" para o LRU (toca a entrada lida).
+            conn.execute(
+                "UPDATE moov_cache SET updated_at=? WHERE chat_id=? AND message_id=?",
+                (time.time(), str(chat_id), int(message_id)),
+            )
+            return dict(row)
+
+    def set_moov_cache(
+        self,
+        chat_id: str,
+        message_id: int,
+        file_size: int | None = None,
+        moov_offset: int | None = None,
+        moov_size: int | None = None,
+        located: int | None = None,
+        duration_ms: int | None = None,
+        width: int | None = None,
+        height: int | None = None,
+        codec: str | None = None,
+        tracks: int | None = None,
+    ) -> None:
+        """Grava/atualiza os metadados `moov` e poda o cache (LRU 200).
+
+        Todos os campos além de (chat_id, message_id) são opcionais e usam
+        COALESCE no UPSERT — isto permite uma atualização apenas de metadados
+        (ex.: pré-busca de resolução) sem apagar um `moov_offset` já descoberto.
+        """
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO moov_cache(
+                    chat_id, message_id, file_size, moov_offset, moov_size,
+                    located, duration_ms, width, height, codec, tracks, updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(chat_id, message_id) DO UPDATE SET
+                    file_size=COALESCE(excluded.file_size, moov_cache.file_size),
+                    moov_offset=COALESCE(excluded.moov_offset, moov_cache.moov_offset),
+                    moov_size=COALESCE(excluded.moov_size, moov_cache.moov_size),
+                    located=COALESCE(excluded.located, moov_cache.located),
+                    duration_ms=COALESCE(excluded.duration_ms, moov_cache.duration_ms),
+                    width=COALESCE(excluded.width, moov_cache.width),
+                    height=COALESCE(excluded.height, moov_cache.height),
+                    codec=COALESCE(excluded.codec, moov_cache.codec),
+                    tracks=COALESCE(excluded.tracks, moov_cache.tracks),
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    str(chat_id), int(message_id), file_size, moov_offset, moov_size,
+                    (int(located) if located is not None else None),
+                    duration_ms, width, height, codec, tracks,
+                    time.time(),
+                ),
+            )
+            # Poda LRU: mantém apenas as MOOV_CACHE_LIMIT entradas mais recentes.
+            count = conn.execute("SELECT COUNT(*) AS n FROM moov_cache").fetchone()["n"]
+            if count > MOOV_CACHE_LIMIT:
+                conn.execute(
+                    "DELETE FROM moov_cache WHERE rowid IN ("
+                    "SELECT rowid FROM moov_cache ORDER BY updated_at ASC LIMIT ?)",
+                    (int(count - MOOV_CACHE_LIMIT),),
+                )
+
+    def clear_moov_cache(self, chat_id: str | None = None, message_id: int | None = None) -> None:
+        with self.connect() as conn:
+            if chat_id is not None and message_id is not None:
+                conn.execute(
+                    "DELETE FROM moov_cache WHERE chat_id=? AND message_id=?",
+                    (str(chat_id), int(message_id)),
+                )
+            else:
+                conn.execute("DELETE FROM moov_cache")
 
     # ------------------------------------------------------------------ courses
     def upsert_course(self, data: dict[str, Any]) -> int:
@@ -569,6 +711,31 @@ class Database:
         with self.connect() as conn:
             conn.execute("UPDATE videos SET subject_id=? WHERE id=?", (subject_id, video_id))
 
+    def set_video_dimensions(
+        self,
+        chat_id: str,
+        message_id: int,
+        width: int | None = None,
+        height: int | None = None,
+        duration: int | None = None,
+    ) -> None:
+        """Atualiza resolução/duração da aula (apenas quando ainda vazias).
+
+        Usado pela pré-busca de metadados em 2º plano; preserva valores já
+        existentes via COALESCE para não regredir dados importados.
+        """
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE videos SET
+                    width=COALESCE(?, width),
+                    height=COALESCE(?, height),
+                    duration=COALESCE(NULLIF(duration, 0), ?)
+                WHERE chat_id=? AND message_id=?
+                """,
+                (width, height, duration, str(chat_id), int(message_id)),
+            )
+
     def set_video_meta(
         self,
         video_id: int,
@@ -604,18 +771,46 @@ class Database:
         progress = 0.0
         if duration_ms and duration_ms > 0:
             progress = max(0.0, min(1.0, position_ms / duration_ms))
+        now = self.now()
         with self.connect() as conn:
             if progress >= 0.92:
                 conn.execute(
-                    "UPDATE videos SET position_ms=?, progress=?, "
+                    "UPDATE videos SET position_ms=?, progress=?, last_watched_at=?, "
                     "watched_at=COALESCE(watched_at, ?) WHERE id=?",
-                    (int(position_ms), progress, self.now(), video_id),
+                    (int(position_ms), progress, now, now, video_id),
                 )
             else:
                 conn.execute(
-                    "UPDATE videos SET position_ms=?, progress=? WHERE id=?",
-                    (int(position_ms), progress, video_id),
+                    "UPDATE videos SET position_ms=?, progress=?, last_watched_at=? WHERE id=?",
+                    (int(position_ms), progress, now, video_id),
                 )
+
+    def continue_watching(self, limit: int = 12) -> list[Video]:
+        """Aulas em andamento (resume): progresso parcial, mais recentes primeiro.
+
+        Ideia portada do 'continuar assistindo' do projeto de referência.
+        """
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM videos WHERE progress > 0.02 AND progress < 0.95 "
+                "AND last_watched_at IS NOT NULL "
+                "ORDER BY last_watched_at DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        return [self._row_to_video(dict(r)) for r in rows]
+
+    def course_progress(self, course_id: int) -> tuple[int, int]:
+        """Retorna (assistidas, total) de um curso para exibir o % de progresso."""
+        with self.connect() as conn:
+            total = conn.execute(
+                "SELECT COUNT(*) AS n FROM videos WHERE course_id=?", (course_id,)
+            ).fetchone()["n"]
+            done = conn.execute(
+                "SELECT COUNT(*) AS n FROM videos WHERE course_id=? AND "
+                "(watched_at IS NOT NULL OR progress >= 0.92)",
+                (course_id,),
+            ).fetchone()["n"]
+        return int(done), int(total)
 
     def reorder_videos(self, ordered_ids: list[int]) -> None:
         with self.connect() as conn:
@@ -844,6 +1039,8 @@ class Database:
             size=data.get("size"),
             duration=data.get("duration"),
             date=data.get("date"),
+            width=data.get("width"),
+            height=data.get("height"),
             hashtags=tags,
             caption=data.get("caption"),
             watched_at=data.get("watched_at"),

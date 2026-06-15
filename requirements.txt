@@ -1,4 +1,4 @@
-# TgPlayer v6.2 — dependências
+# TgPlayer v6.3 — dependências
 #
 # Instale com:
 #     pip install -r requirements.txt

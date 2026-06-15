@@ -1,5 +1,98 @@
 # Changelog — TgPlayer
 
+## v6.3.0
+
+Foco desta versão: **portar ideias e lógica** do projeto de referência
+`caamer20/Telegram-Drive` (Tauri/Rust/React, "Telegram como nuvem") para o
+TgPlayer — **reimplementadas em Python/PySide6/Pyrogram/aiohttp**, sem copiar
+código Rust/React. Onde a referência usava MSE/mp4box no navegador (remux
+fMP4), aqui usamos reprodução nativa (libVLC/QMediaPlayer) e descartamos o
+remux. A arquitetura atual foi preservada (servidor aiohttp local +
+`stream_cache.py` + backends de player).
+
+### Streaming mais rápido e à prova de corrupção (Fase A)
+- **Alinhamento de offset do CDN (512 KiB):** todas as leituras de Range são
+  alinhadas para baixo na fronteira de 512 KiB que o CDN do Telegram usa,
+  eliminando corrupção de MP4 por requisições desalinhadas.
+- **Descoberta do `moov` em 3 passos** (128K → 512K → cauda): localiza o átomo
+  `moov` mesmo em arquivos *non-faststart* (moov no fim), com varredura
+  estruturada + busca por assinatura validando `mvhd`.
+- **Cache persistente do `moov` (SQLite, LRU ~200):** boot instantâneo na 2ª
+  reprodução; pré-aquece direto o intervalo do `moov`.
+- **Cancelamento limpo:** ao fechar uma sessão, os downloads em voo são
+  cancelados de forma ordenada (sem travar o app).
+
+### Qualidade e adaptação (Fase B)
+- **Presets de qualidade** (360/480/720/1080/original) com mapa de *throttle*
+  por qualidade e **modo adaptativo** (mede banda numa janela de 3s e escolhe a
+  qualidade por limiares).
+- **Seletor de qualidade no player** (engrenagem ⚙), com trava anti-*upscale*
+  (não oferece resolução acima da fonte) e botão "Auto".
+
+### Player premium (Fase C)
+- **Badges** sobre o vídeo: qualidade, resolução, modo (Auto/Manual) e posição
+  na playlist.
+- **Overlay de debug (tecla D):** velocidade, segundos em buffer, modo, tamanho,
+  `moov` e botão para limpar cache.
+- **Navegação entre aulas (‹ ›) + auto-play da próxima** (contagem de 5s ao
+  chegar a ~92% ou ao terminar).
+- **Atalhos completos:** Espaço, ←/→, J/L (±10s), ↑/↓ (volume), F, M, Esc, D,
+  [ / ] (velocidade), 0–9 (saltar %), N/P (próxima/anterior).
+- **Velocidade de reprodução persistente por curso.**
+
+### Miniaturas e metadados (Fase D)
+- **Cache de miniaturas com poda LRU** (até 400 arquivos / 256 MB, preservando o
+  ativo) — ideia portada do `preview.rs`.
+- **Pré-busca de metadados** (resolução/duração) em 2º plano, persistida em
+  `moov_cache` e na tabela `videos`.
+- **VideoMetaBadge:** resolução compacta (ex.: `1080p`) nas listas e no painel
+  de detalhes.
+
+### Rede, proxy e resiliência (Fase E)
+- Seção **"Streaming & Rede"** (menu Ferramentas): qualidade/adaptativo,
+  **limite de banda (kbps)**, tamanho do bloco, re-tentativas e **modo conexão
+  instável**, além de **proxy SOCKS5/HTTP/MTProto** (host/porta/usuário/senha).
+- **Re-tentativas por bloco com backoff** e retomada do offset já gravado (não
+  reinicia o bloco do zero) — downloads resilientes em redes ruins.
+- **Backoff/retry no SQLite** (`busy_timeout` + tentativas) contra
+  *"database is locked"*.
+- **Widget de banda em tempo real** na barra superior (some sem streaming
+  ativo).
+
+### Links e organização (Fase F)
+- **Copiar link nativo do Telegram (`t.me/{canal}/{id}`)** para canais/grupos
+  PÚBLICOS, com aviso claro quando o canal é privado.
+
+### Toques de produto (P7)
+- **Continuar assistindo (resume):** filtro virtual na barra de matérias com as
+  aulas em andamento, ordenadas pelo acesso mais recente.
+- **% de progresso por curso** na lista de cursos.
+- **Estados vazios** mais amigáveis.
+
+### Mapeamento "ideia da referência → recurso do TgPlayer"
+
+| Referência (`caamer20/Telegram-Drive`) | Reimplementação no TgPlayer |
+| --- | --- |
+| Alinhamento de offset do CDN (512 KiB) no leitor de stream | `stream_cache.align_down` + `CDN_ALIGNMENT` aplicado em `read_range` |
+| Busca do átomo `moov` (faststart vs moov-no-fim) | `discover_moov` (3 passos) + `_scan_moov_box` (walk + assinatura) |
+| Cache de metadados/preview por arquivo | tabela SQLite `moov_cache` (LRU 200) + `get/set_moov_cache` |
+| Cancelamento de downloads em voo | `StreamSession.close()` aguarda cancelamento das tasks |
+| Presets/adaptação de qualidade (`AdaptiveMediaPlayer.tsx`) | `quality.py` (presets, throttle, limiares) + modo adaptativo por janela de 3s |
+| Remux fMP4 (MSE/mp4box no navegador) | **descartado**: reprodução nativa libVLC/QMediaPlayer |
+| Cache de previews com poda preservando o ativo (`preview.rs`) | `ensure_thumbnail` + `_prune_thumb_cache` (LRU 400/256MB, preserva `keep`) |
+| Tuning de rede / proxy | `StreamingSettingsDialog` + `_build_proxy` (SOCKS5/HTTP/MTProto) + `max_retries` |
+| Modo conexão instável | re-tentativas com backoff em `_download_block` + `unstable_connection` |
+| Copiar link nativo do Telegram | `telegram_message_link` + ação "Copiar link do Telegram (t.me)" |
+| Continuar assistindo / progresso | `continue_watching` + `course_progress` + filtro `SUBJECT_CONTINUE` |
+
+### Notas técnicas
+- Sessão preservada (`tgclassplayer`) e migração de dados legados mantidas.
+- Migrações idempotentes (`width`, `height`, `last_watched_at`, tabela
+  `moov_cache`) via `_ensure_column` / `CREATE TABLE IF NOT EXISTS`.
+- Todos os ajustes persistem via `get_setting`/`set_setting`.
+- Smoke tests: alinhamento de CDN, descoberta de `moov`, cache hit/miss + LRU,
+  qualidade adaptativa, retomada/continuar/progresso, metadados/`moov` parcial.
+
 ## v6.2.0
 
 > **O projeto agora se chama TgPlayer** (antes: TGClassPlayer). O nome do

@@ -1,5 +1,5 @@
 ============================================================
-  TgPlayer v6.2 - COMO USAR (guia rapido, em portugues)
+  TgPlayer v6.3 - COMO USAR (guia rapido, em portugues)
 ============================================================
 
 O TgPlayer organiza e reproduz as videoaulas dos seus cursos do
@@ -81,6 +81,24 @@ Voce nao precisa configurar nada. Depois pode editar tudo manualmente.
 - Se mesmo assim alguma aula nao tocar, clique em "Tentar de novo" ou no
   botao "Abrir no VLC" (instale o VLC gratis em https://www.videolan.org/).
 
+NOVO na v6.3 - dentro do player:
+- Engrenagem de QUALIDADE (canto): 360p / 480p / 720p / 1080p / original,
+  ou modo "Auto" (adaptativo) que ajusta pela sua banda.
+- Badges no topo mostram qualidade, resolucao e a posicao na playlist.
+- Botoes < e > (e as teclas P / N) trocam para a aula anterior/proxima.
+- Ao terminar (ou perto do fim), aparece a contagem de AUTO-PLAY da proxima.
+- Atalhos uteis: Espaco (play/pausa), <-/-> (10s), J/L (10s), cima/baixo
+  (volume), F (tela cheia), M (mudo), [ e ] (velocidade), 0-9 (saltar %),
+  D (overlay de debug com banda e buffer).
+- A velocidade de reproducao e lembrada POR CURSO.
+
+NOVO na v6.3 - na lista de aulas:
+- A resolucao aparece como badge (ex.: 1080p) quando conhecida.
+- O filtro "Continuar assistindo" (lista de materias) reune as aulas em
+  andamento; a lista de cursos mostra o % concluido de cada curso.
+- No botao direito da aula: "Copiar link do Telegram (t.me)" gera o link
+  nativo (somente para canais/grupos PUBLICOS).
+
 
 ------------------------------------------------------------
 6) SUMARIO (MENU) DE CADA MATERIA
@@ -110,7 +128,8 @@ botao direito sobre a materia.
 - Cursos: renomear, definir cor, reordenar, sincronizar, excluir.
 - Materias: nova, renomear, editar sumario, reordenar, excluir.
 - Aulas: editar (titulo, materia, modulo, tipo, hashtags, notas),
-  favoritar, marcar assistida/pendente, copiar link temporario, remover.
+  favoritar, marcar assistida/pendente, copiar link temporario,
+  copiar link do Telegram (t.me, canais publicos), remover.
 
 
 ------------------------------------------------------------
@@ -125,14 +144,29 @@ botao direito sobre a materia.
 
 
 ------------------------------------------------------------
-9) TEMA CLARO / ESCURO
+9) STREAMING & REDE (novo na v6.3)
+------------------------------------------------------------
+Menu "Ferramentas" > "Streaming & Rede...". Ali voce define:
+- Qualidade padrao e o modo adaptativo (Auto).
+- Limite de banda (kbps) - util para nao saturar a sua conexao.
+- Tamanho do bloco e numero de re-tentativas de rede.
+- Modo "conexao instavel": mais re-tentativas com espera (backoff),
+  ideal para redes ruins/instaveis.
+- Proxy: SOCKS5, HTTP ou MTProto (host, porta, usuario e senha).
+  Os ajustes de proxy passam a valer na proxima conexao.
+
+Quando ha streaming ativo, a barra do topo mostra a BANDA em tempo real.
+
+
+------------------------------------------------------------
+10) TEMA CLARO / ESCURO
 ------------------------------------------------------------
 Clique no botao de tema (lua/sol) no canto superior direito. A sua
 escolha fica salva automaticamente.
 
 
 ------------------------------------------------------------
-10) PRIVACIDADE E LIMITES
+11) PRIVACIDADE E LIMITES
 ------------------------------------------------------------
 - O video NAO e salvo de forma permanente (apenas cache temporario,
   apagado ao fechar o player).

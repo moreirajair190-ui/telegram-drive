@@ -51,6 +51,7 @@ from .dialogs import (
     EditVideoDialog,
     LoginDialog,
     SelectCoursesDialog,
+    StreamingSettingsDialog,
     SubjectsEditorDialog,
     wait_future,
 )
@@ -71,13 +72,22 @@ ROLE_NODE_TYPE = Qt.UserRole + 1
 # Identificador especial para "todas as matérias".
 SUBJECT_ALL = -1
 SUBJECT_NONE = 0  # vídeos sem matéria
+SUBJECT_CONTINUE = -2  # filtro virtual "Continuar assistindo" (resume)
 
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.db = Database()
-        self.service = TelegramService()
+        self.service = TelegramService(db=self.db)
+        # Restaura a qualidade de streaming / modo adaptativo salvos.
+        try:
+            self.service.set_quality(
+                self.db.get_setting("streaming_quality") or "original",
+                (self.db.get_setting("adaptive_mode") or "0") == "1",
+            )
+        except Exception:  # noqa: BLE001
+            pass
         self.theme = self.db.get_setting("theme") or "dark"
         self.current_course_id: int | None = None
         self.current_subject_id: int = SUBJECT_ALL
@@ -89,6 +99,11 @@ class MainWindow(QMainWindow):
         self.apply_theme(self.theme, persist=False)
         self.refresh_courses()
         QTimer.singleShot(400, self.try_quick_connect)
+        # Atualiza o widget de banda em tempo real (a cada 1.5s).
+        self._bw_timer = QTimer(self)
+        self._bw_timer.setInterval(1500)
+        self._bw_timer.timeout.connect(self._update_bandwidth_widget)
+        self._bw_timer.start()
 
     # ===================================================== construção da interface
     def build_ui(self) -> None:
@@ -148,6 +163,13 @@ class MainWindow(QMainWindow):
         prog_row.addWidget(self.overall_meta)
         center.addLayout(prog_row)
         layout.addLayout(center, 1)
+
+        # Widget de banda em tempo real (some quando não há streaming ativo).
+        self.bandwidth_label = QLabel("")
+        self.bandwidth_label.setObjectName("Muted2")
+        self.bandwidth_label.setToolTip("Banda agregada das sessões de streaming ativas")
+        self.bandwidth_label.hide()
+        layout.addWidget(self.bandwidth_label)
 
         # Status da conta.
         self.status_label = QLabel("Não conectado")
@@ -388,6 +410,9 @@ class MainWindow(QMainWindow):
         vlc_action = QAction("Configurar VLC...", self)
         vlc_action.triggered.connect(self.choose_vlc)
         tools.addAction(vlc_action)
+        net_action = QAction("Streaming & Rede...", self)
+        net_action.triggered.connect(self.open_streaming_settings)
+        tools.addAction(net_action)
         log_action = QAction("Abrir pasta de logs", self)
         log_action.triggered.connect(self.open_logs)
         tools.addAction(log_action)
@@ -443,6 +468,24 @@ class MainWindow(QMainWindow):
         except Exception:  # noqa: BLE001
             log.exception("Autoconexão falhou")
             self.status_label.setText("Sessão não conectada")
+
+    def _update_bandwidth_widget(self) -> None:
+        """Mostra/atualiza a banda agregada das sessões ativas na barra superior."""
+        try:
+            if self.service.active_sessions() <= 0:
+                if self.bandwidth_label.isVisible():
+                    self.bandwidth_label.hide()
+                return
+            kbps = self.service.total_measured_kbps()
+            if kbps >= 1000:
+                text = f"⬇ {kbps / 1000:.1f} Mbps"
+            else:
+                text = f"⬇ {kbps:.0f} kbps"
+            self.bandwidth_label.setText(text)
+            if not self.bandwidth_label.isVisible():
+                self.bandwidth_label.show()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _set_connected(self, me: dict[str, Any]) -> None:
         name = me.get("first_name") or me.get("username") or "Conectado"
@@ -508,12 +551,15 @@ class MainWindow(QMainWindow):
         self.course_list.blockSignals(True)
         self.course_list.clear()
         for course in self.db.list_courses():
-            videos = self.db.list_videos(course.id)
-            watched = sum(1 for v in videos if v.watched_at)
+            done, total = self.db.course_progress(course.id)
             kind = "🗂️ Fórum" if course.is_forum else (
                 "📢 Canal" if (course.chat_type or "").upper() == "CHANNEL" else "👥 Grupo"
             )
-            sub = f"{len(videos)} aulas · {watched} assistidas" if videos else "sem sincronizar"
+            if total:
+                pct = int(done / total * 100)
+                sub = f"{total} aulas · {done} assistidas · {pct}%"
+            else:
+                sub = "sem sincronizar"
             item = QListWidgetItem(f"{course.title}\n{kind} · {sub}")
             item.setData(Qt.UserRole, course.id)
             if course.color:
@@ -705,6 +751,13 @@ class MainWindow(QMainWindow):
         all_item = QListWidgetItem(f"📚  Todas as matérias  ·  {len(videos)} aulas")
         all_item.setData(Qt.UserRole, SUBJECT_ALL)
         self.subject_list.addItem(all_item)
+
+        # Filtro virtual "Continuar assistindo" (apenas se houver aulas em curso).
+        in_progress = sum(1 for v in videos if 0.02 < (v.progress or 0) < 0.95)
+        if in_progress:
+            cont = QListWidgetItem(f"▶️  Continuar assistindo  ·  {in_progress}")
+            cont.setData(Qt.UserRole, SUBJECT_CONTINUE)
+            self.subject_list.addItem(cont)
 
         for subject in subjects:
             count = sum(1 for v in videos if v.subject_id == subject.id)
@@ -914,6 +967,23 @@ class MainWindow(QMainWindow):
             f"último sync: {self._fmt_date(course.last_sync)}"
         )
 
+        # Filtro virtual "Continuar assistindo": lista plana das aulas em curso,
+        # ordenadas pelo acesso mais recente (resume).
+        if self.current_subject_id == SUBJECT_CONTINUE:
+            in_progress = [v for v in self.db.continue_watching(50)
+                           if v.course_id == course.id]
+            if query:
+                in_progress = [v for v in in_progress if self._video_passes(v, query, "all")]
+            if in_progress:
+                parent = self._make_folder("▶️  Continuar assistindo", "matéria")
+                for v in in_progress:
+                    parent.addChild(self._video_item(v))
+                self.video_tree.addTopLevelItem(parent)
+                parent.setExpanded(True)
+            else:
+                self._show_empty_lessons("Nenhuma aula em andamento por aqui ainda.")
+            return
+
         # Decide quais matérias mostrar conforme seleção da barra de matérias.
         if self.current_subject_id == SUBJECT_ALL:
             visible_subjects = subjects
@@ -956,6 +1026,11 @@ class MainWindow(QMainWindow):
             )
             self.video_tree.addTopLevelItem(placeholder)
         self.video_tree.expandToDepth(0 if not single_subject else 2)
+
+    def _show_empty_lessons(self, message: str) -> None:
+        """Estado vazio amigável na lista de aulas (empty state)."""
+        placeholder = QTreeWidgetItem([message, "", "", ""])
+        self.video_tree.addTopLevelItem(placeholder)
 
     def _render_subject(
         self, subject: Subject, subject_videos: list[Video], query: str,
@@ -1052,6 +1127,32 @@ class MainWindow(QMainWindow):
         item.setExpanded(False)
         return item
 
+    @staticmethod
+    def _video_meta_badge(video: Video) -> str:
+        """VideoMetaBadge: resolução compacta (ex.: '1080p', '720p').
+
+        Ideia portada do badge de metadados de vídeo do projeto de referência.
+        Mostra a altura da fonte quando conhecida (gravada em moov_cache /
+        importação). Sem altura, retorna string vazia.
+        """
+        height = getattr(video, "height", None)
+        if not height:
+            return ""
+        h = int(height)
+        if h >= 2160:
+            return "4K"
+        if h >= 1440:
+            return "1440p"
+        if h >= 1080:
+            return "1080p"
+        if h >= 720:
+            return "720p"
+        if h >= 480:
+            return "480p"
+        if h >= 360:
+            return "360p"
+        return f"{h}p"
+
     def _video_item(self, video: Video, prefix: str | None = None) -> QTreeWidgetItem:
         star = "★ " if video.favorite else ""
         check = "✅ " if video.watched_at else "⬜ "
@@ -1062,8 +1163,13 @@ class MainWindow(QMainWindow):
             status = f"▶ {int(video.progress * 100)}%"
         else:
             status = "pendente"
+        # VideoMetaBadge: anexa a resolução à coluna de tipo quando conhecida.
+        type_col = video.type or ""
+        badge = self._video_meta_badge(video)
+        if badge:
+            type_col = f"{type_col} · {badge}" if type_col else badge
         item = QTreeWidgetItem(
-            [title, video.type or "", human_duration(video.duration), status]
+            [title, type_col, human_duration(video.duration), status]
         )
         item.setData(0, ROLE_VIDEO_ID, video.id)
         if video.watched_at:
@@ -1120,8 +1226,12 @@ class MainWindow(QMainWindow):
         else:
             status = "Não assistida"
         subject = self.db.get_subject(video.subject_id) if video.subject_id else None
+        line1 = f"{human_size(video.size)} · {human_duration(video.duration)} · {status}"
+        badge = self._video_meta_badge(video)
+        if badge:
+            line1 += f" · {badge}"
         parts = [
-            f"{human_size(video.size)} · {human_duration(video.duration)} · {status}",
+            line1,
             f"Matéria: {subject.title if subject else 'Sem matéria'}",
         ]
         if video.module:
@@ -1167,6 +1277,7 @@ class MainWindow(QMainWindow):
             "Marcar como NÃO assistida" if video.watched_at else "✓ Marcar como assistida"
         )
         copy = menu.addAction("Copiar link temporário")
+        tg_link = menu.addAction("Copiar link do Telegram (t.me)")
         menu.addSeparator()
         delete = menu.addAction("Remover da lista")
         action = menu.exec(self.video_tree.mapToGlobal(pos))
@@ -1182,6 +1293,8 @@ class MainWindow(QMainWindow):
             self.toggle_watched_selected()
         elif action == copy:
             self.copy_stream_url()
+        elif action == tg_link:
+            self.copy_telegram_link()
         elif action == delete:
             self.db.delete_video(video.id)
             self._refresh_after_change()
@@ -1254,15 +1367,60 @@ class MainWindow(QMainWindow):
         )
         return result if isinstance(result, dict) else None
 
+    def _playlist_for(self, video: Video) -> tuple[list[Video], int]:
+        """Lista de aulas (ordem de exibição) para navegação ‹ › e auto-play.
+
+        Usa as aulas da MESMA matéria (se houver) ou do curso, na ordem em que
+        aparecem na biblioteca. Retorna (lista, índice da aula atual).
+        """
+        try:
+            if video.subject_id:
+                videos = self.db.list_videos_for_subject(video.subject_id)
+            else:
+                videos = self.db.list_videos(video.course_id)
+        except Exception:  # noqa: BLE001
+            videos = [video]
+        if not videos:
+            videos = [video]
+        index = next((i for i, v in enumerate(videos) if v.id == video.id), 0)
+        return videos, index
+
+    def _prefetch_video_meta(self, video: Video) -> None:
+        """Agenda a pré-busca de metadados/miniatura no loop de 2º plano.
+
+        Fire-and-forget: usa `service.call` para rodar as corrotinas no loop do
+        Telegram sem bloquear a UI. Os dados são persistidos em moov_cache e na
+        tabela `videos`, refletindo na próxima atualização das listas.
+        """
+        try:
+            payload = {
+                "chat_id": video.chat_id,
+                "message_id": video.message_id,
+                "duration": video.duration,
+                "size": video.size,
+            }
+            self.service.call(self.service.fetch_video_metadata(payload))
+            self.service.call(self.service.ensure_thumbnail(payload))
+        except Exception:  # noqa: BLE001
+            pass
+
     def watch_selected_internal(self) -> None:
         video = self.selected_video()
         if not video:
             return
+        self._open_player_for(video)
+
+    def _open_player_for(self, video: Video) -> None:
+        """Abre o player premium para `video`, com navegação/qualidade/debug."""
         try:
             stream = self._prepare_stream(video)
             if not stream:
                 return
             video_id = video.id
+            playlist, index = self._playlist_for(video)
+            # Pré-busca de metadados (resolução/duração) e miniatura em 2º plano.
+            if not (video.width and video.height):
+                self._prefetch_video_meta(video)
 
             def save_progress(position_ms: int, duration_ms: int) -> None:
                 try:
@@ -1272,6 +1430,44 @@ class MainWindow(QMainWindow):
 
             def open_vlc() -> None:
                 self._launch_vlc(stream.get("stream_url") or stream.get("url"))
+
+            def quality_change(quality: str, adaptive: bool) -> None:
+                try:
+                    self.service.set_quality(quality, adaptive)
+                    self.db.set_setting("streaming_quality", quality)
+                    self.db.set_setting("adaptive_mode", "1" if adaptive else "0")
+                except Exception:  # noqa: BLE001
+                    pass
+
+            def clear_cache() -> None:
+                try:
+                    self.db.clear_moov_cache(video.chat_id, video.message_id)
+                except Exception:  # noqa: BLE001
+                    pass
+
+            def rate_change(rate: float) -> None:
+                try:
+                    self.db.set_setting(
+                        f"course_rate_{video.course_id}", f"{rate:g}"
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+
+            # Próxima/anterior: agenda a abertura da aula vizinha após fechar.
+            self._pending_navigation = None
+
+            def go_to(idx: int) -> None:
+                if 0 <= idx < len(playlist):
+                    self._pending_navigation = playlist[idx].id
+
+            on_next = (lambda: go_to(index + 1)) if index < len(playlist) - 1 else None
+            on_prev = (lambda: go_to(index - 1)) if index > 0 else None
+
+            saved_rate = self.db.get_setting(f"course_rate_{video.course_id}") or "1"
+            try:
+                playback_rate = float(saved_rate)
+            except Exception:  # noqa: BLE001
+                playback_rate = 1.0
 
             try:
                 dlg = VideoPlayerDialog(
@@ -1283,6 +1479,19 @@ class MainWindow(QMainWindow):
                     on_progress=save_progress,
                     on_open_vlc=open_vlc,
                     player_url=stream.get("player_url"),
+                    on_next=on_next,
+                    on_prev=on_prev,
+                    current_index=index,
+                    total_items=len(playlist),
+                    source_width=video.width,
+                    source_height=video.height,
+                    initial_quality=self.db.get_setting("streaming_quality") or "original",
+                    adaptive_mode=(self.db.get_setting("adaptive_mode") or "0") == "1",
+                    on_quality_change=quality_change,
+                    on_clear_cache=clear_cache,
+                    debug_overlay=(self.db.get_setting("debug_overlay") or "0") == "1",
+                    playback_rate=playback_rate,
+                    on_rate_change=rate_change,
                     parent=self,
                 )
             except Exception as exc:  # noqa: BLE001
@@ -1295,6 +1504,14 @@ class MainWindow(QMainWindow):
             dlg.exec()
             self._refresh_after_change()
             self._reselect_video(video_id)
+            # Se o usuário pediu próxima/anterior, abre a aula vizinha.
+            nav_id = getattr(self, "_pending_navigation", None)
+            if nav_id:
+                self._pending_navigation = None
+                nxt = self.db.get_video(nav_id)
+                if nxt:
+                    self.current_video_id = nxt.id
+                    QTimer.singleShot(50, lambda: self._open_player_for(nxt))
         except Exception as exc:  # noqa: BLE001
             log.exception("Erro ao assistir no player interno")
             QMessageBox.critical(self, "Erro no streaming", f"{exc}")
@@ -1343,6 +1560,32 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Erro", str(exc))
 
+    def copy_telegram_link(self) -> None:
+        """Copia o link nativo t.me da aula (somente canais/grupos PÚBLICOS).
+
+        Ideia portada do recurso de 'copiar link nativo do Telegram' do projeto
+        de referência. Requer que o curso tenha `username` (canal público).
+        """
+        video = self.selected_video()
+        if not video:
+            return
+        course = self.db.get_course(video.course_id) if video.course_id else None
+        username = course.username if course else None
+        link = self.service.telegram_message_link(username, video.message_id)
+        if not link:
+            QMessageBox.information(
+                self, "Link do Telegram",
+                "Esta aula está em um canal/grupo PRIVADO (sem nome de usuário "
+                "público), então não há um link t.me nativo. Use 'Copiar link "
+                "temporário' para reproduzir enquanto o app estiver aberto.",
+            )
+            return
+        QApplication.clipboard().setText(link)
+        QMessageBox.information(
+            self, "Link copiado",
+            f"Link nativo do Telegram copiado:\n{link}",
+        )
+
     # ============================================================== ferramentas
     def choose_vlc(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -1352,6 +1595,20 @@ class MainWindow(QMainWindow):
         if path:
             self.db.set_setting("vlc_path", path)
             QMessageBox.information(self, "VLC", "Caminho do VLC salvo.")
+
+    def open_streaming_settings(self) -> None:
+        dlg = StreamingSettingsDialog(self.db, self)
+        if dlg.exec() == QDialog.Accepted:
+            quality, adaptive = dlg.result_quality()
+            try:
+                self.service.set_quality(quality, adaptive)
+            except Exception:  # noqa: BLE001
+                pass
+            QMessageBox.information(
+                self, "Streaming & Rede",
+                "Configurações salvas. Ajustes de proxy entram em vigor na "
+                "próxima conexão.",
+            )
 
     def open_logs(self) -> None:
         from .paths import LOG_DIR

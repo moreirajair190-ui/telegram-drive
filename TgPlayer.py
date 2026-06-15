@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TgPlayer v6.2 — Ponto de entrada (entry point).
+TgPlayer v6.3 — Ponto de entrada (entry point).
 
 Player premium de videoaulas do Telegram com streaming sob demanda
 (carrega a aula sem baixar/armazenar o vídeo inteiro e sem travar).
