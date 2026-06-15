@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# Ambientes virtuais
+.venv/
+venv/
+env/
+
+# Build do PyInstaller
+build/
+dist/
+*.manifest
+
+# Dados locais do app (sessao, banco, cache, logs)
+data/
+*.session
+*.session-journal
+*.log
+
+# Sistema operacional / editores
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+TGClassPlayer_v*.zip

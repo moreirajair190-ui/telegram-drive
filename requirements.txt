@@ -1,0 +1,24 @@
+# TGClassPlayer v5 — dependências
+#
+# Instale com:
+#     pip install -r requirements.txt
+#
+# Observação: instale com Python 3.10, 3.11 ou 3.12 (64 bits no Windows).
+
+# Interface gráfica (Qt para Python). Inclui QtMultimedia (player fallback).
+PySide6>=6.6,<6.9
+
+# Player HTML5 premium (player principal). Pacote separado no PySide6 6.8+.
+PySide6-Addons>=6.6,<6.9
+
+# Cliente do Telegram (MTProto).
+Pyrogram>=2.0.106
+
+# Acelera a criptografia do Pyrogram (recomendado/quase obrigatório p/ vídeo).
+TgCrypto>=1.2.5
+
+# Servidor HTTP local assíncrono usado para o streaming sob demanda.
+aiohttp>=3.9
+
+# Para gerar o executável (.exe) no Windows.
+pyinstaller>=6.3

@@ -1,0 +1,105 @@
+========================================================================
+  TGClassPlayer v5  -  COMO USAR (guia rapido)
+========================================================================
+
+O que e: um aplicativo que conecta na SUA conta do Telegram e organiza
+os seus cursos (supergrupos) em uma videoteca bonita, com player premium.
+As aulas tocam SOB DEMANDA: nao baixa o video inteiro, nao guarda o
+arquivo no PC e NAO TRAVA ao avancar/voltar.
+
+
+------------------------------------------------------------------------
+PASSO 1 - GERAR O APLICATIVO (.EXE)  [Windows]
+------------------------------------------------------------------------
+1) Instale o Python 3.10, 3.11 ou 3.12 (64 bits):
+      https://www.python.org/downloads/
+   IMPORTANTE: na instalacao, marque "Add Python to PATH".
+
+2) De DUPLO CLIQUE no arquivo:  build_exe.bat
+   (ele instala tudo sozinho e gera o programa - pode demorar alguns
+    minutos na primeira vez)
+
+3) Quando terminar, o programa estara em:
+      dist\TGClassPlayer\TGClassPlayer.exe
+
+4) Para usar em outro PC, copie a PASTA INTEIRA "dist\TGClassPlayer".
+
+   (Se quiser apenas testar sem gerar o .exe, de duplo clique em
+    run_dev.bat)
+
+
+------------------------------------------------------------------------
+PASSO 2 - PEGAR SUAS CHAVES DO TELEGRAM (so na 1a vez)
+------------------------------------------------------------------------
+1) Acesse:  https://my.telegram.org  e faca login com seu numero.
+2) Clique em "API development tools".
+3) Crie um app (qualquer nome) e copie:
+      - App api_id
+      - App api_hash
+
+ATENCAO: nunca compartilhe seu api_hash, o codigo de login nem a
+senha 2FA. Esses dados ficam SO no seu computador.
+
+
+------------------------------------------------------------------------
+PASSO 3 - CONECTAR E IMPORTAR SEUS CURSOS
+------------------------------------------------------------------------
+1) Abra o TGClassPlayer e clique em "Conectar".
+2) Informe API ID, API HASH e seu telefone (com DDI, ex: +55...).
+3) Digite o codigo que o Telegram enviar (e a senha 2FA, se tiver).
+4) Escolha os grupos/canais que sao seus cursos e importe.
+
+
+------------------------------------------------------------------------
+PASSO 4 - ORGANIZAR (TUDO E EDITAVEL)
+------------------------------------------------------------------------
+- Curso  = supergrupo do Telegram
+- Topico = subdivisao do curso
+- Sumario= o "indice" do topico, que vira o menu das aulas
+- Aula   = o video
+
+Botao DIREITO do mouse em um curso ou aula abre o menu para EDITAR:
+  * Cursos: renomear, mudar cor, excluir, reordenar.
+  * Topicos/Sumario: criar, renomear, reordenar, excluir, editar texto.
+  * Aulas: editar titulo, topico, hashtags, anotacoes, favoritar,
+           marcar como assistida / nao assistida.
+
+Formato do sumario (gera o menu e liga as hashtags aos videos):
+
+      = Modulo 1 - Introducao
+      == Aula 1 - Boas-vindas
+      === Video
+      #PY01
+
+      == Aula 2 - Ambiente
+      === Video
+      #PY02
+
+
+------------------------------------------------------------------------
+PASSO 5 - ASSISTIR
+------------------------------------------------------------------------
+- Clique em uma aula para tocar no player interno (premium).
+- Atalhos: espaco = play/pause | setas = +/-10s | F = tela cheia |
+           M = mudo | < e > = velocidade.
+- O app salva onde voce parou e RETOMA na proxima vez.
+- Tambem da para abrir no VLC, se preferir.
+
+
+------------------------------------------------------------------------
+ONDE FICAM OS DADOS
+------------------------------------------------------------------------
+- Banco/sessao/logs: %LOCALAPPDATA%\TGClassPlayer  (quando .exe)
+- O cache de video e TEMPORARIO e e apagado ao fechar o player.
+
+
+------------------------------------------------------------------------
+PROBLEMAS COMUNS
+------------------------------------------------------------------------
+- "Python nao encontrado": reinstale marcando "Add Python to PATH".
+- Video nao abre: rode de novo o build_exe.bat (ele instala o TgCrypto,
+  necessario para o Telegram funcionar bem).
+
+========================================================================
+  Use apenas com conteudo ao qual voce tem acesso legitimo.
+========================================================================
