@@ -28,7 +28,7 @@ def build_player_html(title: str, url: str, start_position_ms: int = 0) -> str:
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   :root {{
-    --accent:#7c5cff; --accent2:#22d3ee; --bg:#05070f;
+    --accent:#7c5cff; --accent2:#8e72ff; --bg:#05070f;
     --text:#f8fafc; --muted:#94a3b8;
   }}
   * {{ box-sizing:border-box; -webkit-user-select:none; user-select:none; }}

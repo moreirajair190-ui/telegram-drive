@@ -55,6 +55,7 @@ from .dialogs import (
     SubjectsEditorDialog,
     wait_future,
 )
+from .files_tab import FilesTab
 from .logging_setup import setup_logging
 from .player import VideoPlayerDialog
 from .study_tab import StudyTab
@@ -105,6 +106,16 @@ class MainWindow(QMainWindow):
         self._bw_timer.timeout.connect(self._update_bandwidth_widget)
         self._bw_timer.start()
 
+        # Warm-up (pré-busca) ao SELECIONAR uma aula: aquece o início + monta o
+        # cabeçalho faststart em 2º plano, com debounce de ~400 ms para não
+        # disparar a cada movimento de seleção. Quando o usuário clicar
+        # "Assistir", a partida já está quente → abertura quase instantânea.
+        self._warmup_timer = QTimer(self)
+        self._warmup_timer.setSingleShot(True)
+        self._warmup_timer.setInterval(400)
+        self._warmup_timer.timeout.connect(self._do_warmup)
+        self._warmup_video_id: int | None = None
+
     # ===================================================== construção da interface
     def build_ui(self) -> None:
         central = QWidget()
@@ -119,6 +130,9 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_lessons_tab(), "🎬  Aulas")
         self.study_tab = StudyTab(self.db, self.get_current_course)
         self.tabs.addTab(self.study_tab, "📊  Acompanhamento")
+        self.files_tab = FilesTab(self.db, self.service, self.get_current_course)
+        self.files_tab.play_video_requested.connect(self._play_media_video)
+        self.tabs.addTab(self.files_tab, "🗂️  Arquivos")
         self.tabs.currentChanged.connect(self._on_tab_changed)
         root.addWidget(self.tabs, 1)
 
@@ -446,9 +460,15 @@ class MainWindow(QMainWindow):
         self.apply_theme("light" if self.theme == "dark" else "dark")
 
     def _on_tab_changed(self, index: int) -> None:
-        if self.tabs.widget(index) is self.study_tab:
+        widget = self.tabs.widget(index)
+        if widget is self.study_tab:
             try:
                 self.study_tab.refresh()
+            except Exception:  # noqa: BLE001
+                pass
+        elif widget is getattr(self, "files_tab", None):
+            try:
+                self.files_tab.reload_chats()
             except Exception:  # noqa: BLE001
                 pass
 
@@ -1217,6 +1237,9 @@ class MainWindow(QMainWindow):
         video = self.db.get_video(self.current_video_id)
         if not video:
             return
+        # Warm-up: aquece o início desta aula em 2º plano (debounce ~400 ms),
+        # para que clicar "Assistir" abra o vídeo quase instantaneamente.
+        self._schedule_warmup(self.current_video_id)
         self.video_title.setText(("★ " if video.favorite else "") + video.title)
         tags = " ".join(video.hashtags) or "sem hashtags"
         if video.watched_at:
@@ -1385,6 +1408,42 @@ class MainWindow(QMainWindow):
         index = next((i for i, v in enumerate(videos) if v.id == video.id), 0)
         return videos, index
 
+    def _schedule_warmup(self, video_id: int) -> None:
+        """Agenda (com debounce) o warm-up do início da aula selecionada."""
+        self._warmup_video_id = video_id
+        try:
+            self._warmup_timer.start()  # reinicia o debounce de 400 ms
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _do_warmup(self) -> None:
+        """Dispara o warm-up da aula atualmente marcada (fire-and-forget)."""
+        video_id = self._warmup_video_id
+        if not video_id:
+            return
+        try:
+            if self.service.active_sessions() > 0:
+                # Já há uma sessão tocando; não competir por banda.
+                return
+        except Exception:  # noqa: BLE001
+            pass
+        video = self.db.get_video(video_id)
+        if not video or not video.size:
+            return
+        payload = {
+            "chat_id": video.chat_id,
+            "message_id": video.message_id,
+            "size": video.size,
+            "mime_type": video.mime_type,
+            "duration": video.duration,
+            "width": video.width,
+            "height": video.height,
+        }
+        try:
+            self.service.call(self.service.warm_up_video(payload))
+        except Exception:  # noqa: BLE001
+            pass
+
     def _prefetch_video_meta(self, video: Video) -> None:
         """Agenda a pré-busca de metadados/miniatura no loop de 2º plano.
 
@@ -1409,6 +1468,52 @@ class MainWindow(QMainWindow):
         if not video:
             return
         self._open_player_for(video)
+
+    def _play_media_video(self, media: dict[str, Any]) -> None:
+        """Abre o player interno para um vídeo vindo da aba 🗂️ Arquivos.
+
+        A aba Arquivos lida com mídia avulsa (sem linha em `videos`); montamos
+        um payload de streaming direto e reutilizamos o `VideoPlayerDialog`.
+        """
+        try:
+            payload = {
+                "chat_id": media.get("chat_id"),
+                "message_id": media.get("message_id"),
+                "title": media.get("title") or media.get("file_name") or "Vídeo",
+                "file_name": media.get("file_name"),
+                "mime_type": media.get("mime_type"),
+                "size": media.get("size"),
+                "start_position_ms": 0,
+            }
+            stream = wait_future(
+                self.service.call(self.service.prepare_stream(payload)),
+                "Streaming", "Preparando o vídeo…", self,
+            )
+            if not isinstance(stream, dict):
+                return
+            try:
+                dlg = VideoPlayerDialog(
+                    payload["title"],
+                    stream.get("stream_url") or stream.get("url"),
+                    stream.get("token"),
+                    self.service,
+                    start_position_ms=0,
+                    on_progress=lambda *_: None,
+                    on_open_vlc=lambda: self._launch_vlc(
+                        stream.get("stream_url") or stream.get("url")
+                    ),
+                    player_url=stream.get("player_url"),
+                    source_width=media.get("width"),
+                    source_height=media.get("height"),
+                    parent=self,
+                )
+            except Exception as exc:  # noqa: BLE001
+                QMessageBox.critical(self, "Player indisponível", str(exc))
+                return
+            dlg.exec()
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Erro ao abrir vídeo da aba Arquivos")
+            QMessageBox.critical(self, "Erro no streaming", f"{exc}")
 
     def _open_player_for(self, video: Video) -> None:
         """Abre o player premium para `video`, com navegação/qualidade/debug."""

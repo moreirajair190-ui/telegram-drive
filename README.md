@@ -4,6 +4,15 @@
 > mudou para **TgPlayer** na v6.2. **Seus dados (login, progresso e
 > configurações) são preservados** ao atualizar.
 
+> **Novidades da v6.4:** **partida quase instantânea** (2–5 s) com **faststart
+> virtual** — reordena `ftyp → moov → mdat` em memória sem baixar a cauda — mais
+> **primeiro bloco de 512 KiB**, **8 downloads paralelos** no arranque e
+> **warm-up ao selecionar a aula**; **player redesenhado** (cor de acento única,
+> menu de engrenagem ⚙ com Qualidade/Velocidade/VLC, barra de progresso premium,
+> cabeçalho limpo e spinner de carregamento); e a nova aba **🗂️ Arquivos** —
+> navegue por toda a mídia do chat (vídeo/PDF/imagem/zip/áudio) com miniaturas,
+> busca, filtros, download/upload com progresso e link t.me.
+>
 > **Novidades da v6.3:** streaming à prova de corrupção (alinhamento de CDN +
 > cache do `moov`), **seletor de qualidade** com modo adaptativo, **navegação
 > entre aulas e auto-play**, **miniaturas + resolução** nas listas, seção
@@ -56,6 +65,23 @@ tarefas e gráficos).
     **retoma no minuto exato** (se faltar < 5 s para o fim, recomeça do zero) e
     marca a aula como **assistida ✅** ao passar de ~92%.
   - Aviso amigável com **"↻ Tentar de novo"** e **"Abrir no VLC"** em caso de erro.
+- **Partida quase instantânea (v6.4):**
+  - **Faststart virtual:** monta em memória o cabeçalho `ftyp + moov` com offsets
+    de chunk (`stco`/`co64`) corrigidos e serve `ftyp → moov → mdat` **sem baixar
+    a cauda** — o vídeo começa em **2–5 s**. Com *fallback* seguro se a análise
+    falhar.
+  - **Sintonia de arranque:** primeiro bloco de **512 KiB**, **8 downloads
+    paralelos** e orçamento de **2 MiB** para os primeiros bytes.
+  - **Warm-up ao selecionar a aula** (debounce ~400 ms): a partida já fica quente
+    antes de clicar em "Assistir".
+- **Player redesenhado (v6.4):** **cor de acento única**, **menu de engrenagem ⚙**
+  reunindo Qualidade/Velocidade/"Abrir no VLC", **barra de progresso premium**
+  (buffer + tooltip), **cabeçalho limpo** (`pos · resolução · ⚡ backend`) e
+  **overlay de carregamento com spinner + %**. Mesmos atalhos de sempre.
+- **Nova aba 🗂️ Arquivos (v6.4):** navegue por **toda a mídia** do chat
+  (vídeo/PDF/imagem/zip/áudio) em **grade com miniaturas**, **busca** e
+  **filtros por tipo**; **baixar** e **enviar** com **progresso**; **pré-ver
+  imagens**, abrir vídeos no player interno e **copiar link t.me**.
 - **Streaming reforçado e qualidade adaptativa (v6.3):**
   - **Alinhamento de offset do CDN (512 KiB)** + **descoberta do `moov` em 3
     passos** + **cache persistente do `moov`** (boot instantâneo na 2ª vez).

@@ -1,4 +1,4 @@
-"""Diálogo de reprodução PREMIUM do TgPlayer (v6.3).
+"""Diálogo de reprodução PREMIUM do TgPlayer (v6.4).
 
 Objetivos desta versão:
 
@@ -44,17 +44,25 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QMenu,
     QPushButton,
     QSlider,
     QToolTip,
     QVBoxLayout,
     QWidget,
+    QWidgetAction,
 )
 
 from .player_html import build_player_html
 from .quality import QUALITIES, cap_to_source, label_for
 
 log = logging.getLogger(__name__)
+
+# Cor de acento ÚNICA do player (índigo do tema, igual a ACCENT em style.py).
+# Toda a UI do player usa SÓ esta cor para estados ativos/hover/preenchimento —
+# nada de ciano/azul/amarelo conflitantes.
+ACCENT = "#7c5cff"
+ACCENT_HOVER = "#8e72ff"
 
 try:
     from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
@@ -97,14 +105,19 @@ def _fmt_time(ms: int) -> str:
 class SeekBar(QSlider):
     """Slider de progresso premium: mostra a faixa de buffer e tooltip de tempo."""
 
+    # Cor de acento ÚNICA do player (índigo do tema). Mantida em sincronia com
+    # ACCENT em style.py — uma só cor para thumb, faixa preenchida e hover.
+    ACCENT = "#7c5cff"
+
     def __init__(self, on_seek: Callable[[int], None]) -> None:
         super().__init__(Qt.Horizontal)
         self._on_seek = on_seek
         self._buffered_ratio = 0.0
+        self._hover = False
         self.setRange(0, 0)
         self.setMouseTracking(True)
         self.setCursor(Qt.PointingHandCursor)
-        self.setFixedHeight(26)
+        self.setFixedHeight(28)
         self.setObjectName("SeekBar")
 
     def set_buffered_ratio(self, ratio: float) -> None:
@@ -128,6 +141,16 @@ class SeekBar(QSlider):
             return
         super().mousePressEvent(event)
 
+    def enterEvent(self, event) -> None:  # noqa: ANN001
+        self._hover = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: ANN001
+        self._hover = False
+        self.update()
+        super().leaveEvent(event)
+
     def mouseMoveEvent(self, event) -> None:
         value = self._value_at(int(event.position().x()))
         QToolTip.showText(
@@ -140,45 +163,51 @@ class SeekBar(QSlider):
         super().mouseMoveEvent(event)
 
     def paintEvent(self, event) -> None:
-        from PySide6.QtGui import QPainter, QLinearGradient, QBrush
+        from PySide6.QtGui import QPainter
 
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
         w = self.width()
         h = self.height()
-        track_h = 7
+        # Trilho mais alto no hover (premium, estilo YouTube/MPV).
+        track_h = 8 if self._hover else 6
         y = (h - track_h) // 2
         radius = track_h / 2
 
-        # Trilho de fundo.
+        accent = QColor(self.ACCENT)
+
+        # Trilho de fundo (cinza translúcido sutil).
         painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor(255, 255, 255, 38))
+        painter.setBrush(QColor(255, 255, 255, 34))
         painter.drawRoundedRect(0, y, w, track_h, radius, radius)
 
         rng = max(1, self.maximum() - self.minimum())
         played_ratio = (self.value() - self.minimum()) / rng if rng else 0.0
 
-        # Faixa de buffer carregado.
+        # Faixa de BUFFER carregado (cinza translúcido mais claro).
         buf_w = int(w * self._buffered_ratio)
         if buf_w > 0:
-            painter.setBrush(QColor(255, 255, 255, 80))
+            painter.setBrush(QColor(255, 255, 255, 70))
             painter.drawRoundedRect(0, y, buf_w, track_h, radius, radius)
 
-        # Faixa reproduzida (gradiente).
+        # Faixa REPRODUZIDA — cor de acento ÚNICA (sem gradiente ciano).
         played_w = int(w * played_ratio)
         if played_w > 0:
-            grad = QLinearGradient(0, 0, played_w, 0)
-            grad.setColorAt(0.0, QColor("#7c5cff"))
-            grad.setColorAt(1.0, QColor("#22d3ee"))
-            painter.setBrush(QBrush(grad))
+            painter.setBrush(accent)
             painter.drawRoundedRect(0, y, played_w, track_h, radius, radius)
 
-        # Thumb.
-        thumb_x = max(7, min(w - 7, played_w))
+        # Thumb — maior só no hover; halo de acento discreto.
+        thumb_x = max(8, min(w - 8, played_w))
+        r_outer = 9 if self._hover else 6
+        r_inner = 6 if self._hover else 5
+        halo = QColor(accent)
+        halo.setAlpha(70)
+        painter.setBrush(halo)
+        painter.drawEllipse(QPoint(thumb_x, h // 2), r_outer + 4, r_outer + 4)
         painter.setBrush(QColor("#ffffff"))
-        painter.drawEllipse(QPoint(thumb_x, h // 2), 8, 8)
-        painter.setBrush(QColor(124, 92, 255, 90))
-        painter.drawEllipse(QPoint(thumb_x, h // 2), 12, 12)
+        painter.drawEllipse(QPoint(thumb_x, h // 2), r_outer, r_outer)
+        painter.setBrush(accent)
+        painter.drawEllipse(QPoint(thumb_x, h // 2), r_inner - 2, r_inner - 2)
         painter.end()
 
 
@@ -304,6 +333,18 @@ class VideoPlayerDialog(QDialog):
         lbox.setSpacing(14)
         lbox.setAlignment(Qt.AlignCenter)
 
+        # Spinner animado (sem dependências externas): giramos um glifo de
+        # arco com um QTimer leve. Usa a cor de acento única.
+        self.loading_spinner = QLabel("◠")
+        self.loading_spinner.setAlignment(Qt.AlignCenter)
+        self.loading_spinner.setStyleSheet(
+            f"color:{ACCENT};font-size:30pt;font-weight:900;background:transparent;"
+        )
+        self._spin_frames = ["◜", "◝", "◞", "◟"]
+        self._spin_idx = 0
+        self._spin_timer = QTimer(self)
+        self._spin_timer.timeout.connect(self._tick_spinner)
+
         self.loading_title = QLabel("Carregando aula…")
         self.loading_title.setAlignment(Qt.AlignCenter)
         self.loading_title.setStyleSheet(
@@ -317,8 +358,8 @@ class VideoPlayerDialog(QDialog):
         self.loading_fill = QFrame(self.loading_bar)
         self.loading_fill.setGeometry(0, 0, 0, 8)
         self.loading_fill.setStyleSheet(
-            "background:qlineargradient(x1:0,y1:0,x2:1,y2:0,"
-            "stop:0 #7c5cff, stop:1 #22d3ee);border-radius:4px;"
+            f"background:qlineargradient(x1:0,y1:0,x2:1,y2:0,"
+            f"stop:0 {ACCENT}, stop:1 {ACCENT_HOVER});border-radius:4px;"
         )
         self.loading_pct = QLabel("0%")
         self.loading_pct.setAlignment(Qt.AlignCenter)
@@ -330,6 +371,7 @@ class VideoPlayerDialog(QDialog):
         self.loading_vlc_btn.clicked.connect(self._request_vlc)
         self.loading_vlc_btn.hide()
 
+        lbox.addWidget(self.loading_spinner, 0, Qt.AlignCenter)
         lbox.addWidget(self.loading_title)
         lbox.addWidget(self.loading_bar, 0, Qt.AlignCenter)
         lbox.addWidget(self.loading_pct)
@@ -472,13 +514,24 @@ class VideoPlayerDialog(QDialog):
             aw, ah = 360, 140
             self.autoplay_overlay.setGeometry(pw - aw - 24, ph - ah - 110, aw, ah)
 
+    def _tick_spinner(self) -> None:
+        """Avança um quadro do spinner animado do overlay de carregamento."""
+        if not hasattr(self, "loading_spinner"):
+            return
+        self._spin_idx = (self._spin_idx + 1) % len(self._spin_frames)
+        self.loading_spinner.setText(self._spin_frames[self._spin_idx])
+
     def _show_loading(self) -> None:
         if hasattr(self, "loading_overlay"):
             self.loading_overlay.show()
             self.loading_overlay.raise_()
+        if hasattr(self, "_spin_timer") and not self._spin_timer.isActive():
+            self._spin_timer.start(110)
 
     def _hide_loading(self) -> None:
         self._is_ready = True
+        if hasattr(self, "_spin_timer"):
+            self._spin_timer.stop()
         if hasattr(self, "loading_overlay"):
             self.loading_overlay.hide()
 
@@ -628,28 +681,36 @@ class VideoPlayerDialog(QDialog):
 
     # ====================================================== controles (UI comum)
     def _build_controls(self, layout: QVBoxLayout) -> None:
-        """Monta a barra de controles flutuante (usada por VLC e QtMultimedia)."""
+        """Barra de controles ENXUTA com auto-hide (estilo player moderno).
+
+        A barra inferior fica só com o essencial:
+            ‹  ⏵/⏸  ›   ↺10s  10s↻   00:00/00:00   ...   🔊 [vol]   ⚙   ⛶
+        Qualidade, Velocidade e "Abrir no VLC" foram agrupados no menu da
+        engrenagem ⚙ (popup escuro), eliminando a poluição visual.
+        Um gradiente sutil de baixo para cima melhora a legibilidade.
+        """
         self.controls_frame = QFrame()
         self.controls_frame.setObjectName("PlayerControls")
         self.controls_frame.setStyleSheet(
-            "#PlayerControls { background: rgba(8,11,22,0.92);"
-            " border-top:1px solid rgba(124,92,255,0.25); }"
+            "#PlayerControls { background: qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+            " stop:0 rgba(6,8,16,0.0), stop:0.35 rgba(6,8,16,0.78),"
+            " stop:1 rgba(6,8,16,0.96)); border:none; }"
         )
         outer = QVBoxLayout(self.controls_frame)
-        outer.setContentsMargins(18, 8, 18, 14)
-        outer.setSpacing(8)
+        outer.setContentsMargins(20, 6, 20, 14)
+        outer.setSpacing(6)
 
         self.seek = SeekBar(self._seek_to)
         outer.addWidget(self.seek)
 
         row = QHBoxLayout()
-        row.setSpacing(10)
+        row.setSpacing(8)
 
         self.prev_btn = QPushButton("‹")
-        self.prev_btn.setFixedSize(46, 44)
+        self.prev_btn.setFixedSize(44, 42)
         self.prev_btn.setToolTip("Aula anterior (P)")
         self.next_btn = QPushButton("›")
-        self.next_btn.setFixedSize(46, 44)
+        self.next_btn.setFixedSize(44, 42)
         self.next_btn.setToolTip("Próxima aula (N)")
         for b in (self.prev_btn, self.next_btn):
             b.setStyleSheet(self._btn_style())
@@ -658,47 +719,53 @@ class VideoPlayerDialog(QDialog):
             self.on_next is not None and self._current_index < self._total_items - 1
         )
 
-        self.play_btn = QPushButton("❚❚")
+        self.play_btn = QPushButton("⏸")
         self.play_btn.setObjectName("PrimaryButton")
-        self.play_btn.setFixedSize(52, 44)
+        self.play_btn.setFixedSize(54, 42)
+        self.play_btn.setToolTip("Reproduzir / Pausar (Espaço)")
         self.play_btn.setStyleSheet(self._btn_style(primary=True))
         self.back_btn = QPushButton("↺ 10s")
+        self.back_btn.setToolTip("Voltar 10s (←/J)")
         self.forward_btn = QPushButton("10s ↻")
+        self.forward_btn.setToolTip("Avançar 10s (→/L)")
         for b in (self.back_btn, self.forward_btn):
-            b.setFixedHeight(44)
+            b.setFixedHeight(42)
             b.setStyleSheet(self._btn_style())
 
         self.time_label = QLabel("00:00 / 00:00")
         self.time_label.setStyleSheet(
-            "color:#e5ebf7;font-weight:800;font-size:12pt;background:transparent;"
+            "color:#e7ecf7;font-weight:800;font-size:12pt;background:transparent;"
         )
 
         self.mute_btn = QPushButton("🔊")
-        self.mute_btn.setFixedSize(46, 44)
+        self.mute_btn.setFixedSize(44, 42)
+        self.mute_btn.setToolTip("Mudo (M)")
         self.mute_btn.setStyleSheet(self._btn_style())
         self.volume = QSlider(Qt.Horizontal)
         self.volume.setRange(0, 100)
         self.volume.setValue(100)
-        self.volume.setFixedWidth(110)
+        self.volume.setFixedWidth(108)
+        self.volume.setToolTip("Volume (↑/↓)")
 
-        speed_lbl = QLabel("Velocidade")
-        speed_lbl.setStyleSheet("color:#c4cde0;background:transparent;font-weight:700;")
+        # ----- Menu da engrenagem ⚙ (qualidade / velocidade / VLC) ----------
+        # Os QComboBox vivem DENTRO do popup do ⚙ (escuros), não na barra.
         self.speed_box = QComboBox()
         self.speed_box.addItems(["0.5x", "0.75x", "1x", "1.25x", "1.5x", "1.75x", "2x"])
         self.speed_box.setCurrentText("1x")
-        self.speed_box.setFixedHeight(44)
-
-        # Seletor de qualidade (engrenagem ⚙). Inclui "Auto (adaptativo)".
         self.quality_box = QComboBox()
         self.quality_box.setToolTip("Qualidade do streaming")
-        self.quality_box.setFixedHeight(44)
         self._populate_quality_box()
 
-        self.vlc_btn = QPushButton("Abrir no VLC")
-        self.vlc_btn.setFixedHeight(44)
-        self.vlc_btn.setStyleSheet(self._btn_style())
+        self.settings_btn = QPushButton("⚙")
+        self.settings_btn.setFixedSize(44, 42)
+        self.settings_btn.setToolTip("Configurações (qualidade, velocidade, VLC)")
+        self.settings_btn.setStyleSheet(self._btn_style())
+        self._build_settings_menu()
+        self.settings_btn.clicked.connect(self._open_settings_menu)
+
         self.full_btn = QPushButton("⛶")
-        self.full_btn.setFixedSize(46, 44)
+        self.full_btn.setFixedSize(44, 42)
+        self.full_btn.setToolTip("Tela cheia (F)")
         self.full_btn.setStyleSheet(self._btn_style())
 
         row.addWidget(self.prev_btn)
@@ -707,19 +774,13 @@ class VideoPlayerDialog(QDialog):
         row.addSpacing(4)
         row.addWidget(self.back_btn)
         row.addWidget(self.forward_btn)
-        row.addSpacing(6)
+        row.addSpacing(8)
         row.addWidget(self.time_label)
         row.addStretch(1)
         row.addWidget(self.mute_btn)
         row.addWidget(self.volume)
-        row.addSpacing(8)
-        row.addWidget(QLabel("⚙"))
-        row.addWidget(self.quality_box)
-        row.addSpacing(8)
-        row.addWidget(speed_lbl)
-        row.addWidget(self.speed_box)
-        row.addSpacing(8)
-        row.addWidget(self.vlc_btn)
+        row.addSpacing(6)
+        row.addWidget(self.settings_btn)
         row.addWidget(self.full_btn)
         outer.addLayout(row)
 
@@ -732,11 +793,74 @@ class VideoPlayerDialog(QDialog):
         self.back_btn.clicked.connect(lambda: self.seek_relative(-10_000))
         self.forward_btn.clicked.connect(lambda: self.seek_relative(10_000))
         self.full_btn.clicked.connect(self.toggle_fullscreen)
-        self.vlc_btn.clicked.connect(self._request_vlc)
         self.mute_btn.clicked.connect(self.toggle_mute)
         self.volume.valueChanged.connect(self._on_volume_changed)
         self.speed_box.currentTextChanged.connect(self.change_speed)
         self.quality_box.currentIndexChanged.connect(self._on_quality_box)
+
+    # ------------------------------------------------------- menu engrenagem ⚙
+    def _menu_qss(self) -> str:
+        """QSS escuro/translúcido para o popup do ⚙ e seus combos (sem branco)."""
+        return (
+            "QMenu{background:rgba(18,24,44,0.98);color:#eef2fb;"
+            "border:1px solid rgba(124,92,255,0.45);border-radius:12px;padding:8px;}"
+            "QMenu::separator{height:1px;background:rgba(255,255,255,0.10);margin:6px 4px;}"
+            "QLabel{color:#c4cde0;background:transparent;font-weight:800;"
+            "font-size:9.5pt;letter-spacing:0.4px;}"
+            "QComboBox{background:#161d31;color:#eef2fb;border:1px solid rgba(124,92,255,0.45);"
+            "border-radius:9px;padding:7px 10px;min-width:170px;font-weight:700;}"
+            "QComboBox:hover{border-color:%s;}"
+            "QComboBox::drop-down{border:none;width:24px;}"
+            "QComboBox QAbstractItemView{background:#161d31;color:#eef2fb;"
+            "border:1px solid rgba(124,92,255,0.45);selection-background-color:%s;"
+            "selection-color:#fff;outline:none;}"
+            "QPushButton{background:rgba(28,36,62,0.9);color:#eef2fb;"
+            "border:1px solid rgba(255,255,255,0.12);border-radius:9px;"
+            "padding:8px 12px;font-weight:750;}"
+            "QPushButton:hover{background:%s;border-color:%s;color:#fff;}"
+            % (ACCENT, ACCENT, ACCENT, ACCENT)
+        )
+
+    def _build_settings_menu(self) -> None:
+        """Cria o popup do ⚙ agrupando Qualidade, Velocidade e 'Abrir no VLC'."""
+        self.settings_menu = QMenu(self)
+        self.settings_menu.setStyleSheet(self._menu_qss())
+
+        panel = QWidget()
+        pl = QVBoxLayout(panel)
+        pl.setContentsMargins(8, 6, 8, 6)
+        pl.setSpacing(6)
+        pl.addWidget(QLabel("QUALIDADE"))
+        pl.addWidget(self.quality_box)
+        pl.addSpacing(2)
+        pl.addWidget(QLabel("VELOCIDADE"))
+        pl.addWidget(self.speed_box)
+        wa = QWidgetAction(self.settings_menu)
+        wa.setDefaultWidget(panel)
+        self.settings_menu.addAction(wa)
+        self.settings_menu.addSeparator()
+        self.vlc_btn = QPushButton("▶  Abrir no VLC")
+        self.vlc_btn.setToolTip("Abrir esta aula no VLC externo")
+        self.vlc_btn.clicked.connect(self._request_vlc)
+        vlc_wa = QWidgetAction(self.settings_menu)
+        vw = QWidget()
+        vwl = QVBoxLayout(vw)
+        vwl.setContentsMargins(8, 2, 8, 4)
+        vwl.addWidget(self.vlc_btn)
+        vlc_wa.setDefaultWidget(vw)
+        self.settings_menu.addAction(vlc_wa)
+
+    def _open_settings_menu(self) -> None:
+        try:
+            below = self.settings_btn.mapToGlobal(
+                self.settings_btn.rect().topRight()
+            )
+            sz = self.settings_menu.sizeHint()
+            self.settings_menu.popup(
+                QPoint(below.x() - sz.width(), below.y() - sz.height() - 6)
+            )
+        except Exception:  # noqa: BLE001
+            self.settings_menu.popup(self.settings_btn.mapToGlobal(QPoint(0, 0)))
 
     def _populate_quality_box(self) -> None:
         """Preenche o seletor de qualidade, evitando upscale acima da fonte."""
@@ -798,62 +922,82 @@ class VideoPlayerDialog(QDialog):
             self.close()
 
     def _btn_style(self, primary: bool = False) -> str:
+        """Estilo dos botões da barra. UMA cor de acento (índigo), sem ciano."""
         if primary:
             return (
-                "QPushButton{background:#7c5cff;color:#fff;border:none;"
-                "border-radius:12px;font-size:15pt;font-weight:800;}"
-                "QPushButton:hover{background:#8e72ff;}"
+                f"QPushButton{{background:{ACCENT};color:#fff;border:none;"
+                "border-radius:11px;font-size:14pt;font-weight:800;}"
+                f"QPushButton:hover{{background:{ACCENT_HOVER};}}"
+                "QPushButton:pressed{background:#6a4be0;}"
             )
         return (
-            "QPushButton{background:rgba(28,36,62,0.9);color:#eef2fb;"
-            "border:1px solid rgba(255,255,255,0.12);border-radius:12px;"
-            "padding:0 14px;font-size:12pt;font-weight:750;}"
+            "QPushButton{background:rgba(28,36,62,0.82);color:#eef2fb;"
+            "border:1px solid rgba(255,255,255,0.10);border-radius:11px;"
+            "padding:0 12px;font-size:12pt;font-weight:750;}"
             "QPushButton:hover{background:rgba(124,92,255,0.34);"
-            "border-color:rgba(124,92,255,0.6);}"
+            "border-color:rgba(124,92,255,0.65);color:#fff;}"
         )
 
     def _build_header(self, title: str, layout: QVBoxLayout) -> None:
+        """Cabeçalho LIMPO: título à esquerda; badges compactos SEM duplicação.
+
+        Badges (da esquerda p/ direita, alinhados à direita): posição na fila
+        (ex.: 16/17) · resolução (ex.: 1280×720, UMA vez) · backend (⚡ Nativo).
+        A qualidade ativa NÃO fica aqui — vive no menu da engrenagem ⚙.
+        """
         self.header = QFrame()
         self.header.setObjectName("PlayerHeader")
+        self.header.setFixedHeight(58)
         self.header.setStyleSheet(
-            "#PlayerHeader{background:rgba(8,11,22,0.92);"
-            "border-bottom:1px solid rgba(124,92,255,0.18);}"
+            "#PlayerHeader{background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+            " stop:0 rgba(6,8,16,0.96), stop:1 rgba(6,8,16,0.0)); border:none;}"
         )
         h = QHBoxLayout(self.header)
-        h.setContentsMargins(20, 14, 20, 14)
-        title_label = QLabel(title)
-        title_label.setObjectName("PlayerTitle")
-        title_label.setStyleSheet(
-            "color:#fff;font-size:15pt;font-weight:800;background:transparent;"
-        )
-        title_label.setWordWrap(True)
-        backend = {"vlc": "VLC", "qt": "Nativo", "web": "Web"}.get(self.mode, "")
+        h.setContentsMargins(22, 10, 18, 10)
+        h.setSpacing(10)
 
-        def _badge(text: str) -> QLabel:
+        self.title_label = QLabel(title)
+        self.title_label.setObjectName("PlayerTitle")
+        self.title_label.setStyleSheet(
+            "color:#ffffff;font-size:14pt;font-weight:800;background:transparent;"
+        )
+        # Elipse quando o título é longo (em vez de quebrar em 2 linhas).
+        self.title_label.setWordWrap(False)
+        try:
+            self.title_label.setTextElideMode(Qt.ElideRight)  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            pass
+        self.title_label.setMinimumWidth(120)
+
+        backend = {"vlc": "Nativo", "qt": "Nativo", "web": "Web"}.get(self.mode, "")
+
+        def _badge(text: str, accent: bool = False) -> QLabel:
             lab = QLabel(text)
-            lab.setStyleSheet(
-                "color:#cdbcff;background:rgba(124,92,255,0.2);"
-                "border:1px solid rgba(124,92,255,0.5);border-radius:999px;"
-                "padding:5px 12px;font-weight:800;font-size:10pt;"
-            )
+            if accent:
+                lab.setStyleSheet(
+                    "color:#dcd2ff;background:rgba(124,92,255,0.18);"
+                    "border:1px solid rgba(124,92,255,0.5);border-radius:999px;"
+                    "padding:4px 11px;font-weight:800;font-size:9.5pt;"
+                )
+            else:
+                lab.setStyleSheet(
+                    "color:#c4cde0;background:rgba(255,255,255,0.06);"
+                    "border:1px solid rgba(255,255,255,0.12);border-radius:999px;"
+                    "padding:4px 11px;font-weight:800;font-size:9.5pt;"
+                )
             return lab
 
-        backend_badge = _badge(f"⚡ {backend}")
-        # Badge de qualidade atual (ex.: "720p · 2.5k" / "Auto").
-        self.quality_badge = _badge(self._quality_badge_text())
-        # Badge de resolução (Source / Playing).
-        self.res_badge = _badge(self._res_badge_text())
-        # Badge de modo (Original / Throttled / Auto).
-        self.mode_badge = _badge(self._mode_badge_text())
-        # Indicador de posição na fila (ex.: "3/12").
+        # Indicador de posição na fila (ex.: "16/17").
         self.pos_badge = _badge(f"{self._current_index + 1}/{self._total_items}")
+        # Resolução (UMA vez; ex.: "1280×720").
+        self.res_badge = _badge(self._res_badge_text())
+        # Backend (acento), ex.: "⚡ Nativo".
+        self.backend_badge = _badge(f"⚡ {backend}", accent=True)
 
-        h.addWidget(title_label, 1)
+        h.addWidget(self.title_label, 1)
         h.addWidget(self.pos_badge, 0, Qt.AlignRight)
         h.addWidget(self.res_badge, 0, Qt.AlignRight)
-        h.addWidget(self.quality_badge, 0, Qt.AlignRight)
-        h.addWidget(self.mode_badge, 0, Qt.AlignRight)
-        h.addWidget(backend_badge, 0, Qt.AlignRight)
+        h.addWidget(self.backend_badge, 0, Qt.AlignRight)
         layout.addWidget(self.header)
 
     # ----------------------------------------------------------- textos de badge
@@ -865,8 +1009,8 @@ class VideoPlayerDialog(QDialog):
     def _res_badge_text(self) -> str:
         sw, sh = self._source_width, self._source_height
         if sw and sh:
-            return f"Source: {sw}×{sh}"
-        return "Source: —"
+            return f"{sw}×{sh}"
+        return "—"
 
     def _mode_badge_text(self) -> str:
         if self._adaptive:
@@ -876,13 +1020,10 @@ class VideoPlayerDialog(QDialog):
         return "Throttled"
 
     def _refresh_badges(self) -> None:
-        for name, fn in (
-            ("quality_badge", self._quality_badge_text),
-            ("res_badge", self._res_badge_text),
-            ("mode_badge", self._mode_badge_text),
-        ):
-            if hasattr(self, name):
-                getattr(self, name).setText(fn())
+        # A qualidade agora vive no menu ⚙; o cabeçalho só mostra resolução,
+        # posição e backend (sem duplicação).
+        if hasattr(self, "res_badge"):
+            self.res_badge.setText(self._res_badge_text())
         if hasattr(self, "pos_badge"):
             self.pos_badge.setText(f"{self._current_index + 1}/{self._total_items}")
 
@@ -1083,7 +1224,7 @@ class VideoPlayerDialog(QDialog):
             self.seek.setValue(pos)
         self.update_time_label(pos)
         is_playing = self.vlc.is_playing()
-        self.play_btn.setText("❚❚" if is_playing else "▶")
+        self.play_btn.setText("⏸" if is_playing else "▶")
         if self.on_progress and pos:
             try:
                 self.on_progress(pos, self._duration)
@@ -1267,7 +1408,7 @@ class VideoPlayerDialog(QDialog):
                 or QMediaPlayer.PlaybackState.PlayingState
             )
             self.play_btn.setText(
-                "❚❚" if self.player.playbackState() == playing else "▶"
+                "⏸" if self.player.playbackState() == playing else "▶"
             )
         except Exception:  # noqa: BLE001
             pass

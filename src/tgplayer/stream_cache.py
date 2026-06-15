@@ -61,6 +61,8 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .mp4_faststart import FaststartError, build_faststart_header, split_ftyp
+
 if TYPE_CHECKING:  # pragma: no cover
     from pyrogram import Client
 
@@ -77,6 +79,20 @@ MAX_PARALLEL_DOWNLOADS = 6
 FAST_FIRST_BYTES = 256 * 1024
 # Quantos blocos do FINAL pré-buscar (onde costuma ficar o `moov`).
 MOOV_TAIL_BLOCKS = 2
+
+# ----------------------------------------------------------------- PARTIDA RÁPIDA
+# Novidades v6.4: a partida usa pedaços MENORES e mais paralelismo para que o
+# player exiba o primeiro frame em poucos segundos (idealmente 2–5 s).
+#
+# Tamanho do "primeiro pedaço" alinhado à fronteira de CDN (512 KiB). É o
+# tamanho com que liberamos os bytes iniciais do `mdat` — menor que o bloco de
+# 2 MiB, então o player começa a tocar muito antes.
+FIRST_CHUNK_SIZE = 512 * 1024
+# Mais downloads concorrentes SÓ durante a partida (separa-se do steady-state).
+STARTUP_PARALLEL = 8
+# Orçamento de bytes do INÍCIO do mdat que, junto com o header faststart, marca
+# "pronto para tocar". Assim que isto chega, o overlay some e a reprodução flui.
+STARTUP_BUDGET_BYTES = 2 * 1024 * 1024
 
 # Fronteira de arredondamento do CDN do Telegram (512 KiB). Pedidos de Range
 # precisam começar em múltiplos disso para não receber dados deslocados.
@@ -139,7 +155,10 @@ class StreamSession:
         self._tasks: set[asyncio.Task] = set()
         self._message = None
         self._lock = asyncio.Lock()
-        self._semaphore = asyncio.Semaphore(MAX_PARALLEL_DOWNLOADS)
+        # Mais downloads concorrentes ajudam a "amortecer" a latência de
+        # primeiro-byte do stream_media. Usamos STARTUP_PARALLEL (>=
+        # MAX_PARALLEL_DOWNLOADS) já que o gargalo é latência, não banda local.
+        self._semaphore = asyncio.Semaphore(max(MAX_PARALLEL_DOWNLOADS, STARTUP_PARALLEL))
         self.last_access = time.time()
         self.closed = False
         self.error: str | None = None
@@ -151,6 +170,22 @@ class StreamSession:
         # ---- Resultado da descoberta do moov -------------------------------
         # {found, moov_offset, moov_size, located} preenchido por discover_moov().
         self.moov_info: dict[str, int | bool] | None = None
+
+        # ---- Faststart virtual (v6.4) --------------------------------------
+        # Quando o arquivo NÃO é faststart (moov no fim), montamos em memória um
+        # cabeçalho ftyp+moov com offsets corrigidos e o servimos ANTES do mdat,
+        # mapeando os Ranges lógicos do player de volta para offsets físicos.
+        # `faststart_header` é o cabeçalho pronto; `faststart_active` indica que
+        # o modo está ligado para esta sessão.
+        self.faststart_header: bytes | None = None
+        self.faststart_active: bool = False
+        # Início FÍSICO do mdat no arquivo original (geralmente logo após o
+        # ftyp, em moov-at-end). Usado para mapear offsets lógicos -> físicos.
+        self._mdat_phys_start: int = 0
+        # Lock para montar o header uma única vez (evita corrida entre o player
+        # e a descoberta em 2º plano).
+        self._faststart_lock = asyncio.Lock()
+        self._faststart_attempted = False
 
         # Pré-aloca arquivo esparso para permitir seek/escrita em qualquer offset.
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -182,18 +217,24 @@ class StreamSession:
 
     # ------------------------------------------------------------ partida rápida
     def prefetch_start(self) -> None:
-        """Dispara o download do bloco 0 e dos últimos blocos (onde fica o moov).
+        """Partida rápida v6.4: prioriza o MÍNIMO para o primeiro frame.
 
-        Chamado logo após criar a sessão para que o player tenha o início do
-        vídeo e o índice `moov` o quanto antes, eliminando a espera longa.
+        Em vez de baixar 6 blocos de 2 MiB antes de liberar a reprodução, aqui
+        focamos no essencial: o cabeçalho (ftyp + início do mdat) e a cauda
+        (moov). Quando o faststart virtual está ativo, o player nem precisa
+        esperar a cauda — o header já carrega o moov no começo.
         """
         if self.closed:
             return
+        # O bloco 0 contém o ftyp + começo do mdat -> primeira coisa a chegar.
         self._spawn_download(0)
-        # Read-ahead inicial dos primeiros blocos.
-        for b in range(1, min(READ_AHEAD_BLOCKS, self.total_blocks or READ_AHEAD_BLOCKS)):
-            self._spawn_download(b)
-        # Pré-busca da cauda (moov de MP4 não-faststart).
+        # Read-ahead inicial ENXUTO (não competir com os bytes da partida):
+        # só o bloco 1, suficiente para emendar a reprodução. O read-ahead
+        # agressivo passa a valer DEPOIS da partida (ver _schedule_read_ahead).
+        if (self.total_blocks or 2) > 1:
+            self._spawn_download(1)
+        # Pré-busca da cauda (moov de MP4 não-faststart) — necessária para
+        # MONTAR o header faststart e/ou para players sem faststart.
         if self.total_blocks:
             for i in range(1, MOOV_TAIL_BLOCKS + 1):
                 tail = self.total_blocks - i
@@ -201,17 +242,28 @@ class StreamSession:
                     self._spawn_download(tail)
 
     def buffer_ratio(self) -> float:
-        """Fração (0..1) do bloco de partida (bloco 0) já baixada.
+        """Fração (0..1) de "pronto para tocar" para o overlay "Carregando…".
 
-        Usado pelo overlay "Carregando aula… NN%". Combina o quanto do bloco 0
-        já chegou com o quanto da cauda (moov) já chegou, para refletir melhor
-        o progresso real de "pronto para tocar".
+        v6.4: "pronto" = header faststart montado (quando aplicável) + pelo
+        menos ``STARTUP_BUDGET_BYTES`` do início do mdat baixados. Assim o
+        overlay some assim que o player REALMENTE tem o necessário para o
+        primeiro frame — sem esperar a cauda inteira nem 6 blocos de 2 MiB.
         """
         if self.total_blocks == 0:
             return 0.0
-        want = self._block_size_for(0) or 1
-        head = min(1.0, self._block_filled.get(0, 0) / want)
-        # Considera também a cauda (moov) — sem ela o MP4 não inicia.
+        # Quanto do orçamento inicial (2 MiB) já temos a partir do offset 0.
+        want = min(STARTUP_BUDGET_BYTES, self.size or STARTUP_BUDGET_BYTES) or 1
+        have = 0
+        blocks_needed = (want + BLOCK_SIZE - 1) // BLOCK_SIZE
+        for b in range(blocks_needed):
+            have += min(self._block_filled.get(b, 0), self._block_size_for(b))
+        head = min(1.0, have / want)
+
+        if self.faststart_active and self.faststart_header is not None:
+            # Faststart pronto: a cauda não importa; só o início do mdat conta.
+            return max(0.0, min(1.0, head))
+
+        # Sem faststart confirmado, a cauda (moov) ainda pesa na partida.
         tail_ready = 1.0
         if self.total_blocks > MOOV_TAIL_BLOCKS:
             done = 0
@@ -220,7 +272,7 @@ class StreamSession:
                 if self._ready_event(tail).is_set():
                     done += 1
             tail_ready = done / MOOV_TAIL_BLOCKS
-        return max(0.0, min(1.0, 0.6 * head + 0.4 * tail_ready))
+        return max(0.0, min(1.0, 0.65 * head + 0.35 * tail_ready))
 
     # --------------------------------------------------------------- mensagem TG
     async def _get_message(self):
@@ -664,6 +716,128 @@ class StreamSession:
         last = min(self.size - 1, offset + size - 1) // BLOCK_SIZE
         for b in range(first, last + 1):
             self._spawn_download(b)
+
+    # ------------------------------------------------------ faststart virtual
+    @property
+    def logical_size(self) -> int:
+        """Tamanho do arquivo LÓGICO apresentado ao player.
+
+        Com faststart ativo, o arquivo lógico é ``header (ftyp+moov)`` + ``mdat``
+        (sem o moov original na cauda). Como apenas REPOSICIONAMOS bytes (o moov
+        sai do fim e vai para o começo, com o mesmo tamanho), o tamanho total
+        permanece IGUAL ao original. Mantemos a propriedade para clareza.
+        """
+        return self.size
+
+    async def ensure_faststart(self) -> bool:
+        """Garante o modo faststart quando o arquivo é moov-at-end.
+
+        Descobre o ``moov`` (se necessário), baixa ``ftyp`` + ``moov`` e monta o
+        cabeçalho faststart em memória, corrigindo os offsets de chunk. Retorna
+        ``True`` se o faststart ficou ativo. Em QUALQUER falha (arquivo já
+        faststart, parsing problemático, moov gigante) retorna ``False`` e a
+        sessão segue servindo o arquivo ORIGINAL (fallback seguro).
+        """
+        if self.faststart_active:
+            return True
+        async with self._faststart_lock:
+            if self.faststart_active:
+                return True
+            if self._faststart_attempted:
+                return self.faststart_active
+            self._faststart_attempted = True
+            try:
+                info = await self.discover_moov()
+            except Exception:  # noqa: BLE001
+                log.exception("faststart: falha ao descobrir moov (%s)", self.token)
+                return False
+            if not info.get("found"):
+                return False
+            located = int(info.get("located") or 0)
+            if located == 1:
+                # Já é faststart (moov no início): nada a reescrever.
+                return False
+            moov_off = int(info.get("moov_offset") or 0)
+            moov_sz = int(info.get("moov_size") or 0)
+            if moov_sz <= 0 or moov_off <= 0:
+                return False
+            try:
+                # 1) Lê o ftyp do começo do arquivo (cabe no primeiro pedaço).
+                head = await self.read_exact(0, min(FIRST_CHUNK_SIZE, self.size), timeout=30.0)
+                ftyp_bytes, ftyp_size = split_ftyp(head)
+                # 2) Lê o moov inteiro da cauda.
+                moov_bytes = await self.read_exact(moov_off, moov_sz, timeout=45.0)
+                if len(moov_bytes) < moov_sz or moov_bytes[4:8] != b"moov":
+                    raise FaststartError("moov incompleto/ inválido na cauda")
+                # 3) Monta o header faststart (offsets corrigidos).
+                header = build_faststart_header(ftyp_bytes, moov_bytes)
+            except FaststartError as exc:
+                log.info("faststart desativado para %s: %s", self.token, exc)
+                return False
+            except Exception:  # noqa: BLE001
+                log.exception("faststart: erro inesperado ao montar header (%s)", self.token)
+                return False
+
+            self.faststart_header = header
+            # O mdat (dados de mídia) fica logo após o ftyp no arquivo original.
+            self._mdat_phys_start = ftyp_size
+            self.faststart_active = True
+            # Pré-aquece o INÍCIO do mdat para a partida fluir imediatamente.
+            self._prewarm_range(self._mdat_phys_start, STARTUP_BUDGET_BYTES)
+            log.info(
+                "faststart ATIVO para %s: header=%dB, mdat_phys_start=%d",
+                self.token, len(header), self._mdat_phys_start,
+            )
+            return True
+
+    def _logical_to_physical(self, logical_off: int) -> int:
+        """Converte um offset LÓGICO (visão do player) para FÍSICO (no arquivo).
+
+        Só usado quando o faststart está ativo. A região do header é tratada à
+        parte; aqui mapeamos a parte que cai no ``mdat``.
+
+            logical:  [0 .. H) = header   |   [H .. fim) = mdat
+            physical: mdat começa em _mdat_phys_start
+
+        Para um offset lógico ``>= H`` (dentro do mdat), o físico é
+        ``_mdat_phys_start + (logical_off - H)``.
+        """
+        h = len(self.faststart_header or b"")
+        return self._mdat_phys_start + (logical_off - h)
+
+    async def read_logical_range(self, start: int, end: int, measure: bool = True):
+        """Gerador que entrega bytes do arquivo LÓGICO [start, end].
+
+        Quando o faststart está ativo, serve primeiro o cabeçalho em memória
+        (ftyp+moov reposicionado) e depois mapeia o restante para o ``mdat``
+        físico. Quando NÃO está ativo, delega para :meth:`read_range` (arquivo
+        servido como está) — fallback seguro.
+        """
+        if not (self.faststart_active and self.faststart_header is not None):
+            async for chunk in self.read_range(start, end, measure=measure):
+                yield chunk
+            return
+
+        header = self.faststart_header
+        h = len(header)
+        pos = start
+
+        # 1) Parte que cai no HEADER (em memória).
+        if pos < h:
+            head_end = min(end, h - 1)
+            chunk = header[pos:head_end + 1]
+            if chunk:
+                yield chunk
+                if measure:
+                    self._record_served(len(chunk))
+                pos = head_end + 1
+
+        # 2) Parte que cai no MDAT (físico), mapeada de volta.
+        if pos <= end:
+            phys_start = self._logical_to_physical(pos)
+            phys_end = self._logical_to_physical(end)
+            async for chunk in self.read_range(phys_start, phys_end, measure=measure):
+                yield chunk
 
     async def close(self) -> None:
         self.closed = True
