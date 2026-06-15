@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TGClassPlayer v6 — Ponto de entrada (entry point).
+TgPlayer v6.2 — Ponto de entrada (entry point).
 
 Player premium de videoaulas do Telegram com streaming sob demanda
 (carrega a aula sem baixar/armazenar o vídeo inteiro e sem travar).
 
 Como rodar em modo desenvolvimento:
     pip install -r requirements.txt
-    python TGClassPlayer.py
+    python TgPlayer.py
 
 Como gerar o .exe (Windows):
     build_exe.bat
@@ -21,7 +21,7 @@ import sys
 
 
 def _setup_path() -> None:
-    """Garante que o pacote `tgclassplayer` seja encontrado em dev e no .exe."""
+    """Garante que o pacote `tgplayer` seja encontrado em dev e no .exe."""
     base = os.path.dirname(os.path.abspath(__file__))
 
     # Quando empacotado pelo PyInstaller, os módulos ficam em sys._MEIPASS.
@@ -39,11 +39,11 @@ def _setup_path() -> None:
 def run() -> None:
     _setup_path()
     try:
-        from tgclassplayer.app import main
+        from tgplayer.app import main
     except Exception as exc:  # noqa: BLE001
         # Falha de import (dependência faltando, etc.) — mostra mensagem clara.
         msg = (
-            "Não foi possível iniciar o TGClassPlayer.\n\n"
+            "Não foi possível iniciar o TgPlayer.\n\n"
             f"Detalhe técnico: {exc}\n\n"
             "Se você estiver rodando o código-fonte, instale as dependências:\n"
             "    pip install -r requirements.txt"
@@ -53,7 +53,7 @@ def run() -> None:
 
             if QApplication.instance() is None:
                 QApplication(sys.argv)
-            QMessageBox.critical(None, "TGClassPlayer — Erro ao iniciar", msg)
+            QMessageBox.critical(None, "TgPlayer — Erro ao iniciar", msg)
         except Exception:  # noqa: BLE001
             print(msg, file=sys.stderr)
         sys.exit(1)

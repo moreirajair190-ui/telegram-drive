@@ -1,4 +1,4 @@
-# TGClassPlayer v6 — dependências
+# TgPlayer v6.2 — dependências
 #
 # Instale com:
 #     pip install -r requirements.txt
@@ -27,6 +27,19 @@ TgCrypto>=1.2.5 ; python_version < "3.13"
 
 # Servidor HTTP local assíncrono usado para o streaming sob demanda.
 aiohttp>=3.9
+
+# (OPCIONAL) Backend de vídeo com libVLC EMBARCADO dentro da janela do app.
+# Quando instalado (e com o VLC/libVLC presente no sistema), o player interno
+# usa o motor do VLC — que inicia o streaming MUITO mais rápido — sem abrir o
+# VLC externo. Se NÃO estiver instalado, o app cai automaticamente para o
+# QMediaPlayer (codecs nativos do SO). Por isso esta linha pode ficar comentada.
+#
+#   pip install python-vlc
+#
+# python-vlc>=3.0.18
+
+# Linter usado nos testes de fumaça do projeto (opcional em produção).
+# pyflakes>=3.0
 
 # Para gerar o executável (.exe) no Windows.
 pyinstaller>=6.3

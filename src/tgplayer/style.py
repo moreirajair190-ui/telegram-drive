@@ -1,4 +1,4 @@
-"""Temas premium do TGClassPlayer — CLARO 🌞 e ESCURO 🌙.
+"""Temas premium do TgPlayer — CLARO 🌞 e ESCURO 🌙.
 
 Cada tema traz uma paleta calibrada (cores, contraste, sombras) e um QSS
 completo. `build_qss(theme)` devolve a folha de estilo e `palette(theme)` o

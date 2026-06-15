@@ -1,4 +1,4 @@
-"""Janela principal do TGClassPlayer v6 (interface refeita do zero).
+"""Janela principal do TgPlayer (interface refeita do zero).
 
 Estrutura da interface:
 - Barra superior: marca, nome do curso/matéria, BARRA DE PROGRESSO GERAL
@@ -82,7 +82,7 @@ class MainWindow(QMainWindow):
         self.current_course_id: int | None = None
         self.current_subject_id: int = SUBJECT_ALL
         self.current_video_id: int | None = None
-        self.setWindowTitle("TGClassPlayer — Videoaulas do Telegram")
+        self.setWindowTitle("TgPlayer — Videoaulas do Telegram")
         self.resize(1500, 900)
         self.setMinimumSize(1180, 720)
         self.build_ui()
@@ -396,7 +396,7 @@ class MainWindow(QMainWindow):
         tools.addAction(data_action)
 
         help_menu = menubar.addMenu("Ajuda")
-        about = QAction("Sobre o TGClassPlayer", self)
+        about = QAction("Sobre o TgPlayer", self)
         about.triggered.connect(self.show_about)
         help_menu.addAction(about)
 
@@ -1376,7 +1376,7 @@ class MainWindow(QMainWindow):
         from . import __version__
         QMessageBox.information(
             self, "Sobre",
-            f"TGClassPlayer v{__version__}\n\n"
+            f"TgPlayer v{__version__}\n\n"
             "Organize e assista às videoaulas dos seus cursos no Telegram, "
             "com player premium, streaming sob demanda (sem armazenar os vídeos) "
             "e módulo de acompanhamento de estudos.\n\n"
@@ -1434,7 +1434,7 @@ def main() -> None:
     sys.excepthook = excepthook
     _configure_rendering()
     app = QApplication(sys.argv)
-    app.setApplicationName("TGClassPlayer")
+    app.setApplicationName("TgPlayer")
     try:
         app.setFont(QFont("Segoe UI", 10))
     except Exception:  # noqa: BLE001

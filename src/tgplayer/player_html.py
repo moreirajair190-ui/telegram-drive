@@ -278,7 +278,7 @@ v.addEventListener('error',()=>showErr(v.error&&v.error.message));
 
 // Retoma posição salva quando os metadados carregarem.
 v.addEventListener('loadedmetadata',()=>{{
-  if(!resumed && START>0 && isFinite(v.duration) && START < v.duration-2){{
+  if(!resumed && START>0 && isFinite(v.duration) && START < v.duration-5){{
     try{{ v.currentTime=START; showToast('Retomando de '+fmt(START)); }}catch(e){{}}
   }}
   resumed=true;

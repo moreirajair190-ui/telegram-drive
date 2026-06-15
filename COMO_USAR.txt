@@ -1,8 +1,8 @@
 ============================================================
-  TGClassPlayer v6 - COMO USAR (guia rapido, em portugues)
+  TgPlayer v6.2 - COMO USAR (guia rapido, em portugues)
 ============================================================
 
-O TGClassPlayer organiza e reproduz as videoaulas dos seus cursos do
+O TgPlayer organiza e reproduz as videoaulas dos seus cursos do
 Telegram, com player premium e streaming sob demanda (o video NAO fica
 salvo no seu computador). Tem temas claro/escuro, navegacao por materias
 e uma aba de Acompanhamento de estudos (Pomodoro, tarefas e graficos).
@@ -23,9 +23,9 @@ e uma aba de Acompanhamento de estudos (Pomodoro, tarefas e graficos).
      ele e opcional e o aplicativo funciona normalmente sem ele.
 
 3. O aplicativo ficara em:
-       dist\TGClassPlayer\TGClassPlayer.exe
+       dist\TgPlayer\TgPlayer.exe
 
-4. Para distribuir, copie a PASTA INTEIRA "dist\TGClassPlayer".
+4. Para distribuir, copie a PASTA INTEIRA "dist\TgPlayer".
 
 (Para apenas testar sem gerar .exe, de duplo clique em "run_dev.bat".)
 
@@ -138,7 +138,7 @@ escolha fica salva automaticamente.
   apagado ao fechar o player).
 - Use somente com conteudo a que voce tem acesso legitimo.
 - Sua sessao e suas credenciais ficam SOMENTE no seu computador
-  (pasta %LOCALAPPDATA%\TGClassPlayer quando rodando como .exe).
+  (pasta %LOCALAPPDATA%\TgPlayer quando rodando como .exe).
 
 
 Bons estudos! :)

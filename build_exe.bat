@@ -1,6 +1,6 @@
 @echo off
 REM ============================================================================
-REM  TGClassPlayer v6 - Gerador do executavel (.exe) para Windows
+REM  TgPlayer v6.2 - Gerador do executavel (.exe) para Windows
 REM ----------------------------------------------------------------------------
 REM  Basta dar DUPLO CLIQUE neste arquivo (ou rodar no Prompt de Comando).
 REM  Requisitos: Python 3.10/3.11/3.12 (64 bits) instalado e no PATH.
@@ -11,7 +11,7 @@ cd /d "%~dp0"
 
 echo.
 echo ============================================================
-echo   TGClassPlayer v6 - Build do executavel (.exe)
+echo   TgPlayer v6.2 - Build do executavel (.exe)
 echo ============================================================
 echo.
 
@@ -79,7 +79,7 @@ REM ---- 5) Gera o executavel -------------------------------------------------
 echo.
 echo [4/4] Gerando o executavel com PyInstaller ^(pode demorar alguns minutos^) ...
 echo.
-python -m PyInstaller --noconfirm TGClassPlayer.spec
+python -m PyInstaller --noconfirm TgPlayer.spec
 if errorlevel 1 (
     echo.
     echo [ERRO] A geracao do executavel falhou. Veja as mensagens acima.
@@ -93,9 +93,9 @@ echo   SUCESSO!
 echo ============================================================
 echo.
 echo   O aplicativo foi gerado em:
-echo       dist\TGClassPlayer\TGClassPlayer.exe
+echo       dist\TgPlayer\TgPlayer.exe
 echo.
-echo   Para distribuir, copie a PASTA INTEIRA "dist\TGClassPlayer".
+echo   Para distribuir, copie a PASTA INTEIRA "dist\TgPlayer".
 echo.
 pause
 endlocal
