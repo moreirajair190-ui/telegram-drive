@@ -12,8 +12,8 @@
    "405 Method Not Allowed". A API precisa apontar para o Render.
    ============================================================ */
 
-// >>> EDITE AQUI: cole a URL do seu backend no Render (sem barra no final).
-window.TGWEB_API_BASE = "https://SEU-BACKEND.onrender.com";
+// >>> URL do backend no Render (sem barra no final).
+window.TGWEB_API_BASE = "https://telegram-drive-yzg9.onrender.com";
 
 /* ---------------------------------------------------------------------------
    Proteção contra configuração esquecida.
