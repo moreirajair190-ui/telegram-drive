@@ -40,9 +40,6 @@ for _p in (str(_BACKEND_DIR), str(_SRC)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from tgplayer.db import Database  # noqa: E402
-from tgplayer.paths import DB_PATH, SESSION_DIR  # noqa: E402
-
 import auth  # noqa: E402
 import config  # noqa: E402
 from services import EncryptionService, TelegramAccountService  # noqa: E402
@@ -66,6 +63,8 @@ def _derive_email(login: str) -> str:
 
 async def _legacy_session_to_string(api_id: str, api_hash: str) -> str | None:
     """Abre o arquivo de sessão legado e exporta a session string."""
+    from tgplayer.paths import SESSION_DIR  # import tardio (evita mkdir cedo)
+
     base = SESSION_DIR / LEGACY_SESSION_NAME
     if not (base.with_suffix(".session").exists()):
         return None
@@ -90,10 +89,30 @@ async def _legacy_session_to_string(api_id: str, api_hash: str) -> str | None:
         return None
 
 
+def _open_legacy_core():
+    """Abre o banco legado do desktop (SQLite) para LER os dados a migrar.
+
+    Só é usado quando existe um SQLite legado gravável; em ambientes sem
+    filesystem (Render), normalmente não há nada legado a migrar e o passo é
+    simplesmente ignorado.
+    """
+    try:
+        from tgplayer.db import Database
+        from tgplayer.paths import DB_PATH
+
+        if not Path(DB_PATH).exists():
+            return None
+        return Database()  # garante schema + acesso a settings legados
+    except Exception as exc:  # noqa: BLE001
+        log.info("Sem banco legado acessível para migração: %s", type(exc).__name__)
+        return None
+
+
 def migrate(dry_run: bool = False) -> dict:
     enc = EncryptionService()  # exige ENCRYPTION_KEY
-    core = Database()  # garante schema do core + acesso a settings
-    web = WebDatabase(str(DB_PATH))
+    # DESTINO da migração: Postgres (Supabase) se houver DATABASE_URL; senão
+    # SQLite local de dev. Nunca depende de /var/data.
+    web = WebDatabase(database_url=config.DATABASE_URL, sqlite_path=config.SQLITE_PATH)
     accounts = TelegramAccountService(web, enc)
 
     report: dict = {
@@ -103,9 +122,17 @@ def migrate(dry_run: bool = False) -> dict:
         "notes": [],
     }
 
+    # FONTE legada (opcional): banco SQLite do desktop.
+    core = _open_legacy_core()
+    if core is None:
+        report["notes"].append(
+            "Nenhum banco legado encontrado — nada a migrar. Os usuários se "
+            "cadastram diretamente pelo site (persistido no Postgres)."
+        )
+
     # 1) Descobrir conta legada (settings) ou env.
-    legacy_user = core.get_setting(LEGACY_USER_KEY)
-    legacy_hash = core.get_setting(LEGACY_HASH_KEY)
+    legacy_user = core.get_setting(LEGACY_USER_KEY) if core else None
+    legacy_hash = core.get_setting(LEGACY_HASH_KEY) if core else None
 
     login = legacy_user or (
         config.ADMIN_EMAIL or "admin"
@@ -144,8 +171,8 @@ def migrate(dry_run: bool = False) -> dict:
             report["created_user"] = email
 
     # 2) Migrar credenciais Telegram (claro -> cifrado).
-    api_id = core.get_setting("api_id")
-    api_hash = core.get_setting("api_hash")
+    api_id = core.get_setting("api_id") if core else None
+    api_hash = core.get_setting("api_hash") if core else None
 
     if user_id != -1:
         acc = accounts.ensure_account(user_id, label="Conta migrada")

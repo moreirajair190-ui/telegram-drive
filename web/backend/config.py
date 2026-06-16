@@ -32,6 +32,32 @@ def _get(key: str, default: str = "") -> str:
     return os.environ.get(key, default)
 
 
+# ---------------------------------------------------------------- banco de dados
+# Em produção (Render Free + Supabase) NÃO há filesystem persistente. Toda a
+# persistência (usuários, credenciais cifradas, sessões, cursos, progresso)
+# vai para o Postgres do Supabase via ``DATABASE_URL``.
+#
+# Aceita ``DATABASE_URL`` ou ``SUPABASE_DB_URL`` no formato:
+#   postgresql://USER:PASSWORD@HOST:5432/postgres?sslmode=require
+#
+# Se NENHUMA estiver definida, caímos para SQLite local (uso desktop/dev). Nesse
+# caso o caminho do arquivo vem de ``TGPLAYER_DATA`` (core) — mas no servidor
+# isso NÃO é necessário nem recomendado.
+DATABASE_URL = _get("DATABASE_URL") or _get("SUPABASE_DB_URL")
+
+# Caminho do SQLite usado APENAS quando NÃO há DATABASE_URL (dev/desktop local).
+# Em produção (Render Free) NUNCA usamos este caminho — a persistência vai
+# inteira para o Postgres. O padrão fica ao lado do backend (gravável em dev) e
+# JAMAIS aponta para /var/data. Configurável via TGWEB_SQLITE_PATH.
+SQLITE_PATH = _get(
+    "TGWEB_SQLITE_PATH",
+    str(Path(__file__).resolve().parent / "tgplayer_web.sqlite3"),
+)
+
+# Cache de streaming é SEMPRE efêmero (buffer temporário de bytes do vídeo).
+# Em produção fica em /tmp (some no restart, e tudo bem). Configurável.
+STREAM_CACHE_DIR = _get("TGWEB_STREAM_CACHE_DIR", "/tmp/tgplayer-streams")
+
 # ---------------------------------------------------------------- criptografia
 # Aceita ENCRYPTION_KEY (uma) ou ENCRYPTION_KEYS (várias, p/ rotação).
 # Se nenhuma estiver definida, geramos uma EFÊMERA apenas em dev (com aviso),

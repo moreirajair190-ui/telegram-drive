@@ -89,15 +89,18 @@ class TelegramAuthService:
         self,
         accounts: TelegramAccountService,
         enc: EncryptionService,
-        cache_dir: Path,
+        cache_dir: str | Path,
         core_db: Any = None,
     ) -> None:
         self.accounts = accounts
         self.enc = enc
-        self.core_db = core_db  # Database do core (cache moov etc.), opcional.
-        self.cache_dir = Path(cache_dir)
-        self.stream_cache_dir = self.cache_dir / "streams"
-        self.stream_cache_dir.mkdir(parents=True, exist_ok=True)
+        self.core_db = core_db  # Banco do core (cache moov etc.), opcional.
+        # IMPORTANTE: este diretório é EFÊMERO — apenas buffer temporário de
+        # bytes do vídeo durante o streaming. NÃO é persistência. Em produção
+        # (Render Free) fica em /tmp e pode sumir no restart sem qualquer perda.
+        # Se o caminho indicado não for gravável, caímos para /tmp como rede de
+        # segurança, garantindo que o servidor SEMPRE suba.
+        self.stream_cache_dir = self._resolve_stream_cache_dir(cache_dir)
 
         self.loop = asyncio.new_event_loop()
         self.thread = threading.Thread(
@@ -113,6 +116,31 @@ class TelegramAuthService:
         self.port: int | None = None
         self.sessions: dict[str, Any] = {}
         self.session_meta: dict[str, dict[str, Any]] = {}
+
+    @staticmethod
+    def _resolve_stream_cache_dir(cache_dir: str | Path) -> Path:
+        """Garante um diretório de cache de streaming GRAVÁVEL e EFÊMERO.
+
+        Tenta o caminho indicado (ex.: ``/tmp/tgplayer-streams``). Se já vier
+        terminando em ``streams`` usamos como está; senão, criamos um subdir
+        ``streams``. Em caso de ``PermissionError`` (filesystem read-only),
+        caímos para ``/tmp/tgplayer-streams`` — nunca derrubamos o servidor por
+        causa de um diretório de cache temporário.
+        """
+        candidate = Path(cache_dir)
+        if candidate.name != "streams":
+            candidate = candidate / "streams"
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            return candidate
+        except OSError:
+            fallback = Path("/tmp/tgplayer-streams/streams")
+            fallback.mkdir(parents=True, exist_ok=True)
+            log.warning(
+                "Cache de streaming %s não gravável; usando %s (efêmero).",
+                candidate, fallback,
+            )
+            return fallback
 
     # ------------------------------------------------------------------ loop
     def _run_loop(self) -> None:

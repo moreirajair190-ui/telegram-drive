@@ -42,12 +42,16 @@ Importante: NENHUM dado sensível é gravado em claro aqui. O serviço de conta
 
 from __future__ import annotations
 
-import sqlite3
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterator
+
+try:  # import absoluto/relativo conforme o modo de execução
+    from services.db_backend import Db, make_db
+except Exception:  # noqa: BLE001
+    from .db_backend import Db, make_db  # type: ignore[no-redef]
 
 __all__ = ["WebDatabase", "User", "TelegramAccount"]
 
@@ -83,24 +87,23 @@ class TelegramAccount:
 
 
 class WebDatabase:
-    """Acesso às tabelas multiusuário. Compartilha o arquivo SQLite do core."""
+    """Acesso às tabelas multiusuário.
 
-    def __init__(self, path: str) -> None:
-        self.path = str(path)
+    Persistência via Postgres (Supabase) quando há ``DATABASE_URL``; senão
+    SQLite local (dev/desktop). Compatível com Render Free (sem disco).
+    """
+
+    def __init__(self, db: Db | None = None, *, database_url: str | None = None,
+                 sqlite_path: str | None = None) -> None:
+        # Aceita um backend pronto OU constrói a partir de URL/caminho.
+        self.db: Db = db if db is not None else make_db(database_url, sqlite_path)
         self.init()
 
     # ------------------------------------------------------------------ conexão
     @contextmanager
-    def connect(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(self.path, timeout=5.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA busy_timeout=4000")
-        try:
+    def connect(self) -> Iterator[Any]:
+        with self.db.connect() as conn:
             yield conn
-            conn.commit()
-        finally:
-            conn.close()
 
     @staticmethod
     def now() -> str:
@@ -108,13 +111,13 @@ class WebDatabase:
 
     # ------------------------------------------------------------------ schema
     def init(self) -> None:
+        pk = self.db.autoincrement_pk
+        real = self.db.real_type
         with self.connect() as conn:
             conn.executescript(
-                """
-                PRAGMA journal_mode=WAL;
-
+                f"""
                 CREATE TABLE IF NOT EXISTS users (
-                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id            {pk},
                     email         TEXT NOT NULL UNIQUE,
                     password_hash TEXT NOT NULL,
                     is_admin      INTEGER NOT NULL DEFAULT 0,
@@ -126,29 +129,28 @@ class WebDatabase:
                 CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
 
                 CREATE TABLE IF NOT EXISTS telegram_accounts (
-                    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id            INTEGER NOT NULL,
+                    id                 {pk},
+                    user_id            BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                     label              TEXT,
                     encrypted_api_id   TEXT,
                     encrypted_api_hash TEXT,
                     encrypted_session  TEXT,
                     encrypted_phone    TEXT,
-                    tg_user_id         INTEGER,
+                    tg_user_id         BIGINT,
                     tg_username        TEXT,
                     tg_first_name      TEXT,
                     status             TEXT NOT NULL DEFAULT 'disconnected',
                     last_sync_at       TEXT,
                     created_at         TEXT NOT NULL,
-                    updated_at         TEXT,
-                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                    updated_at         TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_tgacc_user ON telegram_accounts(user_id);
 
                 CREATE TABLE IF NOT EXISTS login_attempts (
-                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id          {pk},
                     identifier  TEXT NOT NULL,
                     success     INTEGER NOT NULL DEFAULT 0,
-                    created_at  REAL NOT NULL
+                    created_at  {real} NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_login_attempts_id ON login_attempts(identifier, created_at);
                 """
@@ -314,7 +316,7 @@ class WebDatabase:
 
     # ------------------------------------------------------------ row -> objeto
     @staticmethod
-    def _row_to_user(row: sqlite3.Row) -> User:
+    def _row_to_user(row: Any) -> User:
         d = dict(row)
         return User(
             id=int(d["id"]),
@@ -328,7 +330,7 @@ class WebDatabase:
         )
 
     @staticmethod
-    def _row_to_account(row: sqlite3.Row) -> TelegramAccount:
+    def _row_to_account(row: Any) -> TelegramAccount:
         d = dict(row)
         return TelegramAccount(
             id=int(d["id"]),

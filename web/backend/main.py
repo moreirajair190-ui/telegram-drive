@@ -46,9 +46,6 @@ from fastapi.responses import (  # noqa: E402
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer  # noqa: E402
 from pydantic import BaseModel  # noqa: E402
 
-from tgplayer.db import Database  # noqa: E402
-from tgplayer.paths import CACHE_DIR, DB_PATH  # noqa: E402
-
 import auth  # noqa: E402
 import config  # noqa: E402
 from services import (  # noqa: E402
@@ -57,6 +54,7 @@ from services import (  # noqa: E402
     TelegramAuthService,
 )
 from services.telegram_auth import SessionRevokedError  # noqa: E402
+from services.web_core_db import WebCoreDatabase  # noqa: E402
 from services.web_db import User, WebDatabase  # noqa: E402
 
 logging.basicConfig(
@@ -78,7 +76,7 @@ app.add_middleware(
 )
 
 # Recursos globais (instanciados no startup).
-core_db: Database = None  # type: ignore[assignment]
+core_db: WebCoreDatabase = None  # type: ignore[assignment]
 web_db: WebDatabase = None  # type: ignore[assignment]
 enc: EncryptionService = None  # type: ignore[assignment]
 accounts: TelegramAccountService = None  # type: ignore[assignment]
@@ -104,10 +102,20 @@ async def _startup() -> None:
         else:
             raise
 
-    core_db = Database()
-    web_db = WebDatabase(str(DB_PATH))
+    # Persistência SEM filesystem persistente: Postgres (Supabase) quando há
+    # DATABASE_URL; caso contrário, SQLite local apenas para dev/desktop.
+    # NUNCA dependemos de /var/data nem de TGPLAYER_DATA no servidor.
+    core_db = WebCoreDatabase(
+        database_url=config.DATABASE_URL, sqlite_path=config.SQLITE_PATH
+    )
+    web_db = WebDatabase(
+        database_url=config.DATABASE_URL, sqlite_path=config.SQLITE_PATH
+    )
     accounts = TelegramAccountService(web_db, enc)
-    tg = TelegramAuthService(accounts, enc, CACHE_DIR, core_db=core_db)
+    # Cache de streaming é EFÊMERO (buffer temporário em /tmp). Não é persistência.
+    tg = TelegramAuthService(
+        accounts, enc, config.STREAM_CACHE_DIR, core_db=core_db
+    )
 
     # Provisiona admin a partir do .env (uma única vez).
     if config.ADMIN_EMAIL and config.ADMIN_PASSWORD:
