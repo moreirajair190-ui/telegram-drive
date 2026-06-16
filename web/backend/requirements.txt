@@ -6,6 +6,10 @@ pydantic>=2.6
 # Criptografia em repouso (Fernet) das credenciais/sessões do Telegram
 cryptography>=42.0
 
+# Banco de dados Postgres (Supabase) — persistência sem filesystem local.
+# psycopg v3 com binário embutido (não exige libpq do sistema no Render Free).
+psycopg[binary]>=3.1
+
 # Núcleo herdado do app desktop
 pyrogram>=2.0
 TgCrypto>=1.2.5
