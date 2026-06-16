@@ -13,6 +13,37 @@
 
     base(path) { return API_BASE + path; },
 
+    /*
+     * Lê o corpo de uma Response UMA ÚNICA VEZ.
+     *
+     * Regra de ouro do Fetch API: o body é um ReadableStream que só pode ser
+     * consumido uma vez. Chamar res.json() e depois res.text() (ou vice-versa)
+     * na MESMA Response dispara erros como:
+     *   - "Response.text: Body has already been consumed"  (Firefox)
+     *   - "Body stream already read" / "body stream already read" (Chrome)
+     *   - "Failed to execute 'text' on 'Response': body stream already read"
+     *   - "ReadableStream locked" / "Cannot read body after it has been consumed"
+     *
+     * Por isso lemos SEMPRE como texto (uma leitura só) e tentamos converter
+     * para JSON em memória. Assim nunca tocamos no stream mais de uma vez.
+     * Retorna: { text, json } onde json é null quando não for JSON válido.
+     */
+    async _readBodyOnce(res) {
+      let text = "";
+      try {
+        text = await res.text();
+      } catch (e) {
+        // Stream indisponível/abortado: degrada para corpo vazio em vez de quebrar.
+        return { text: "", json: null };
+      }
+      let json = null;
+      const ct = (res.headers.get("content-type") || "").toLowerCase();
+      if (text && (ct.includes("application/json") || text.trimStart()[0] === "{" || text.trimStart()[0] === "[")) {
+        try { json = JSON.parse(text); } catch (e) { json = null; }
+      }
+      return { text, json };
+    },
+
     async request(method, path, body) {
       const headers = { "Content-Type": "application/json" };
       if (this.token) headers["Authorization"] = "Bearer " + this.token;
@@ -21,27 +52,35 @@
         headers,
         body: body != null ? JSON.stringify(body) : undefined,
       });
+
+      // Lê o corpo UMA só vez, independentemente do status. Tudo (sucesso,
+      // 401 e demais erros) reaproveita este resultado em memória.
+      const { text, json } = await this._readBodyOnce(res);
+
       if (res.status === 401) {
-        const txt = await res.text().catch(() => "");
         // session_revoked é tratado pela UI; token expirado desloga.
-        if (!txt.includes("session_revoked")) {
+        if (!text.includes("session_revoked")) {
           this.token = "";
           window.dispatchEvent(new CustomEvent("tgweb:logout"));
         }
-        const err = new Error(txt || "Não autenticado");
+        const detail = (json && (json.detail || json.message || json.error)) || text;
+        const err = new Error(detail || "Não autenticado");
         err.status = 401;
-        err.body = txt;
+        // err.body mantém o texto cru para o app.js detectar "session_revoked".
+        err.body = text;
         throw err;
       }
+
       if (!res.ok) {
-        let detail = "";
-        try { detail = (await res.json()).detail; } catch (e) { detail = await res.text(); }
+        const detail = (json && (json.detail || json.message || json.error)) || text;
         const err = new Error(detail || ("Erro " + res.status));
         err.status = res.status;
+        err.body = text;
         throw err;
       }
-      const ct = res.headers.get("content-type") || "";
-      return ct.includes("application/json") ? res.json() : res.text();
+
+      // Sucesso: devolve JSON quando houver, senão o texto cru.
+      return json != null ? json : text;
     },
 
     get(p) { return this.request("GET", p); },
