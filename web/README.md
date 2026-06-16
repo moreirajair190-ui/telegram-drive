@@ -1,7 +1,13 @@
 # TgPlayer Web 🎬
 
-Versão **web** do TgPlayer: um painel bonito, com login/senha fixo, que se conecta
-à **sua** conta do Telegram para organizar e assistir suas videoaulas.
+Versão **web** do TgPlayer: uma plataforma **multiusuário** onde **cada usuário**
+cria sua conta e conecta a **sua própria** conta do Telegram (API ID/HASH
+próprios). Todas as credenciais sensíveis são **cifradas** (Fernet) em repouso e
+o administrador **não** tem acesso a elas.
+
+> 📦 **Deploy**: veja [`DEPLOY.md`](./DEPLOY.md) (Cloudflare Pages + Render).
+> 🔐 **Segurança & entregáveis**: veja [`SECURITY.md`](./SECURITY.md)
+> (diagnóstico, vulnerabilidades corrigidas e checklist de produção).
 
 Os vídeos podem ser abertos de duas formas:
 

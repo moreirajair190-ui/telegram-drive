@@ -5,6 +5,7 @@
   const app = document.getElementById("app");
   const State = {
     view: "dashboard",
+    user: null,
     courses: [],
     currentCourse: null,
     subjects: [],
@@ -41,6 +42,14 @@
     return `${n.toFixed(n < 10 && i > 0 ? 1 : 0)} ${u[i]}`;
   }
   function fmtHrs(sec) { return (sec / 3600).toFixed(1).replace(".0", "") + "h"; }
+  function fmtBytes(n) {
+    n = Number(n) || 0;
+    if (n < 1024) return n + " B";
+    const units = ["KB", "MB", "GB", "TB"];
+    let i = -1;
+    do { n /= 1024; i++; } while (n >= 1024 && i < units.length - 1);
+    return n.toFixed(n >= 10 || i === 0 ? 0 : 1) + " " + units[i];
+  }
   function kindLabel(c) {
     if (c.is_forum) return "🗂️ Fórum";
     if ((c.chat_type || "").toUpperCase() === "CHANNEL") return "📢 Canal";
@@ -59,7 +68,8 @@
   }
 
   // ================================================================ LOGIN
-  function renderLogin(errMsg) {
+  function renderLogin(errMsg, st) {
+    const canRegister = !st || st.registration_open !== false;
     app.innerHTML = "";
     const card = h(`
       <div class="login-wrap">
@@ -70,8 +80,8 @@
           ${errMsg ? `<div class="login-err">${esc(errMsg)}</div>` : ""}
           <form id="loginForm">
             <div class="field">
-              <label>Usuário</label>
-              <input id="lu" type="text" autocomplete="username" placeholder="seu usuário" required />
+              <label>E-mail</label>
+              <input id="lu" type="email" autocomplete="username" placeholder="voce@exemplo.com" required />
             </div>
             <div class="field">
               <label>Senha</label>
@@ -79,17 +89,19 @@
             </div>
             <button class="btn btn-primary btn-block btn-lg" type="submit">Entrar</button>
           </form>
-          <p class="login-hint">Não tem conta ainda? <a href="#" id="goSetup">Criar conta</a></p>
+          ${canRegister ? `<p class="login-hint">Não tem conta ainda? <a href="#" id="goSetup">Criar conta</a></p>` : ""}
         </div>
       </div>`);
     app.appendChild(card);
-    $("#goSetup").addEventListener("click", (e) => { e.preventDefault(); renderSetup(); });
+    const goSetup = $("#goSetup");
+    if (goSetup) goSetup.addEventListener("click", (e) => { e.preventDefault(); renderRegister(); });
     $("#loginForm").addEventListener("submit", async (e) => {
       e.preventDefault();
       const btn = $("#loginForm button[type=submit]"); btn.disabled = true; btn.textContent = "Entrando...";
       try {
         const r = await api.login($("#lu").value.trim(), $("#lp").value);
         api.token = r.token;
+        State.user = r.user || null;
         await boot();
       } catch (err) {
         renderLogin(err.message || "Falha no login");
@@ -98,40 +110,30 @@
   }
 
   // ================================================================ CRIAR CONTA
-  function renderSetup(errMsg) {
+  // Cadastro apenas com e-mail + senha. Os dados do Telegram (API ID/HASH) são
+  // informados DEPOIS, já logado, na conexão da conta — cada usuário usa a SUA
+  // própria conta Telegram e suas credenciais são SEMPRE cifradas no servidor.
+  function renderRegister(errMsg) {
     app.innerHTML = "";
     const card = h(`
       <div class="login-wrap">
-        <div class="login-card login-card-wide">
+        <div class="login-card">
           <div class="login-logo">▶</div>
           <h1>Criar sua conta</h1>
-          <p class="sub">Defina um login e senha para acessar o site, e conecte os dados da sua conta do Telegram.</p>
+          <p class="sub">Crie seu acesso à plataforma. Depois você conectará sua própria conta do Telegram.</p>
           ${errMsg ? `<div class="login-err">${esc(errMsg)}</div>` : ""}
           <form id="setupForm">
             <div class="field">
-              <label>Usuário (login do site)</label>
-              <input id="su" type="text" autocomplete="username" placeholder="ex.: joao" minlength="3" required />
+              <label>E-mail</label>
+              <input id="su" type="email" autocomplete="username" placeholder="voce@exemplo.com" required />
             </div>
             <div class="field">
-              <label>Senha (mín. 6 caracteres)</label>
-              <input id="sp" type="password" autocomplete="new-password" placeholder="••••••••" minlength="6" required />
+              <label>Senha (mín. 8 caracteres, com letras e números)</label>
+              <input id="sp" type="password" autocomplete="new-password" placeholder="••••••••" minlength="8" required />
             </div>
             <div class="field">
               <label>Confirmar senha</label>
-              <input id="sp2" type="password" autocomplete="new-password" placeholder="••••••••" minlength="6" required />
-            </div>
-            <div class="setup-divider"><span>Dados do Telegram (opcional agora)</span></div>
-            <p class="setup-note">
-              Pegue em <a href="https://my.telegram.org" target="_blank" rel="noopener">my.telegram.org</a> →
-              <em>API development tools</em>. Você pode deixar em branco e preencher depois.
-            </p>
-            <div class="field">
-              <label>API ID</label>
-              <input id="sapi" type="text" inputmode="numeric" placeholder="123456" />
-            </div>
-            <div class="field">
-              <label>API HASH</label>
-              <input id="shash" type="text" placeholder="abcdef0123456789abcdef0123456789" />
+              <input id="sp2" type="password" autocomplete="new-password" placeholder="••••••••" minlength="8" required />
             </div>
             <button class="btn btn-primary btn-block btn-lg" type="submit">Criar conta e entrar</button>
           </form>
@@ -145,19 +147,18 @@
       const u = $("#su").value.trim();
       const p = $("#sp").value;
       const p2 = $("#sp2").value;
-      const apiId = $("#sapi").value.trim();
-      const apiHash = $("#shash").value.trim();
-      if (u.length < 3) return renderSetup("Usuário precisa ter ao menos 3 caracteres.");
-      if (p.length < 6) return renderSetup("Senha precisa ter ao menos 6 caracteres.");
-      if (p !== p2) return renderSetup("As senhas não coincidem.");
+      if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(u)) return renderRegister("E-mail inválido.");
+      if (p.length < 8) return renderRegister("Senha precisa ter ao menos 8 caracteres.");
+      if (p !== p2) return renderRegister("As senhas não coincidem.");
       const btn = $("#setupForm button[type=submit]"); btn.disabled = true; btn.textContent = "Criando...";
       try {
-        const r = await api.setup(u, p, apiId, apiHash);
+        const r = await api.register(u, p);
         api.token = r.token;
-        toast("Conta criada com sucesso!", "ok");
+        State.user = r.user || null;
+        toast("Conta criada! Agora conecte seu Telegram.", "ok");
         await boot();
       } catch (err) {
-        renderSetup(err.message || "Falha ao criar conta");
+        renderRegister(err.message || "Falha ao criar conta");
       }
     });
   }
@@ -181,6 +182,7 @@
           </div>
           <nav class="nav">
             ${NAV.map((n) => `<button class="nav-item ${State.view === n.id ? "active" : ""}" data-view="${n.id}"><span class="ic">${n.ic}</span>${n.label}</button>`).join("")}
+            ${State.user && State.user.is_admin ? `<button class="nav-item ${State.view === "admin" ? "active" : ""}" data-view="admin"><span class="ic">🛡️</span>Administração</button>` : ""}
           </nav>
           <div class="sidebar-foot">
             <div class="tg-status" id="tgStatus">
@@ -232,6 +234,78 @@
     if (State.view === "dashboard") renderDashboard();
     else if (State.view === "courses") renderCourses();
     else if (State.view === "files") renderFiles();
+    else if (State.view === "admin") renderAdmin();
+  }
+
+  // ================================================================ ADMIN
+  // Painel administrativo. Mostra APENAS dados não sensíveis: conta conectada,
+  // última sincronização, status, contagem de arquivos e espaço usado.
+  // NUNCA exibe API_ID, API_HASH, session string, telefone ou tokens.
+  async function renderAdmin() {
+    setTitle("Administração", false);
+    const c = $("#content"); loading(c);
+    if (!(State.user && State.user.is_admin)) {
+      c.innerHTML = `<div class="empty"><div class="big">🔒</div><h3>Acesso restrito</h3><p class="muted">Você não tem permissão para ver esta página.</p></div>`;
+      return;
+    }
+    let data;
+    try { data = await api.adminOverview(); }
+    catch (e) { c.innerHTML = `<div class="empty"><div class="big">🛡️</div><h3>Não foi possível carregar</h3><p class="muted">${esc(e.message)}</p></div>`; return; }
+
+    const statusLabel = (s, connected) => connected ? "🟢 Conectada" : (s === "pending" ? "🟡 Pendente" : "⚪ Desconectada");
+
+    const rows = data.users.map((u) => {
+      const accs = (u.accounts || []);
+      const accHtml = accs.length
+        ? accs.map((a) => `
+            <div class="admin-acc">
+              <div class="admin-acc-head">
+                <b>${esc(a.label || a.tg_username || a.tg_first_name || ("Conta #" + a.id))}</b>
+                <span class="badge">${statusLabel(a.status, a.connected)}</span>
+              </div>
+              <div class="admin-acc-meta muted">
+                <span>📁 ${a.files || 0} arquivos</span>
+                <span>💾 ${fmtBytes(a.bytes_used || 0)}</span>
+                <span>🔄 ${a.last_sync_at ? esc(a.last_sync_at) : "nunca sincronizado"}</span>
+              </div>
+            </div>`).join("")
+        : `<div class="muted" style="font-size:13px">Nenhuma conta do Telegram conectada.</div>`;
+      return `
+        <div class="admin-card">
+          <div class="admin-user-head">
+            <div>
+              <div style="font-weight:700">${esc(u.email)} ${u.is_admin ? '<span class="badge">admin</span>' : ""}</div>
+              <div class="muted" style="font-size:12.5px">Criado: ${esc(u.created_at || "—")} • Último acesso: ${esc(u.last_login_at || "—")}</div>
+            </div>
+            <label class="admin-toggle">
+              <input type="checkbox" data-uid="${u.id}" ${u.is_active ? "checked" : ""} ${u.is_admin ? "disabled" : ""} />
+              <span>${u.is_active ? "Ativo" : "Inativo"}</span>
+            </label>
+          </div>
+          <div class="admin-accs">${accHtml}</div>
+        </div>`;
+    }).join("");
+
+    c.innerHTML = `
+      <div class="metrics">
+        <div class="metric"><div class="label">👥 Usuários</div><div class="value">${data.users_count}</div></div>
+        <div class="metric"><div class="label">📲 Contas Telegram</div><div class="value">${data.accounts_count}</div></div>
+      </div>
+      <div class="admin-note muted" style="margin:8px 0 18px;font-size:13px">
+        🔐 Por privacidade, este painel <b>não</b> exibe API ID, API HASH, session string, telefone ou tokens. Esses dados ficam cifrados no servidor.
+      </div>
+      <div class="admin-list">${rows || '<div class="empty"><div class="big">👤</div><h3>Sem usuários</h3></div>'}</div>`;
+
+    c.querySelectorAll(".admin-toggle input[data-uid]").forEach((cb) => {
+      cb.addEventListener("change", async () => {
+        const uid = Number(cb.dataset.uid);
+        try {
+          await api.adminSetActive(uid, cb.checked);
+          toast(cb.checked ? "Usuário ativado" : "Usuário desativado", "ok");
+          renderAdmin();
+        } catch (e) { toast(e.message, "err"); cb.checked = !cb.checked; }
+      });
+    });
   }
 
   function loading(el) { el.innerHTML = `<div class="spinner"></div>`; }
@@ -674,9 +748,9 @@
         const id = body.querySelector("#apiId").value.trim(), hash = body.querySelector("#apiHash").value.trim();
         if (!id || !hash) return toast("Preencha API ID e API HASH", "err");
         try {
-          const r = await api.tgCredentials(id, hash);
-          if (r.authorized) { toast("Conectado ✓", "ok"); closeModal(bk); refreshTgStatus(); return; }
-          renderTgStep(body, bk, "phone");
+          // Credenciais são cifradas no servidor. Em seguida, login por telefone.
+          await api.tgCredentials(id, hash, ctx.account_id);
+          renderTgStep(body, bk, "phone", ctx);
         } catch (e) { toast(e.message, "err"); }
       });
     } else if (step === "phone") {
@@ -688,9 +762,9 @@
       body.querySelector("#next").addEventListener("click", async () => {
         const phone = body.querySelector("#phone").value.trim();
         try {
-          const r = await api.tgSendCode(phone);
+          const r = await api.tgSendCode(phone, ctx.account_id);
           if (r.flood_wait) return toast(`Aguarde ${Math.ceil(r.flood_wait / 60)} min antes de pedir outro código.`, "err");
-          renderTgStep(body, bk, "code");
+          renderTgStep(body, bk, "code", ctx);
         } catch (e) { toast(e.message, "err"); }
       });
     } else if (step === "code") {
@@ -700,8 +774,8 @@
         <button class="btn btn-primary btn-block" id="next">Confirmar</button>`;
       body.querySelector("#next").addEventListener("click", async () => {
         try {
-          const r = await api.tgSignIn(body.querySelector("#code").value.trim());
-          if (r.needs_password) return renderTgStep(body, bk, "password");
+          const r = await api.tgSignIn(body.querySelector("#code").value.trim(), ctx.account_id);
+          if (r.needs_password) return renderTgStep(body, bk, "password", ctx);
           if (r.authorized) { toast("Conectado ✓", "ok"); closeModal(bk); refreshTgStatus(); }
         } catch (e) { toast(e.message, "err"); }
       });
@@ -712,7 +786,7 @@
         <button class="btn btn-primary btn-block" id="next">Confirmar</button>`;
       body.querySelector("#next").addEventListener("click", async () => {
         try {
-          const r = await api.tgPassword(body.querySelector("#pw2").value);
+          const r = await api.tgPassword(body.querySelector("#pw2").value, ctx.account_id);
           if (r.authorized) { toast("Conectado ✓", "ok"); closeModal(bk); refreshTgStatus(); }
         } catch (e) { toast(e.message, "err"); }
       });
@@ -792,8 +866,15 @@
 
   // ================================================================ BOOT
   async function boot() {
+    // Carrega o usuário atual (para saber se é admin) e o status do Telegram.
+    try {
+      const m = await api.me();
+      State.user = m.user || null;
+    } catch (e) {
+      if (e.status === 401) { api.token = ""; return startAuth(); }
+    }
     try { State.tg = await api.tgStatus(); }
-    catch (e) { if (e.status === 401) return startAuth(); State.tg = { connected: false, has_credentials: false }; }
+    catch (e) { if (e.status === 401) { api.token = ""; return startAuth(); } State.tg = { connected: false, has_credentials: false }; }
     renderShell();
   }
 
@@ -803,8 +884,8 @@
   async function startAuth() {
     try {
       const st = await api.authState();
-      if (st.account_exists) renderLogin();
-      else renderSetup();
+      if (!st.has_users && st.registration_open) renderRegister();
+      else renderLogin(null, st);
     } catch (e) {
       // Se nem o estado conseguimos buscar, mostra login (backend offline mostra erro).
       renderLogin();

@@ -1,17 +1,17 @@
-"""TgPlayer Web — Backend FastAPI.
+"""TgPlayer Web — Backend FastAPI (MULTIUSUÁRIO).
 
-Reaproveita a lógica do app desktop (`src/tgplayer`):
-- `Database`        -> mesmo banco SQLite (cursos, matérias, aulas, progresso,
-                       pomodoro, tarefas, estatísticas).
-- `TelegramService` -> login na SUA conta, sincronização, streaming HTTP e
-                       geração de links tg:// / t.me.
+Cada usuário:
+- cria sua conta (e-mail + senha) na plataforma;
+- informa o SEU próprio API_ID / API_HASH (https://my.telegram.org);
+- recebe o código do Telegram e confirma o login;
+- tem sua sessão vinculada APENAS à própria conta (nada compartilhado).
 
-Expõe uma API REST protegida por JWT (login/senha fixo) e serve o frontend.
-
-Para abrir os vídeos, o frontend usa:
-- ▶ "Assistir no navegador": player HTML5 que consome /api/stream/... (proxy
-  para o streaming local do TelegramService).
-- 📲 "Abrir no Telegram (64Gram/Desktop)": deep link tg:// gerado pelo backend.
+Segurança:
+- Dados sensíveis (API_ID/HASH/session/telefone) são SEMPRE cifrados no banco
+  via ``EncryptionService`` (Fernet) com a chave ``ENCRYPTION_KEY``.
+- JWT por usuário, expiração de sessão, rate limiting e proteção brute-force.
+- Sanitização de exceções (nenhum traceback/segredo é devolvido ao cliente).
+- Painel administrativo NÃO expõe API_ID/HASH/session/tokens.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-# Garante que `src/` (pacote tgplayer) esteja no path, esteja onde estiver.
+# Garante que `src/` (pacote tgplayer) esteja no path.
 _THIS = Path(__file__).resolve()
 _REPO_ROOT = _THIS.parents[2]
 _SRC = _REPO_ROOT / "src"
@@ -40,23 +40,29 @@ from fastapi.responses import (  # noqa: E402
     StreamingResponse,
 )
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer  # noqa: E402
-from fastapi.staticfiles import StaticFiles  # noqa: E402
 from pydantic import BaseModel  # noqa: E402
 
 from tgplayer.db import Database  # noqa: E402
-from tgplayer.telegram_service import SessionRevokedError, TelegramService  # noqa: E402
+from tgplayer.paths import CACHE_DIR, DB_PATH  # noqa: E402
 
 from . import auth, config  # noqa: E402
+from .services import (  # noqa: E402
+    EncryptionService,
+    TelegramAccountService,
+    TelegramAuthService,
+)
+from .services.telegram_auth import SessionRevokedError  # noqa: E402
+from .services.web_db import User, WebDatabase  # noqa: E402
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+)
 log = logging.getLogger("tgplayer.web")
 
 FRONTEND_DIR = _THIS.parent.parent / "frontend"
 
-app = FastAPI(title="TgPlayer Web", version="1.0.0")
-# Auth é via Bearer token (não cookies), então não precisamos de credentials.
-# E "allow_origins=['*']" com "allow_credentials=True" é rejeitado pelos browsers,
-# por isso só ligamos credentials quando há origens específicas listadas.
+app = FastAPI(title="TgPlayer Web (multiusuário)", version="2.0.0")
+
 _cors_wildcard = "*" in config.CORS_ORIGINS
 app.add_middleware(
     CORSMiddleware,
@@ -67,86 +73,148 @@ app.add_middleware(
 )
 
 # Recursos globais (instanciados no startup).
-db: Database = None  # type: ignore[assignment]
-service: TelegramService = None  # type: ignore[assignment]
+core_db: Database = None  # type: ignore[assignment]
+web_db: WebDatabase = None  # type: ignore[assignment]
+enc: EncryptionService = None  # type: ignore[assignment]
+accounts: TelegramAccountService = None  # type: ignore[assignment]
+tg: TelegramAuthService = None  # type: ignore[assignment]
 bearer = HTTPBearer(auto_error=False)
 
 
 # =========================================================== ciclo de vida
 @app.on_event("startup")
 async def _startup() -> None:
-    global db, service
-    db = Database()
-    service = TelegramService(db=db)
+    global core_db, web_db, enc, accounts, tg
 
-    # Reaproveita API ID/HASH: prioridade para env; senão usa o que já está
-    # salvo no banco do app desktop.
-    api_id = config.TELEGRAM_API_ID or db.get_setting("api_id") or ""
-    api_hash = config.TELEGRAM_API_HASH or db.get_setting("api_hash") or ""
-    if api_id and api_hash:
-        db.set_setting("api_id", str(api_id))
-        db.set_setting("api_hash", str(api_hash))
-        try:
-            fut = service.call(service.ensure_connected(api_id, api_hash))
-            result = await asyncio.wrap_future(fut)
-            log.info("Telegram: %s", "conectado" if result.get("authorized") else "aguardando login")
-        except Exception:  # noqa: BLE001
-            log.exception("Falha ao conectar no Telegram no startup (seguindo mesmo assim)")
-    else:
-        log.warning("Sem API ID/HASH configurados — defina em web/backend/.env ou faça login.")
+    # Criptografia — obrigatória. Em dev pode-se permitir chave efêmera.
+    try:
+        enc = EncryptionService()
+    except RuntimeError:
+        if config.ALLOW_EPHEMERAL_ENCRYPTION:
+            log.warning(
+                "ENCRYPTION_KEY ausente — usando chave EFÊMERA (apenas DEV). "
+                "Dados cifrados se tornarão ilegíveis após reiniciar!"
+            )
+            enc = EncryptionService(keys=[EncryptionService.generate_key()])
+        else:
+            raise
+
+    core_db = Database()
+    web_db = WebDatabase(str(DB_PATH))
+    accounts = TelegramAccountService(web_db, enc)
+    tg = TelegramAuthService(accounts, enc, CACHE_DIR, core_db=core_db)
+
+    # Provisiona admin a partir do .env (uma única vez).
+    if config.ADMIN_EMAIL and config.ADMIN_PASSWORD:
+        if not web_db.get_user_by_email(config.ADMIN_EMAIL):
+            try:
+                auth.register_user(
+                    web_db, config.ADMIN_EMAIL, config.ADMIN_PASSWORD, is_admin=True
+                )
+                log.info("Administrador inicial provisionado: %s", config.ADMIN_EMAIL)
+            except auth.AuthError as exc:
+                log.warning("Não foi possível provisionar admin: %s", exc)
+
+    web_db.prune_login_attempts()
 
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
     try:
-        service.stop()
+        tg.stop()
     except Exception:  # noqa: BLE001
         pass
 
 
+# =========================================================== sanitização global
+@app.exception_handler(Exception)
+async def _sanitize_exceptions(request: Request, exc: Exception) -> Response:
+    """Nunca devolve traceback/segredo ao cliente; loga o detalhe no servidor."""
+    if isinstance(exc, HTTPException):
+        return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+    log.exception("Erro não tratado em %s %s", request.method, request.url.path)
+    return JSONResponse({"detail": "Erro interno do servidor."}, status_code=500)
+
+
 # =========================================================== helpers
-async def _call(coro) -> Any:
-    """Executa uma corrotina no event loop do TelegramService e aguarda."""
-    return await asyncio.wrap_future(service.call(coro))
+async def _call_tg(coro) -> Any:
+    return await asyncio.wrap_future(tg.call(coro))
 
 
-def require_auth(creds: HTTPAuthorizationCredentials = Depends(bearer)) -> str:
+def _client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else ""
+
+
+def require_user(creds: HTTPAuthorizationCredentials = Depends(bearer)) -> User:
     if creds is None or not creds.credentials:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Não autenticado")
     payload = auth.verify_token(creds.credentials)
     if not payload:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Token inválido ou expirado")
-    return str(payload.get("sub"))
+    try:
+        user_id = int(payload.get("sub"))
+    except (TypeError, ValueError):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Token inválido")
+    user = web_db.get_user(user_id)
+    if not user or not user.is_active:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Conta inexistente ou inativa")
+    return user
+
+
+def require_admin(user: User = Depends(require_user)) -> User:
+    if not user.is_admin:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Acesso restrito a administradores")
+    return user
+
+
+def _resolve_account(user: User, account_id: int | None):
+    """Retorna a conta Telegram do usuário (a indicada, ou a primeira)."""
+    if account_id is not None:
+        acc = accounts.get_owned(account_id, user.id)
+        if not acc:
+            raise HTTPException(404, "Conta Telegram não encontrada")
+        return acc
+    acc = accounts.ensure_account(user.id)
+    return acc
 
 
 # =========================================================== modelos
+class RegisterIn(BaseModel):
+    email: str
+    password: str
+
+
 class LoginIn(BaseModel):
-    username: str
+    email: str
     password: str
-
-
-class SetupIn(BaseModel):
-    username: str
-    password: str
-    api_id: str | None = None
-    api_hash: str | None = None
 
 
 class TelegramCredsIn(BaseModel):
     api_id: str
     api_hash: str
+    account_id: int | None = None
 
 
 class PhoneIn(BaseModel):
     phone: str
+    account_id: int | None = None
 
 
 class CodeIn(BaseModel):
     code: str
+    account_id: int | None = None
 
 
 class PasswordIn(BaseModel):
     password: str
+    account_id: int | None = None
+
+
+class AccountRefIn(BaseModel):
+    account_id: int | None = None
 
 
 class TaskIn(BaseModel):
@@ -158,128 +226,169 @@ class TaskIn(BaseModel):
 # =========================================================== AUTH (site)
 @app.get("/api/auth/state")
 async def auth_state() -> dict[str, Any]:
-    """Diz ao frontend se já existe conta (mostra login) ou não (mostra
-    a tela de "Criar conta"). Também informa se há env fixo configurado."""
-    has_account = auth.account_exists(db)
-    # Conta fixa por env conta como "já existe conta" para fins de fluxo,
-    # exceto se ainda estiver no padrão de desenvolvimento.
-    env_account = bool(
-        config.WEB_USERNAME
-        and config.WEB_PASSWORD
-        and not (config.WEB_USERNAME == "admin" and config.WEB_PASSWORD == "tgplayer123")
-    )
+    """Diz ao frontend se o registro está aberto e quantos usuários existem."""
     return {
-        "account_exists": bool(has_account or env_account),
-        "created_in_db": bool(has_account),
+        "registration_open": config.ALLOW_REGISTRATION,
+        "has_users": web_db.count_users() > 0,
     }
 
 
-@app.post("/api/setup")
-async def setup_account(data: SetupIn) -> dict[str, Any]:
-    """Cria a conta do site (login/senha) na primeira utilização.
-
-    Opcionalmente já recebe os dados do Telegram (API ID/HASH) e os salva,
-    deixando tudo pronto para o usuário só inserir o telefone/código depois.
-    Só permite criar enquanto NÃO existir conta no banco (evita sobrescrever).
-    """
-    if auth.account_exists(db):
-        raise HTTPException(status.HTTP_409_CONFLICT, "Uma conta já foi criada. Faça login.")
-
-    username = (data.username or "").strip()
-    password = data.password or ""
-    if len(username) < 3:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Usuário precisa ter ao menos 3 caracteres.")
-    if len(password) < 6:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Senha precisa ter ao menos 6 caracteres.")
-
-    auth.create_account(db, username, password)
-
-    # Se o usuário já forneceu os dados do Telegram, salva-os.
-    api_id = (data.api_id or "").strip()
-    api_hash = (data.api_hash or "").strip()
-    if api_id and api_hash:
-        db.set_setting("api_id", api_id)
-        db.set_setting("api_hash", api_hash)
-
-    token = auth.create_token(username)
-    return {"token": token, "user": username, "has_telegram_creds": bool(api_id and api_hash)}
+@app.post("/api/register")
+async def register(data: RegisterIn, request: Request) -> dict[str, Any]:
+    if not config.ALLOW_REGISTRATION:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Cadastro desabilitado.")
+    try:
+        user = auth.register_user(web_db, data.email, data.password)
+    except auth.AuthError as exc:
+        raise HTTPException(exc.status, str(exc)) from exc
+    # Já cria uma conta Telegram vazia para o usuário começar a configurar.
+    accounts.ensure_account(user.id)
+    token = auth.create_token(user.id, user.email, user.is_admin)
+    web_db.touch_last_login(user.id)
+    return {"token": token, "user": _user_public(user)}
 
 
 @app.post("/api/login")
-async def login(data: LoginIn) -> dict[str, Any]:
-    if not auth.check_credentials(db, data.username, data.password):
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Usuário ou senha inválidos")
-    token = auth.create_token(data.username)
-    return {"token": token, "user": data.username}
-
-
-# =========================================================== TELEGRAM (conta)
-@app.get("/api/telegram/status")
-async def telegram_status(_: str = Depends(require_auth)) -> dict[str, Any]:
-    """Estado da conexão com a SUA conta do Telegram."""
-    api_id = config.TELEGRAM_API_ID or db.get_setting("api_id") or ""
-    api_hash = config.TELEGRAM_API_HASH or db.get_setting("api_hash") or ""
-    info: dict[str, Any] = {
-        "has_credentials": bool(api_id and api_hash),
-        "connected": False,
-        "me": None,
-    }
-    if not (api_id and api_hash):
-        return info
+async def login(data: LoginIn, request: Request) -> dict[str, Any]:
+    ip = _client_ip(request)
+    email = auth.normalize_email(data.email)
     try:
-        me = await _call(service.get_me())
-        if me:
-            info["connected"] = True
-            info["me"] = me
+        auth.check_login_rate_limit(web_db, email, ip)
+        user = auth.authenticate(web_db, email, data.password)
+    except auth.AuthError as exc:
+        if exc.status == 401:
+            auth.record_login_result(web_db, email, ip, success=False)
+        raise HTTPException(exc.status, str(exc)) from exc
+    auth.record_login_result(web_db, email, ip, success=True)
+    web_db.touch_last_login(user.id)
+    token = auth.create_token(user.id, user.email, user.is_admin)
+    return {"token": token, "user": _user_public(user)}
+
+
+@app.get("/api/me")
+async def me(user: User = Depends(require_user)) -> dict[str, Any]:
+    return {"user": _user_public(user)}
+
+
+def _user_public(user: User) -> dict[str, Any]:
+    """Dados públicos do usuário (sem hash de senha)."""
+    return {
+        "id": user.id,
+        "email": user.email,
+        "is_admin": bool(user.is_admin),
+        "created_at": user.created_at,
+    }
+
+
+# =========================================================== CONTAS TELEGRAM
+@app.get("/api/telegram/accounts")
+async def telegram_accounts(user: User = Depends(require_user)) -> list[dict[str, Any]]:
+    return [accounts.safe_view(a) for a in accounts.list_for_user(user.id)]
+
+
+@app.post("/api/telegram/accounts")
+async def telegram_account_create(user: User = Depends(require_user)) -> dict[str, Any]:
+    acc = accounts.create_account(user.id)
+    return accounts.safe_view(acc)
+
+
+@app.delete("/api/telegram/accounts/{account_id}")
+async def telegram_account_delete(account_id: int, user: User = Depends(require_user)) -> dict[str, Any]:
+    acc = accounts.get_owned(account_id, user.id)
+    if not acc:
+        raise HTTPException(404, "Conta não encontrada")
+    try:
+        await _call_tg(tg.logout(account_id))
     except Exception:  # noqa: BLE001
-        info["connected"] = False
+        pass
+    accounts.delete(account_id)
+    return {"ok": True}
+
+
+@app.get("/api/telegram/status")
+async def telegram_status(
+    account_id: int | None = None, user: User = Depends(require_user)
+) -> dict[str, Any]:
+    acc = _resolve_account(user, account_id)
+    info = await _call_tg(tg.status(acc.id))
+    info["account_id"] = acc.id
     return info
 
 
 @app.post("/api/telegram/credentials")
-async def telegram_credentials(data: TelegramCredsIn, _: str = Depends(require_auth)) -> dict[str, Any]:
-    db.set_setting("api_id", data.api_id.strip())
-    db.set_setting("api_hash", data.api_hash.strip())
-    result = await _call(service.ensure_connected(data.api_id.strip(), data.api_hash.strip()))
-    return result
+async def telegram_credentials(data: TelegramCredsIn, user: User = Depends(require_user)) -> dict[str, Any]:
+    acc = _resolve_account(user, data.account_id)
+    api_id = (data.api_id or "").strip()
+    api_hash = (data.api_hash or "").strip()
+    if not api_id.isdigit():
+        raise HTTPException(400, "API ID deve ser numérico.")
+    if len(api_hash) < 8:
+        raise HTTPException(400, "API HASH inválido.")
+    accounts.set_api_credentials(acc.id, api_id, api_hash)
+    return {"ok": True, "account_id": acc.id}
 
 
 @app.post("/api/telegram/send-code")
-async def telegram_send_code(data: PhoneIn, _: str = Depends(require_auth)) -> dict[str, Any]:
-    return await _call(service.send_code(data.phone.strip()))
+async def telegram_send_code(data: PhoneIn, request: Request, user: User = Depends(require_user)) -> dict[str, Any]:
+    acc = _resolve_account(user, data.account_id)
+    if not accounts.has_api_credentials(acc.id):
+        raise HTTPException(400, "Configure API ID/HASH antes de entrar.")
+    # Rate limit no envio de código (anti brute-force / FLOOD).
+    ip = _client_ip(request)
+    ident = f"tgcode:{acc.id}:{ip}"
+    if web_db.count_recent_failures(ident, config.TELEGRAM_SENDCODE_WINDOW) >= config.TELEGRAM_SENDCODE_MAX:
+        raise HTTPException(429, "Muitas solicitações de código. Aguarde um pouco.")
+    web_db.record_login_attempt(ident, success=False)
+    try:
+        return await _call_tg(tg.send_code(acc.id, data.phone.strip()))
+    except SessionRevokedError as exc:
+        raise HTTPException(401, "session_revoked") from exc
 
 
 @app.post("/api/telegram/sign-in")
-async def telegram_sign_in(data: CodeIn, _: str = Depends(require_auth)) -> dict[str, Any]:
-    return await _call(service.sign_in(data.code.strip()))
+async def telegram_sign_in(data: CodeIn, user: User = Depends(require_user)) -> dict[str, Any]:
+    acc = _resolve_account(user, data.account_id)
+    try:
+        result = await _call_tg(tg.sign_in(acc.id, data.code.strip()))
+    except SessionRevokedError as exc:
+        raise HTTPException(401, "session_revoked") from exc
+    return result
 
 
 @app.post("/api/telegram/password")
-async def telegram_password(data: PasswordIn, _: str = Depends(require_auth)) -> dict[str, Any]:
-    return await _call(service.check_password(data.password))
+async def telegram_password(data: PasswordIn, user: User = Depends(require_user)) -> dict[str, Any]:
+    acc = _resolve_account(user, data.account_id)
+    return await _call_tg(tg.check_password(acc.id, data.password))
 
 
 @app.post("/api/telegram/logout")
-async def telegram_logout(_: str = Depends(require_auth)) -> dict[str, Any]:
-    return await _call(service.logout())
+async def telegram_logout(data: AccountRefIn, user: User = Depends(require_user)) -> dict[str, Any]:
+    acc = _resolve_account(user, data.account_id)
+    return await _call_tg(tg.logout(acc.id))
 
 
 @app.get("/api/telegram/dialogs")
-async def telegram_dialogs(_: str = Depends(require_auth)) -> dict[str, Any]:
-    """Lista grupos/canais para o usuário escolher quais virar cursos."""
+async def telegram_dialogs(
+    account_id: int | None = None, user: User = Depends(require_user)
+) -> dict[str, Any]:
+    acc = _resolve_account(user, account_id)
     try:
-        courses = await _call(service.list_dialog_courses())
-        return {"ok": True, "courses": courses}
+        courses_list = await _call_tg(tg.list_dialog_courses(acc.id))
+        return {"ok": True, "courses": courses_list}
     except SessionRevokedError as exc:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, f"session_revoked:{exc}") from exc
+        raise HTTPException(401, "session_revoked") from exc
 
 
 # =========================================================== CURSOS
+# NOTA: cursos/aulas/progresso continuam no banco do core (compartilhado a nível
+# de instalação). O isolamento crítico (credenciais Telegram + sessão) é por
+# usuário/conta. Sincronização e streaming usam SEMPRE o client da conta do
+# próprio usuário.
 @app.get("/api/courses")
-async def courses(_: str = Depends(require_auth)) -> list[dict[str, Any]]:
+async def courses_list(user: User = Depends(require_user)) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
-    for c in db.list_courses():
-        done, total = db.course_progress(c.id)
+    for c in core_db.list_courses():
+        done, total = core_db.course_progress(c.id)
         data = asdict(c)
         data["done"] = done
         data["total"] = total
@@ -289,43 +398,46 @@ async def courses(_: str = Depends(require_auth)) -> list[dict[str, Any]]:
 
 
 @app.post("/api/courses/add")
-async def courses_add(payload: dict[str, Any], _: str = Depends(require_auth)) -> dict[str, Any]:
-    """Adiciona cursos a partir da seleção de grupos/canais do Telegram."""
+async def courses_add(payload: dict[str, Any], user: User = Depends(require_user)) -> dict[str, Any]:
     selected = payload.get("courses") or []
     added = 0
     for course in selected:
-        db.upsert_course(course)
+        core_db.upsert_course(course)
         added += 1
     return {"added": added}
 
 
 @app.delete("/api/courses/{course_id}")
-async def courses_delete(course_id: int, _: str = Depends(require_auth)) -> dict[str, Any]:
-    db.delete_course(course_id)
+async def courses_delete(course_id: int, user: User = Depends(require_user)) -> dict[str, Any]:
+    core_db.delete_course(course_id)
     return {"ok": True}
 
 
 @app.post("/api/courses/{course_id}/color")
-async def courses_color(course_id: int, payload: dict[str, Any], _: str = Depends(require_auth)) -> dict[str, Any]:
-    db.set_course_color(course_id, payload.get("color"))
+async def courses_color(course_id: int, payload: dict[str, Any], user: User = Depends(require_user)) -> dict[str, Any]:
+    core_db.set_course_color(course_id, payload.get("color"))
     return {"ok": True}
 
 
 @app.post("/api/courses/{course_id}/sync")
-async def courses_sync(course_id: int, payload: dict[str, Any] | None = None, _: str = Depends(require_auth)) -> dict[str, Any]:
-    course = db.get_course(course_id)
+async def courses_sync(
+    course_id: int, payload: dict[str, Any] | None = None, user: User = Depends(require_user)
+) -> dict[str, Any]:
+    course = core_db.get_course(course_id)
     if not course:
         raise HTTPException(404, "Curso não encontrado")
-    limit = int((payload or {}).get("limit") or 99999)
+    body = payload or {}
+    acc = _resolve_account(user, body.get("account_id"))
+    limit = int(body.get("limit") or 99999)
     try:
-        result = await _call(service.sync_course(course.chat_id, limit=limit))
+        result = await _call_tg(tg.sync_course(acc.id, course.chat_id, limit=limit))
     except SessionRevokedError as exc:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, f"session_revoked:{exc}") from exc
-    # Aplica resultado no banco (matérias + vídeos).
-    new_course_id = db.upsert_course(result["chat"])
+        raise HTTPException(401, "session_revoked") from exc
+    new_course_id = core_db.upsert_course(result["chat"])
     _apply_sync(new_course_id, result)
-    db.touch_course_sync(new_course_id)
-    done, total = db.course_progress(new_course_id)
+    core_db.touch_course_sync(new_course_id)
+    accounts.touch_sync(acc.id)
+    done, total = core_db.course_progress(new_course_id)
     return {
         "ok": True,
         "course_id": new_course_id,
@@ -338,24 +450,23 @@ async def courses_sync(course_id: int, payload: dict[str, Any] | None = None, _:
 
 
 def _apply_sync(course_id: int, result: dict[str, Any]) -> None:
-    """Cria/atualiza matérias e vincula vídeos (versão web do _apply_sync_result)."""
     topic_to_subject: dict[str, int] = {}
     for s in result.get("subjects") or []:
         tg_id = str(s.get("telegram_topic_id") or "")
-        subject_id = db.find_or_create_subject(
+        subject_id = core_db.find_or_create_subject(
             course_id,
             s.get("title") or "Matéria",
             telegram_topic_id=tg_id or None,
             summary_text=s.get("summary_text") or "",
             manual=0,
         )
-        existing = db.get_subject(subject_id)
+        existing = core_db.get_subject(subject_id)
         if existing and not existing.manual:
             new_title = s.get("title") or "Matéria"
             if new_title and new_title != existing.title:
-                db.rename_subject(subject_id, new_title)
+                core_db.rename_subject(subject_id, new_title)
             if s.get("summary_text"):
-                db.update_subject_summary(subject_id, s.get("summary_text"))
+                core_db.update_subject_summary(subject_id, s.get("summary_text"))
         topic_to_subject[tg_id] = subject_id
 
     videos = result.get("videos") or []
@@ -363,26 +474,25 @@ def _apply_sync(course_id: int, result: dict[str, Any]) -> None:
         tg_id = str(v.get("telegram_topic_id") or "")
         if tg_id and tg_id in topic_to_subject:
             v["subject_id"] = topic_to_subject[tg_id]
-    db.replace_videos(course_id, videos)
+    core_db.replace_videos(course_id, videos)
 
 
 # =========================================================== MATÉRIAS + AULAS
 @app.get("/api/courses/{course_id}/subjects")
-async def course_subjects(course_id: int, _: str = Depends(require_auth)) -> list[dict[str, Any]]:
-    return [asdict(s) for s in db.list_subjects(course_id)]
+async def course_subjects(course_id: int, user: User = Depends(require_user)) -> list[dict[str, Any]]:
+    return [asdict(s) for s in core_db.list_subjects(course_id)]
 
 
 @app.get("/api/courses/{course_id}/videos")
-async def course_videos(course_id: int, _: str = Depends(require_auth)) -> list[dict[str, Any]]:
-    return [_video_dict(v) for v in db.list_videos(course_id)]
+async def course_videos(course_id: int, user: User = Depends(require_user)) -> list[dict[str, Any]]:
+    return [_video_dict(v) for v in core_db.list_videos(course_id)]
 
 
 def _video_dict(v) -> dict[str, Any]:
     data = asdict(v)
-    # Gera links tg:// e t.me para abrir no app (64Gram / Desktop) ou web.
-    course = db.get_course(v.course_id) if v.course_id else None
+    course = core_db.get_course(v.course_id) if v.course_id else None
     username = getattr(course, "username", None) if course else None
-    tg_url, web_url = service.telegram_message_urls(username, v.chat_id, v.message_id)
+    tg_url, web_url = tg.telegram_message_urls(username, v.chat_id, v.message_id)
     data["tg_url"] = tg_url
     data["tme_url"] = web_url
     data["watched"] = bool(v.watched_at)
@@ -391,42 +501,40 @@ def _video_dict(v) -> dict[str, Any]:
 
 # =========================================================== AÇÕES DE AULA
 @app.post("/api/videos/{video_id}/watched")
-async def video_watched(video_id: int, _: str = Depends(require_auth)) -> dict[str, Any]:
-    db.mark_watched(video_id)
+async def video_watched(video_id: int, user: User = Depends(require_user)) -> dict[str, Any]:
+    core_db.mark_watched(video_id)
     return {"ok": True}
 
 
 @app.post("/api/videos/{video_id}/unwatched")
-async def video_unwatched(video_id: int, _: str = Depends(require_auth)) -> dict[str, Any]:
-    db.mark_unwatched(video_id)
+async def video_unwatched(video_id: int, user: User = Depends(require_user)) -> dict[str, Any]:
+    core_db.mark_unwatched(video_id)
     return {"ok": True}
 
 
 @app.post("/api/videos/{video_id}/favorite")
-async def video_favorite(video_id: int, _: str = Depends(require_auth)) -> dict[str, Any]:
-    fav = db.toggle_favorite(video_id)
+async def video_favorite(video_id: int, user: User = Depends(require_user)) -> dict[str, Any]:
+    fav = core_db.toggle_favorite(video_id)
     return {"ok": True, "favorite": fav}
 
 
 @app.post("/api/videos/{video_id}/progress")
-async def video_progress(video_id: int, payload: dict[str, Any], _: str = Depends(require_auth)) -> dict[str, Any]:
-    db.save_progress(
-        video_id,
-        int(payload.get("position_ms") or 0),
-        payload.get("duration_ms"),
+async def video_progress(video_id: int, payload: dict[str, Any], user: User = Depends(require_user)) -> dict[str, Any]:
+    core_db.save_progress(
+        video_id, int(payload.get("position_ms") or 0), payload.get("duration_ms")
     )
     return {"ok": True}
 
 
-# =========================================================== STREAMING (player web)
+# =========================================================== STREAMING
 @app.post("/api/videos/{video_id}/prepare-stream")
-async def prepare_stream(video_id: int, _: str = Depends(require_auth)) -> dict[str, Any]:
-    """Prepara o streaming de uma aula e devolve a URL de proxy para o player web."""
-    v = db.get_video(video_id)
+async def prepare_stream(video_id: int, payload: dict[str, Any] | None = None, user: User = Depends(require_user)) -> dict[str, Any]:
+    v = core_db.get_video(video_id)
     if not v:
         raise HTTPException(404, "Aula não encontrada")
-    course = db.get_course(v.course_id) if v.course_id else None
-    payload = {
+    acc = _resolve_account(user, (payload or {}).get("account_id"))
+    course = core_db.get_course(v.course_id) if v.course_id else None
+    payload_stream = {
         "chat_id": v.chat_id,
         "message_id": v.message_id,
         "file_name": v.file_name,
@@ -441,12 +549,10 @@ async def prepare_stream(video_id: int, _: str = Depends(require_auth)) -> dict[
         "start_position_ms": int(v.position_ms or 0),
     }
     try:
-        result = await _call(service.prepare_stream(payload))
+        result = await _call_tg(tg.prepare_stream(acc.id, payload_stream))
     except SessionRevokedError as exc:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, f"session_revoked:{exc}") from exc
+        raise HTTPException(401, "session_revoked") from exc
     token = result["token"]
-    # O frontend consome SEMPRE pelo proxy do backend (mesma origem da API),
-    # evitando problemas de CORS/127.0.0.1 quando hospedado na Cloudflare.
     return {
         "token": token,
         "stream_url": f"/api/stream/{token}",
@@ -459,8 +565,8 @@ async def prepare_stream(video_id: int, _: str = Depends(require_auth)) -> dict[
 
 @app.api_route("/api/stream/{token}", methods=["GET", "HEAD"])
 async def stream_proxy(token: str, request: Request) -> Response:
-    """Proxy do streaming do TelegramService (suporta HTTP Range)."""
-    port = getattr(service, "port", None)
+    """Proxy do streaming (suporta HTTP Range). O token isola a conta."""
+    port = getattr(tg, "port", None)
     if not port:
         raise HTTPException(503, "Servidor de streaming não está pronto")
     upstream = f"http://127.0.0.1:{port}/stream/{token}/video"
@@ -473,7 +579,7 @@ async def stream_proxy(token: str, request: Request) -> Response:
         resp = await session.request(request.method, upstream, headers=headers)
     except Exception as exc:  # noqa: BLE001
         await session.close()
-        raise HTTPException(502, f"Falha no streaming: {exc}") from exc
+        raise HTTPException(502, "Falha no streaming") from exc
 
     out_headers = {}
     for h in ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"):
@@ -499,22 +605,22 @@ async def stream_proxy(token: str, request: Request) -> Response:
 
 # =========================================================== CONTINUAR ASSISTINDO
 @app.get("/api/continue")
-async def continue_watching(_: str = Depends(require_auth)) -> list[dict[str, Any]]:
-    return [_video_dict(v) for v in db.continue_watching(12)]
+async def continue_watching(user: User = Depends(require_user)) -> list[dict[str, Any]]:
+    return [_video_dict(v) for v in core_db.continue_watching(12)]
 
 
 # =========================================================== ACOMPANHAMENTO
 @app.get("/api/study/dashboard")
-async def study_dashboard(_: str = Depends(require_auth)) -> dict[str, Any]:
-    today = db.today_study_seconds()
-    week = db.week_study_seconds()
-    streak = db.study_streak_days()
-    pomos = db.count_pomodoros_today()
-    done_videos, total_videos = db.video_totals()
-    by_day = [{"day": d, "seconds": s} for d, s in db.study_seconds_by_day(7)]
-    by_course = db.course_completion_stats()
-    recent = db.recent_completed_videos(8)
-    goal = db.get_setting("weekly_goal_hours") or "10"
+async def study_dashboard(user: User = Depends(require_user)) -> dict[str, Any]:
+    today = core_db.today_study_seconds()
+    week = core_db.week_study_seconds()
+    streak = core_db.study_streak_days()
+    pomos = core_db.count_pomodoros_today()
+    done_videos, total_videos = core_db.video_totals()
+    by_day = [{"day": d, "seconds": s} for d, s in core_db.study_seconds_by_day(7)]
+    by_course = core_db.course_completion_stats()
+    recent = core_db.recent_completed_videos(8)
+    goal = core_db.get_setting("weekly_goal_hours") or "10"
     return {
         "today_seconds": today,
         "week_seconds": week,
@@ -530,57 +636,131 @@ async def study_dashboard(_: str = Depends(require_auth)) -> dict[str, Any]:
 
 
 @app.post("/api/study/goal")
-async def study_goal(payload: dict[str, Any], _: str = Depends(require_auth)) -> dict[str, Any]:
-    db.set_setting("weekly_goal_hours", str(payload.get("hours") or 10))
+async def study_goal(payload: dict[str, Any], user: User = Depends(require_user)) -> dict[str, Any]:
+    core_db.set_setting("weekly_goal_hours", str(payload.get("hours") or 10))
     return {"ok": True}
 
 
 @app.post("/api/study/pomodoro")
-async def study_pomodoro(payload: dict[str, Any], _: str = Depends(require_auth)) -> dict[str, Any]:
+async def study_pomodoro(payload: dict[str, Any], user: User = Depends(require_user)) -> dict[str, Any]:
     minutes = int(payload.get("minutes") or 25)
     seconds = minutes * 60
-    db.add_pomodoro_session(seconds, kind="foco", course_id=payload.get("course_id"))
-    db.log_study_time(seconds, course_id=payload.get("course_id"))
+    core_db.add_pomodoro_session(seconds, kind="foco", course_id=payload.get("course_id"))
+    core_db.log_study_time(seconds, course_id=payload.get("course_id"))
     return {"ok": True}
 
 
 @app.post("/api/study/log")
-async def study_log(payload: dict[str, Any], _: str = Depends(require_auth)) -> dict[str, Any]:
-    db.log_study_time(int(payload.get("seconds") or 0), payload.get("course_id"))
+async def study_log(payload: dict[str, Any], user: User = Depends(require_user)) -> dict[str, Any]:
+    core_db.log_study_time(int(payload.get("seconds") or 0), payload.get("course_id"))
     return {"ok": True}
 
 
 # =========================================================== TAREFAS
 @app.get("/api/tasks")
-async def tasks_list(_: str = Depends(require_auth)) -> list[dict[str, Any]]:
-    return db.list_tasks(include_done=True)
+async def tasks_list(user: User = Depends(require_user)) -> list[dict[str, Any]]:
+    return core_db.list_tasks(include_done=True)
 
 
 @app.post("/api/tasks")
-async def tasks_add(data: TaskIn, _: str = Depends(require_auth)) -> dict[str, Any]:
-    tid = db.add_task(data.text, priority=data.priority, due_date=None, course_id=data.course_id)
+async def tasks_add(data: TaskIn, user: User = Depends(require_user)) -> dict[str, Any]:
+    tid = core_db.add_task(data.text, priority=data.priority, due_date=None, course_id=data.course_id)
     return {"ok": True, "id": tid}
 
 
 @app.post("/api/tasks/{task_id}/toggle")
-async def tasks_toggle(task_id: int, _: str = Depends(require_auth)) -> dict[str, Any]:
-    done = db.toggle_task(task_id)
+async def tasks_toggle(task_id: int, user: User = Depends(require_user)) -> dict[str, Any]:
+    done = core_db.toggle_task(task_id)
     return {"ok": True, "done": done}
 
 
 @app.delete("/api/tasks/{task_id}")
-async def tasks_delete(task_id: int, _: str = Depends(require_auth)) -> dict[str, Any]:
-    db.delete_task(task_id)
+async def tasks_delete(task_id: int, user: User = Depends(require_user)) -> dict[str, Any]:
+    core_db.delete_task(task_id)
     return {"ok": True}
 
 
-# =========================================================== FRONTEND (estático)
+# =========================================================== ADMIN (privacidade)
+@app.get("/api/admin/overview")
+async def admin_overview(admin: User = Depends(require_admin)) -> dict[str, Any]:
+    """Painel administrativo SEM dados sensíveis.
+
+    Mostra apenas: conta conectada, última sincronização, status da conexão,
+    quantidade de arquivos/cursos e espaço utilizado (estimado). NUNCA expõe
+    API_ID, API_HASH, session string, telefone ou tokens.
+    """
+    users_out: list[dict[str, Any]] = []
+    for u in web_db.list_users():
+        accs = accounts.list_for_user(u.id)
+        acc_views = []
+        for a in accs:
+            view = accounts.safe_view(a)
+            # Métricas agregadas seguras por conta conectada.
+            files = _account_file_count(a)
+            view["files"] = files["files"]
+            view["bytes_used"] = files["bytes"]
+            acc_views.append(view)
+        users_out.append(
+            {
+                "id": u.id,
+                "email": u.email,
+                "is_admin": bool(u.is_admin),
+                "is_active": bool(u.is_active),
+                "created_at": u.created_at,
+                "last_login_at": u.last_login_at,
+                "accounts": acc_views,
+            }
+        )
+    return {
+        "users_count": len(users_out),
+        "accounts_count": len(web_db.list_all_accounts()),
+        "users": users_out,
+    }
+
+
+def _account_file_count(account) -> dict[str, int]:
+    """Estatísticas agregadas (arquivos/bytes) das contas Telegram conectadas.
+
+    Como cursos/aulas são por instalação (não por conta), retornamos um total
+    de aulas/espaço da instalação apenas para a primeira conta conectada, para
+    fins de painel. Nada sensível é exposto.
+    """
+    try:
+        done, total = core_db.video_totals()
+    except Exception:  # noqa: BLE001
+        total = 0
+    # Estima espaço somando o tamanho das aulas conhecidas.
+    bytes_used = 0
+    try:
+        with core_db.connect() as conn:
+            row = conn.execute("SELECT COALESCE(SUM(size),0) AS s, COUNT(*) AS n FROM videos").fetchone()
+            bytes_used = int(row["s"] or 0)
+            total = int(row["n"] or 0)
+    except Exception:  # noqa: BLE001
+        pass
+    return {"files": total, "bytes": bytes_used}
+
+
+@app.post("/api/admin/users/{user_id}/active")
+async def admin_set_active(user_id: int, payload: dict[str, Any], admin: User = Depends(require_admin)) -> dict[str, Any]:
+    if user_id == admin.id:
+        raise HTTPException(400, "Você não pode desativar a si mesmo.")
+    target = web_db.get_user(user_id)
+    if not target:
+        raise HTTPException(404, "Usuário não encontrado")
+    web_db.set_user_active(user_id, bool(payload.get("active", True)))
+    return {"ok": True}
+
+
+# =========================================================== FRONTEND
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
     return {"ok": True, "version": app.version}
 
 
 if FRONTEND_DIR.exists():
+    from fastapi.staticfiles import StaticFiles
+
     app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIR / "assets")), name="assets")
 
     @app.get("/")
@@ -589,9 +769,6 @@ if FRONTEND_DIR.exists():
 
     @app.exception_handler(404)
     async def spa_fallback(request: Request, exc) -> Response:
-        # SPA: rotas não-API caem no index.html.
         if request.url.path.startswith("/api/"):
             return JSONResponse({"detail": "Not found"}, status_code=404)
         return FileResponse(str(FRONTEND_DIR / "index.html"))
-
-
