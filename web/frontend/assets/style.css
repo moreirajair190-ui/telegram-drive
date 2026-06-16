@@ -437,6 +437,103 @@ a { color: inherit; text-decoration: none; }
   .search-box { min-width: 0; }
 }
 
+/* ===================================================== Lessons header */
+.lessons-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; margin-bottom: 18px; flex-wrap: wrap;
+}
+.lessons-head-right { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.course-progress-mini { display: flex; align-items: center; gap: 9px; }
+.cpm-bar { width: 120px; height: 8px; background: var(--surface-3); border-radius: 999px; overflow: hidden; }
+.cpm-fill { height: 100%; background: linear-gradient(90deg, var(--brand), var(--accent)); border-radius: 999px; transition: width 0.5s var(--trans); }
+.cpm-label { font-size: 12.5px; font-weight: 700; color: var(--text-dim); font-variant-numeric: tabular-nums; }
+
+/* ===================================================== Explorer (pastas) */
+.explorer {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 10px 8px; box-shadow: var(--shadow-sm);
+}
+.tree-folder { position: relative; }
+.folder-head {
+  display: flex; align-items: center; gap: 9px; width: 100%;
+  padding: 10px 12px; border-radius: 10px; background: transparent; border: none;
+  text-align: left; cursor: pointer; transition: background var(--trans);
+  color: var(--text); font-weight: 700; font-size: 14.5px;
+  padding-left: calc(12px + var(--depth, 0) * 20px);
+}
+.folder-head:hover { background: var(--surface-2); }
+.folder-head.open { color: var(--brand); }
+.folder-head .caret { font-size: 11px; width: 12px; color: var(--text-faint); transition: var(--trans); flex-shrink: 0; }
+.folder-head .folder-icon { font-size: 17px; flex-shrink: 0; }
+.folder-head .folder-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.folder-head .folder-count {
+  font-size: 11.5px; font-weight: 700; color: var(--text-dim);
+  background: var(--surface-3); padding: 2px 9px; border-radius: 999px; flex-shrink: 0;
+}
+.folder-head.open .folder-count { background: var(--brand-glow); color: var(--brand); }
+.folder-body { animation: folderOpen 0.18s ease; }
+@keyframes folderOpen { from { opacity: 0; transform: translateY(-4px); } }
+
+/* a lesson-row dentro do explorer recebe recuo conforme a profundidade */
+.explorer .lesson-row {
+  margin: 4px 8px 4px calc(12px + var(--depth, 0) * 20px);
+  cursor: pointer;
+}
+.explorer .lesson-row:hover { transform: none; background: var(--surface-2); }
+.lesson-row.done .lesson-info .t { color: var(--text-dim); }
+
+/* ===================================================== Sync overlay */
+.sync-overlay {
+  position: fixed; inset: 0; z-index: 300;
+  background: rgba(5, 7, 15, 0.6); backdrop-filter: blur(8px);
+  display: grid; place-items: center; padding: 24px; animation: fade 0.2s;
+}
+.sync-overlay.closing { animation: fade 0.2s reverse; }
+.sync-card {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius-lg); padding: 40px 36px; max-width: 420px; width: 100%;
+  text-align: center; box-shadow: var(--shadow); animation: pop 0.3s var(--trans);
+}
+.sync-anim { position: relative; width: 92px; height: 92px; margin: 0 auto 22px; display: grid; place-items: center; }
+.sync-ring {
+  position: absolute; inset: 0; border-radius: 50%;
+  border: 4px solid var(--surface-3); border-top-color: var(--brand);
+  animation: spin 1s linear infinite;
+}
+.sync-ring.r2 {
+  inset: 12px; border-width: 3px; border-top-color: var(--accent);
+  animation: spin 1.4s linear infinite reverse;
+}
+.sync-ico { font-size: 30px; animation: pulse 1.6s ease-in-out infinite; }
+@keyframes pulse { 0%,100% { transform: scale(1); opacity: 1; } 50% { transform: scale(1.12); opacity: 0.7; } }
+.sync-title { font-size: 19px; font-weight: 800; margin-bottom: 6px; }
+.sync-sub { font-size: 13.5px; color: var(--text-dim); margin-bottom: 20px; line-height: 1.5; }
+.sync-bar { height: 8px; background: var(--surface-3); border-radius: 999px; overflow: hidden; margin-bottom: 14px; }
+.sync-bar-fill {
+  height: 100%; width: 40%; border-radius: 999px;
+  background: linear-gradient(90deg, transparent, var(--brand), var(--accent), transparent);
+  animation: indeterminate 1.4s ease-in-out infinite;
+}
+@keyframes indeterminate { 0% { margin-left: -40%; } 100% { margin-left: 100%; } }
+.sync-steps { font-size: 13px; color: var(--text-faint); font-weight: 600; min-height: 18px; }
+
+/* ===================================================== Player controls */
+.player-loading { padding: 60px 20px; display: flex; flex-direction: column; align-items: center; gap: 6px; }
+.player-loading .spinner { margin: 0 0 8px; }
+.player-loading .muted { color: #cbd3f0; }
+.player-controls { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 14px; flex-wrap: wrap; }
+.speed-control {
+  display: inline-flex; align-items: center; gap: 8px;
+  background: var(--surface-2); border: 1.5px solid var(--border);
+  border-radius: var(--radius-sm); padding: 7px 12px;
+}
+.speed-control .speed-ico { font-size: 15px; }
+.speed-control select {
+  background: transparent; border: none; color: var(--text);
+  font-weight: 700; font-size: 14px; cursor: pointer; outline: none;
+}
+.speed-control select option { background: var(--surface); color: var(--text); }
+
 /* ===================================================== Admin panel */
 .admin-list { display: flex; flex-direction: column; gap: 16px; }
 .admin-card { background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 18px; box-shadow: var(--shadow-sm, none); }

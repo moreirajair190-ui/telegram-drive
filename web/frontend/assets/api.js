@@ -115,6 +115,7 @@
     syncCourse(id, limit) { return this.post("/api/courses/" + id + "/sync", { limit }); },
     subjects(id) { return this.get("/api/courses/" + id + "/subjects"); },
     videos(id) { return this.get("/api/courses/" + id + "/videos"); },
+    tree(id) { return this.get("/api/courses/" + id + "/tree"); },
 
     markWatched(id) { return this.post("/api/videos/" + id + "/watched", {}); },
     markUnwatched(id) { return this.post("/api/videos/" + id + "/unwatched", {}); },
