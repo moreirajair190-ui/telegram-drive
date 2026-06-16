@@ -1,6 +1,18 @@
 # Cloudflare Pages — Headers
+
+# HTML nunca é cacheado: garante que o navegador sempre receba o index.html
+# mais novo (com a query string ?v=... atualizada dos scripts). Isso evita que
+# uma versão antiga do api.js/app.js fique presa no cache do navegador/CDN.
+/
+  Cache-Control: no-cache, no-store, must-revalidate
+/index.html
+  Cache-Control: no-cache, no-store, must-revalidate
+
+# Os assets são versionados via ?v=... no index.html, então podem ter cache
+# longo com segurança (quando a versão muda, a URL muda e o cache é ignorado).
 /assets/*
   Cache-Control: public, max-age=86400
+
 /*
   X-Content-Type-Options: nosniff
   Referrer-Policy: strict-origin-when-cross-origin
