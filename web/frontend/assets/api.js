@@ -48,17 +48,27 @@
     post(p, b) { return this.request("POST", p, b); },
     del(p) { return this.request("DELETE", p); },
 
-    // ---- endpoints
+    // ---- endpoints (multiusuário)
     authState() { return this.get("/api/auth/state"); },
-    setup(username, password, api_id, api_hash) { return this.post("/api/setup", { username, password, api_id, api_hash }); },
-    login(username, password) { return this.post("/api/login", { username, password }); },
-    tgStatus() { return this.get("/api/telegram/status"); },
-    tgCredentials(api_id, api_hash) { return this.post("/api/telegram/credentials", { api_id, api_hash }); },
-    tgSendCode(phone) { return this.post("/api/telegram/send-code", { phone }); },
-    tgSignIn(code) { return this.post("/api/telegram/sign-in", { code }); },
-    tgPassword(password) { return this.post("/api/telegram/password", { password }); },
-    tgLogout() { return this.post("/api/telegram/logout", {}); },
-    tgDialogs() { return this.get("/api/telegram/dialogs"); },
+    register(email, password) { return this.post("/api/register", { email, password }); },
+    login(email, password) { return this.post("/api/login", { email, password }); },
+    me() { return this.get("/api/me"); },
+
+    // Conta(s) Telegram do usuário. account_id é opcional (usa a 1ª por padrão).
+    tgAccounts() { return this.get("/api/telegram/accounts"); },
+    tgCreateAccount() { return this.post("/api/telegram/accounts", {}); },
+    tgDeleteAccount(id) { return this.del("/api/telegram/accounts/" + id); },
+    tgStatus(account_id) { return this.get("/api/telegram/status" + (account_id ? ("?account_id=" + account_id) : "")); },
+    tgCredentials(api_id, api_hash, account_id) { return this.post("/api/telegram/credentials", { api_id, api_hash, account_id }); },
+    tgSendCode(phone, account_id) { return this.post("/api/telegram/send-code", { phone, account_id }); },
+    tgSignIn(code, account_id) { return this.post("/api/telegram/sign-in", { code, account_id }); },
+    tgPassword(password, account_id) { return this.post("/api/telegram/password", { password, account_id }); },
+    tgLogout(account_id) { return this.post("/api/telegram/logout", { account_id }); },
+    tgDialogs(account_id) { return this.get("/api/telegram/dialogs" + (account_id ? ("?account_id=" + account_id) : "")); },
+
+    // Admin (sem dados sensíveis)
+    adminOverview() { return this.get("/api/admin/overview"); },
+    adminSetActive(user_id, active) { return this.post("/api/admin/users/" + user_id + "/active", { active }); },
 
     courses() { return this.get("/api/courses"); },
     addCourses(courses) { return this.post("/api/courses/add", { courses }); },

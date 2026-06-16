@@ -3,6 +3,9 @@ fastapi>=0.110
 uvicorn[standard]>=0.27
 pydantic>=2.6
 
+# Criptografia em repouso (Fernet) das credenciais/sessões do Telegram
+cryptography>=42.0
+
 # Núcleo herdado do app desktop
 pyrogram>=2.0
 TgCrypto>=1.2.5
