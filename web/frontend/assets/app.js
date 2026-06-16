@@ -49,7 +49,7 @@
 
   // ---------------------------------------------------------------- theme
   function initTheme() {
-    const saved = localStorage.getItem("tgweb_theme") || "dark";
+    const saved = localStorage.getItem("tgweb_theme") || "light";
     document.body.dataset.theme = saved;
   }
   function toggleTheme() {
@@ -79,19 +79,85 @@
             </div>
             <button class="btn btn-primary btn-block btn-lg" type="submit">Entrar</button>
           </form>
-          <p class="login-hint">Acesso restrito · login e senha definidos por você.</p>
+          <p class="login-hint">Não tem conta ainda? <a href="#" id="goSetup">Criar conta</a></p>
         </div>
       </div>`);
     app.appendChild(card);
+    $("#goSetup").addEventListener("click", (e) => { e.preventDefault(); renderSetup(); });
     $("#loginForm").addEventListener("submit", async (e) => {
       e.preventDefault();
-      const btn = $("button", card); btn.disabled = true; btn.textContent = "Entrando...";
+      const btn = $("#loginForm button[type=submit]"); btn.disabled = true; btn.textContent = "Entrando...";
       try {
         const r = await api.login($("#lu").value.trim(), $("#lp").value);
         api.token = r.token;
         await boot();
       } catch (err) {
         renderLogin(err.message || "Falha no login");
+      }
+    });
+  }
+
+  // ================================================================ CRIAR CONTA
+  function renderSetup(errMsg) {
+    app.innerHTML = "";
+    const card = h(`
+      <div class="login-wrap">
+        <div class="login-card login-card-wide">
+          <div class="login-logo">▶</div>
+          <h1>Criar sua conta</h1>
+          <p class="sub">Defina um login e senha para acessar o site, e conecte os dados da sua conta do Telegram.</p>
+          ${errMsg ? `<div class="login-err">${esc(errMsg)}</div>` : ""}
+          <form id="setupForm">
+            <div class="field">
+              <label>Usuário (login do site)</label>
+              <input id="su" type="text" autocomplete="username" placeholder="ex.: joao" minlength="3" required />
+            </div>
+            <div class="field">
+              <label>Senha (mín. 6 caracteres)</label>
+              <input id="sp" type="password" autocomplete="new-password" placeholder="••••••••" minlength="6" required />
+            </div>
+            <div class="field">
+              <label>Confirmar senha</label>
+              <input id="sp2" type="password" autocomplete="new-password" placeholder="••••••••" minlength="6" required />
+            </div>
+            <div class="setup-divider"><span>Dados do Telegram (opcional agora)</span></div>
+            <p class="setup-note">
+              Pegue em <a href="https://my.telegram.org" target="_blank" rel="noopener">my.telegram.org</a> →
+              <em>API development tools</em>. Você pode deixar em branco e preencher depois.
+            </p>
+            <div class="field">
+              <label>API ID</label>
+              <input id="sapi" type="text" inputmode="numeric" placeholder="123456" />
+            </div>
+            <div class="field">
+              <label>API HASH</label>
+              <input id="shash" type="text" placeholder="abcdef0123456789abcdef0123456789" />
+            </div>
+            <button class="btn btn-primary btn-block btn-lg" type="submit">Criar conta e entrar</button>
+          </form>
+          <p class="login-hint">Já tem conta? <a href="#" id="goLogin">Fazer login</a></p>
+        </div>
+      </div>`);
+    app.appendChild(card);
+    $("#goLogin").addEventListener("click", (e) => { e.preventDefault(); renderLogin(); });
+    $("#setupForm").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const u = $("#su").value.trim();
+      const p = $("#sp").value;
+      const p2 = $("#sp2").value;
+      const apiId = $("#sapi").value.trim();
+      const apiHash = $("#shash").value.trim();
+      if (u.length < 3) return renderSetup("Usuário precisa ter ao menos 3 caracteres.");
+      if (p.length < 6) return renderSetup("Senha precisa ter ao menos 6 caracteres.");
+      if (p !== p2) return renderSetup("As senhas não coincidem.");
+      const btn = $("#setupForm button[type=submit]"); btn.disabled = true; btn.textContent = "Criando...";
+      try {
+        const r = await api.setup(u, p, apiId, apiHash);
+        api.token = r.token;
+        toast("Conta criada com sucesso!", "ok");
+        await boot();
+      } catch (err) {
+        renderSetup(err.message || "Falha ao criar conta");
       }
     });
   }
@@ -727,12 +793,24 @@
   // ================================================================ BOOT
   async function boot() {
     try { State.tg = await api.tgStatus(); }
-    catch (e) { if (e.status === 401) return renderLogin(); State.tg = { connected: false, has_credentials: false }; }
+    catch (e) { if (e.status === 401) return startAuth(); State.tg = { connected: false, has_credentials: false }; }
     renderShell();
   }
 
-  window.addEventListener("tgweb:logout", () => renderLogin());
+  window.addEventListener("tgweb:logout", () => startAuth());
+
+  // Decide entre tela de login (conta existe) ou criar conta (primeira vez).
+  async function startAuth() {
+    try {
+      const st = await api.authState();
+      if (st.account_exists) renderLogin();
+      else renderSetup();
+    } catch (e) {
+      // Se nem o estado conseguimos buscar, mostra login (backend offline mostra erro).
+      renderLogin();
+    }
+  }
 
   initTheme();
-  if (api.token) boot(); else renderLogin();
+  if (api.token) boot(); else startAuth();
 })();
