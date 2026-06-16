@@ -14,14 +14,17 @@ APIs de sincronização, streaming (player same-origin) e diálogos.
 
 from __future__ import annotations
 
+import ctypes
+import ctypes.wintypes
 import logging
+import re
 import sys
 import traceback
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QAction, QColor, QFont
+from PySide6.QtCore import Qt, QTimer, QUrl, QSize, QPoint
+from PySide6.QtGui import QAction, QColor, QFont, QDesktopServices, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -42,8 +45,10 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QTreeWidget,
     QTreeWidgetItem,
+    QAbstractItemView,
     QVBoxLayout,
     QWidget,
+    QSizeGrip,
 )
 
 from .db import Course, Database, Subject, Video
@@ -57,23 +62,106 @@ from .dialogs import (
 )
 from .files_tab import FilesTab
 from .logging_setup import setup_logging
-from .player import VideoPlayerDialog
 from .study_tab import StudyTab
 from .style import build_qss, palette
 from .summary_parser import match_videos_to_tree
-from .telegram_service import TelegramService
+from .telegram_service import SessionRevokedError, TelegramService
 from .utils import human_duration, human_size
 from .vlc_locator import find_vlc, launch_vlc, open_vlc_download_page
+from .paths import DATA_DIR, SESSION_DIR
 
 log = logging.getLogger(__name__)
 
+# Marcadores que identificam, na mensagem do erro, uma sessão inválida no
+# servidor do Telegram (auth_key revogada/expirada). Usado como rede de
+# segurança caso o serviço levante a exceção crua em vez de SessionRevokedError.
+_SESSION_ERROR_MARKERS = (
+    "AUTH_KEY_UNREGISTERED",
+    "AUTH_KEY_INVALID",
+    "AUTH_KEY_DUPLICATED",
+    "SESSION_REVOKED",
+    "SESSION_EXPIRED",
+    "USER_DEACTIVATED",
+    "UNAUTHORIZED",
+    "401",
+)
+
+
+def _looks_like_session_error(exc: BaseException) -> bool:
+    if isinstance(exc, SessionRevokedError):
+        return True
+    text = f"{type(exc).__name__}: {exc}".upper()
+    return any(marker in text for marker in _SESSION_ERROR_MARKERS)
+
+
 ROLE_VIDEO_ID = Qt.UserRole
 ROLE_NODE_TYPE = Qt.UserRole + 1
+ROLE_RAW_TITLE = Qt.UserRole + 2
 
 # Identificador especial para "todas as matérias".
 SUBJECT_ALL = -1
 SUBJECT_NONE = 0  # vídeos sem matéria
 SUBJECT_CONTINUE = -2  # filtro virtual "Continuar assistindo" (resume)
+
+
+class DraggableTopBar(QWidget):
+    """Barra superior arrastável para janela sem moldura nativa.
+
+    Importante: a barra NÃO pode capturar cliques feitos em botões/menus.
+    Versões anteriores aceitavam o mousePressEvent no widget inteiro e, junto
+    com o WM_NCHITTEST, isso fazia Conectar/minimizar/maximizar/fechar ficarem
+    com aparência normal, mas sem clique real. A regra agora é: arrastar só em
+    área vazia da barra.
+    """
+
+    def __init__(self, window: "MainWindow") -> None:
+        super().__init__()
+        self.window = window
+        self._drag_pos: QPoint | None = None
+
+    def _over_interactive(self, event) -> bool:  # noqa: ANN001
+        try:
+            global_pos = event.globalPosition().toPoint()
+            return bool(self.window._is_global_point_on_titlebar_control(global_pos))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def mousePressEvent(self, event):  # noqa: ANN001
+        if event.button() == Qt.LeftButton and not self._over_interactive(event):
+            try:
+                self._drag_pos = event.globalPosition().toPoint() - self.window.frameGeometry().topLeft()
+                event.accept()
+                return
+            except Exception:  # noqa: BLE001
+                self._drag_pos = None
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):  # noqa: ANN001
+        if event.buttons() & Qt.LeftButton and self._drag_pos is not None:
+            try:
+                if self.window.isMaximized():
+                    old_width = max(1, self.window.width())
+                    ratio = max(0.15, min(0.85, event.position().x() / old_width))
+                    self.window.showNormal()
+                    self.window._update_window_buttons()
+                    self._drag_pos = QPoint(int(self.window.width() * ratio), 26)
+                self.window.move(event.globalPosition().toPoint() - self._drag_pos)
+                event.accept()
+                return
+            except Exception:  # noqa: BLE001
+                pass
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):  # noqa: ANN001
+        self._drag_pos = None
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):  # noqa: ANN001
+        if event.button() == Qt.LeftButton and not self._over_interactive(event):
+            self.window.toggle_maximize_restore()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
 
 
 class MainWindow(QMainWindow):
@@ -94,6 +182,17 @@ class MainWindow(QMainWindow):
         self.current_subject_id: int = SUBJECT_ALL
         self.current_video_id: int | None = None
         self.setWindowTitle("TgPlayer — Videoaulas do Telegram")
+        # v6.4.14: voltamos à moldura nativa do Windows para garantir cliques,
+        # redimensionamento, Snap Assist e botões minimizar/maximizar/fechar.
+        # A tentativa de barra 100% customizada interceptava cliques em alguns
+        # ambientes Windows/PyInstaller. A barra visual do TgPlayer fica dentro
+        # do app, mas os controles reais da janela são nativos e estáveis.
+        self.setWindowFlags(
+            Qt.Window
+            | Qt.WindowMinimizeButtonHint
+            | Qt.WindowMaximizeButtonHint
+            | Qt.WindowCloseButtonHint
+        )
         self.resize(1500, 900)
         self.setMinimumSize(1180, 720)
         self.build_ui()
@@ -116,6 +215,69 @@ class MainWindow(QMainWindow):
         self._warmup_timer.timeout.connect(self._do_warmup)
         self._warmup_video_id: int | None = None
 
+    def toggle_maximize_restore(self) -> None:
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
+        self._update_window_buttons()
+
+    def _update_window_buttons(self) -> None:
+        btn = getattr(self, "max_btn", None)
+        if btn is not None:
+            btn.setText("❐" if self.isMaximized() else "□")
+            btn.setToolTip("Restaurar" if self.isMaximized() else "Maximizar")
+
+    def _titlebar_controls(self) -> list[QWidget]:
+        """Widgets do topo que devem receber clique normal.
+
+        O Windows pergunta primeiro via WM_NCHITTEST se aquela região é
+        HTCAPTION/resize. Se respondermos HTCAPTION em cima de um botão, o Qt
+        nunca recebe o clique. Por isso calculamos retângulos globais dos
+        controles interativos em vez de confiar apenas em childAt().
+        """
+        names = (
+            "login_btn", "theme_btn", "min_btn", "max_btn", "close_btn",
+            "account_btn", "tools_btn", "help_btn",
+        )
+        widgets: list[QWidget] = []
+        for name in names:
+            widget = getattr(self, name, None)
+            if isinstance(widget, QWidget) and widget.isVisible() and widget.isEnabled():
+                widgets.append(widget)
+        return widgets
+
+    def _is_global_point_on_titlebar_control(self, global_pos: QPoint) -> bool:
+        for widget in self._titlebar_controls():
+            try:
+                top_left = widget.mapToGlobal(QPoint(0, 0))
+                rect = widget.rect().translated(top_left)
+                # Margem pequena para compensar DPI/escala do Windows.
+                rect = rect.adjusted(-3, -3, 3, 3)
+                if rect.contains(global_pos):
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
+        return False
+
+    def changeEvent(self, event):  # noqa: ANN001
+        super().changeEvent(event)
+        self._update_window_buttons()
+
+
+    def nativeEvent(self, eventType, message):  # noqa: ANN001, N802
+        """Não intercepta eventos nativos da janela.
+
+        A v6.4.14 usa a barra nativa do Windows. Isso devolve ao sistema o
+        controle de redimensionamento, Snap Assist e botões da janela, evitando
+        que a região superior do app capture cliques em Conectar/tema/menus.
+        """
+        return super().nativeEvent(eventType, message)
+
+    def showEvent(self, event):  # noqa: ANN001, N802
+        super().showEvent(event)
+        self._update_window_buttons()
+
     # ===================================================== construção da interface
     def build_ui(self) -> None:
         central = QWidget()
@@ -124,6 +286,7 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
+        self._build_menu()
         root.addWidget(self._build_topbar())
 
         self.tabs = QTabWidget()
@@ -136,20 +299,42 @@ class MainWindow(QMainWindow):
         self.tabs.currentChanged.connect(self._on_tab_changed)
         root.addWidget(self.tabs, 1)
 
-        self._build_menu()
+        grip_row = QHBoxLayout()
+        grip_row.setContentsMargins(0, 0, 6, 6)
+        grip_row.addStretch(1)
+        grip_row.addWidget(QSizeGrip(self), 0, Qt.AlignRight | Qt.AlignBottom)
+        root.addLayout(grip_row)
+
+        self._update_action_buttons_state(False)
 
     # ---------------------------------------------------------------- barra topo
+    def _menu_button(self, text: str, menu: QMenu) -> QPushButton:
+        btn = QPushButton(text)
+        btn.setObjectName("TopMenuButton")
+        btn.setMenu(menu)
+        btn.setMinimumHeight(30)
+        btn.setCursor(Qt.PointingHandCursor)
+        return btn
+
     def _build_topbar(self) -> QWidget:
+        """Barra superior compacta.
+
+        A barra deve se comportar como uma barra de título do app: logo, menus,
+        estado de conexão e controles da janela. O nome do curso e o progresso
+        ficam no cabeçalho da aba Aulas, evitando o visual espremido do topo.
+        """
+        # Barra visual interna; não é mais uma titlebar customizada.
+        # Assim os botões e menus recebem clique normal em todos os Windows.
         bar = QWidget()
         bar.setObjectName("TopBar")
-        bar.setFixedHeight(78)
+        bar.setFixedHeight(52)
         layout = QHBoxLayout(bar)
-        layout.setContentsMargins(22, 12, 22, 12)
-        layout.setSpacing(18)
+        layout.setContentsMargins(14, 8, 12, 8)
+        layout.setSpacing(10)
 
         brand_box = QHBoxLayout()
         brand_box.setSpacing(0)
-        brand = QLabel("TGClass")
+        brand = QLabel("Tg")
         brand.setObjectName("Brand")
         brand_accent = QLabel("Player")
         brand_accent.setObjectName("BrandAccent")
@@ -157,35 +342,22 @@ class MainWindow(QMainWindow):
         brand_box.addWidget(brand_accent)
         layout.addLayout(brand_box)
 
-        # Curso/matéria atual + progresso geral.
-        center = QVBoxLayout()
-        center.setSpacing(3)
-        self.topbar_title = QLabel("Selecione um curso")
-        self.topbar_title.setObjectName("PageTitle")
-        center.addWidget(self.topbar_title)
+        self.account_btn = self._menu_button("Conta", self.account_menu)
+        self.tools_btn = self._menu_button("Ferramentas", self.tools_menu)
+        self.help_btn = self._menu_button("Ajuda", self.help_menu)
+        layout.addWidget(self.account_btn)
+        layout.addWidget(self.tools_btn)
+        layout.addWidget(self.help_btn)
 
-        prog_row = QHBoxLayout()
-        prog_row.setSpacing(10)
-        self.overall_progress = QProgressBar()
-        self.overall_progress.setTextVisible(True)
-        self.overall_progress.setFormat("%p% concluído")
-        self.overall_progress.setValue(0)
-        self.overall_progress.setFixedHeight(16)
-        prog_row.addWidget(self.overall_progress, 1)
-        self.overall_meta = QLabel("0/0 aulas · 0h")
-        self.overall_meta.setObjectName("Muted2")
-        prog_row.addWidget(self.overall_meta)
-        center.addLayout(prog_row)
-        layout.addLayout(center, 1)
+        # Área vazia arrastável. Não colocar título/progresso aqui.
+        layout.addStretch(1)
 
-        # Widget de banda em tempo real (some quando não há streaming ativo).
         self.bandwidth_label = QLabel("")
         self.bandwidth_label.setObjectName("Muted2")
         self.bandwidth_label.setToolTip("Banda agregada das sessões de streaming ativas")
         self.bandwidth_label.hide()
         layout.addWidget(self.bandwidth_label)
 
-        # Status da conta.
         self.status_label = QLabel("Não conectado")
         self.status_label.setObjectName("StatusLabel")
         layout.addWidget(self.status_label)
@@ -200,6 +372,12 @@ class MainWindow(QMainWindow):
         self.theme_btn.setToolTip("Alternar tema claro/escuro")
         self.theme_btn.clicked.connect(self.toggle_theme)
         layout.addWidget(self.theme_btn)
+
+        # Os botões de minimizar/maximizar/fechar ficam na moldura nativa do
+        # Windows. Não criamos duplicatas aqui para não interceptar cliques.
+        self.min_btn = None
+        self.max_btn = None
+        self.close_btn = None
 
         return bar
 
@@ -264,12 +442,28 @@ class MainWindow(QMainWindow):
         head_col = QVBoxLayout()
         head_col.setSpacing(2)
         self.course_title = QLabel("Selecione um curso")
-        self.course_title.setObjectName("PanelTitle")
+        self.course_title.setObjectName("PageTitle")
+        # topbar_title é mantido como alias para a lógica existente de progresso.
+        self.topbar_title = self.course_title
         self.course_meta = QLabel("Conecte-se ao Telegram e adicione seus grupos/canais.")
         self.course_meta.setObjectName("Muted")
         self.course_meta.setWordWrap(True)
         head_col.addWidget(self.course_title)
         head_col.addWidget(self.course_meta)
+
+        prog_row = QHBoxLayout()
+        prog_row.setSpacing(10)
+        self.overall_progress = QProgressBar()
+        self.overall_progress.setTextVisible(True)
+        self.overall_progress.setFormat("%p% concluído")
+        self.overall_progress.setValue(0)
+        self.overall_progress.setFixedHeight(14)
+        prog_row.addWidget(self.overall_progress, 1)
+        self.overall_meta = QLabel("0/0 aulas · 0h")
+        self.overall_meta.setObjectName("Muted2")
+        prog_row.addWidget(self.overall_meta)
+        head_col.addLayout(prog_row)
+
         header.addLayout(head_col, 1)
 
         self.sync_btn = QPushButton("⟳  Sincronizar")
@@ -311,16 +505,27 @@ class MainWindow(QMainWindow):
         # Árvore: módulo -> aula -> tipo -> vídeos.
         self.video_tree = QTreeWidget()
         self.video_tree.setHeaderLabels(["Aula / módulo", "Tipo", "Duração", "Status"])
+        self.video_tree.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.video_tree.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.video_tree.setAllColumnsShowFocus(False)
+        self.video_tree.setFocusPolicy(Qt.NoFocus)
+        self.video_tree.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.video_tree.setAlternatingRowColors(False)
         self.video_tree.itemSelectionChanged.connect(self.on_video_selected)
+        self.video_tree.itemClicked.connect(self.on_tree_clicked)
         self.video_tree.itemDoubleClicked.connect(self.on_tree_double_clicked)
-        self.video_tree.setRootIsDecorated(True)
+        self.video_tree.itemExpanded.connect(lambda item: self._refresh_folder_label(item))
+        self.video_tree.itemCollapsed.connect(lambda item: self._refresh_folder_label(item))
+        # Usamos setas textuais (▸/▾) dentro do rótulo. A decoração nativa do Qt
+        # fica desligada para evitar a faixa azul/roxa separada na margem esquerda.
+        self.video_tree.setRootIsDecorated(False)
         self.video_tree.setExpandsOnDoubleClick(False)
         self.video_tree.setAnimated(True)
-        self.video_tree.setIndentation(20)
+        self.video_tree.setIndentation(24)
         self.video_tree.setUniformRowHeights(False)
         self.video_tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.video_tree.customContextMenuRequested.connect(self.show_video_menu)
-        self.video_tree.setColumnWidth(0, 560)
+        self.video_tree.setColumnWidth(0, 620)
         self.video_tree.setColumnWidth(1, 120)
         self.video_tree.setColumnWidth(2, 90)
         layout.addWidget(self.video_tree, 1)
@@ -360,19 +565,27 @@ class MainWindow(QMainWindow):
         card_layout.addWidget(self.resume_bar)
 
         card_layout.addSpacing(6)
-        self.watch_btn = QPushButton("▶  Assistir agora")
+        self.watch_btn = QPushButton("▶  Abrir no Telegram")
         self.watch_btn.setObjectName("PrimaryButton")
-        self.watch_btn.clicked.connect(self.watch_selected_internal)
+        self.watch_btn.setToolTip("Abre a mensagem original no Telegram Desktop/64Gram/Nekogram pelo protocolo do sistema.")
+        self.watch_btn.clicked.connect(self.open_selected_in_telegram)
         card_layout.addWidget(self.watch_btn)
 
         row1 = QHBoxLayout()
         self.watch_vlc_btn = QPushButton("Abrir no VLC")
         self.watch_vlc_btn.clicked.connect(self.watch_selected_vlc)
+        self.resume_point_btn = QPushButton("⏱ Salvar ponto")
+        self.resume_point_btn.setToolTip("Salva manualmente o minuto em que você parou no Telegram.")
+        self.resume_point_btn.clicked.connect(self.save_resume_point_selected)
+        row1.addWidget(self.watch_vlc_btn)
+        row1.addWidget(self.resume_point_btn)
+        card_layout.addLayout(row1)
+
+        row1b = QHBoxLayout()
         self.fav_btn = QPushButton("★ Favorito")
         self.fav_btn.clicked.connect(self.toggle_favorite_selected)
-        row1.addWidget(self.watch_vlc_btn)
-        row1.addWidget(self.fav_btn)
-        card_layout.addLayout(row1)
+        row1b.addWidget(self.fav_btn)
+        card_layout.addLayout(row1b)
 
         row2 = QHBoxLayout()
         self.edit_btn = QPushButton("✎ Editar")
@@ -394,9 +607,9 @@ class MainWindow(QMainWindow):
         help_title.setObjectName("SectionTitle")
         h_layout.addWidget(help_title)
         help_text = QLabel(
-            "O app cria um link local (127.0.0.1) e carrega o vídeo por blocos, "
-            "sob demanda. A aula começa na hora, você pula para qualquer ponto "
-            "sem travar e o vídeo não fica salvo no computador."
+            "O botão principal abre a mensagem original no Telegram Desktop/64Gram/Nekogram. "
+            "Como o Telegram não envia ao TgPlayer o minuto assistido, use 'Salvar ponto' "
+            "para registrar manualmente onde você parou. O VLC continua como opção secundária."
         )
         help_text.setObjectName("Muted")
         help_text.setWordWrap(True)
@@ -407,37 +620,43 @@ class MainWindow(QMainWindow):
         return right
 
     def _build_menu(self) -> None:
-        menubar = self.menuBar()
+        """Cria menus internos usados pelos botões da barra superior.
 
-        account = menubar.addMenu("Conta")
+        Não usamos mais QMenuBar nativo aqui, porque ele criava uma faixa separada
+        acima da interface em janelas sem moldura.
+        """
+        self.account_menu = QMenu("Conta", self)
         relogin = QAction("Entrar / trocar conta", self)
         relogin.triggered.connect(self.open_login)
-        account.addAction(relogin)
+        self.account_menu.addAction(relogin)
         logout = QAction("Sair da conta (logout)", self)
         logout.triggered.connect(self.do_logout)
-        account.addAction(logout)
+        self.account_menu.addAction(logout)
+        clear_private = QAction("Limpar credenciais locais", self)
+        clear_private.triggered.connect(self.clear_private_data)
+        self.account_menu.addAction(clear_private)
 
-        tools = menubar.addMenu("Ferramentas")
+        self.tools_menu = QMenu("Ferramentas", self)
         theme_action = QAction("Alternar tema claro/escuro", self)
         theme_action.triggered.connect(self.toggle_theme)
-        tools.addAction(theme_action)
+        self.tools_menu.addAction(theme_action)
         vlc_action = QAction("Configurar VLC...", self)
         vlc_action.triggered.connect(self.choose_vlc)
-        tools.addAction(vlc_action)
+        self.tools_menu.addAction(vlc_action)
         net_action = QAction("Streaming & Rede...", self)
         net_action.triggered.connect(self.open_streaming_settings)
-        tools.addAction(net_action)
+        self.tools_menu.addAction(net_action)
         log_action = QAction("Abrir pasta de logs", self)
         log_action.triggered.connect(self.open_logs)
-        tools.addAction(log_action)
+        self.tools_menu.addAction(log_action)
         data_action = QAction("Abrir pasta de dados", self)
         data_action.triggered.connect(self.open_data_folder)
-        tools.addAction(data_action)
+        self.tools_menu.addAction(data_action)
 
-        help_menu = menubar.addMenu("Ajuda")
+        self.help_menu = QMenu("Ajuda", self)
         about = QAction("Sobre o TgPlayer", self)
         about.triggered.connect(self.show_about)
-        help_menu.addAction(about)
+        self.help_menu.addAction(about)
 
     # ====================================================================== tema
     def apply_theme(self, theme: str, persist: bool = True) -> None:
@@ -485,9 +704,37 @@ class MainWindow(QMainWindow):
             )
             if result.get("authorized"):
                 self._set_connected(result.get("me") or {})
+            elif result.get("session_revoked"):
+                # Sessão antiga foi invalidada no servidor; o arquivo local já
+                # foi apagado pelo serviço. Avisamos sem assustar e oferecemos
+                # reconexão imediata.
+                self._set_disconnected("Sessão expirada — entre novamente")
+                self._notify_session_revoked()
+            else:
+                self._set_disconnected("Sessão não conectada")
         except Exception:  # noqa: BLE001
             log.exception("Autoconexão falhou")
-            self.status_label.setText("Sessão não conectada")
+            self._set_disconnected("Sessão não conectada")
+
+    def _set_disconnected(self, text: str = "Não conectado") -> None:
+        self.status_label.setText(text)
+        self.status_label.setObjectName("StatusLabel")
+        self._repolish(self.status_label)
+        self.login_btn.setText("Conectar")
+
+    def _notify_session_revoked(self) -> None:
+        """Avisa que a sessão expirou e abre o login se o usuário quiser."""
+        resp = QMessageBox.question(
+            self,
+            "Sessão do Telegram expirou",
+            "Sua sessão do Telegram expirou ou foi encerrada em outro "
+            "dispositivo, então ela foi removida deste computador.\n\n"
+            "Deseja entrar novamente agora?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if resp == QMessageBox.Yes:
+            self.open_login()
 
     def _update_bandwidth_widget(self) -> None:
         """Mostra/atualiza a banda agregada das sessões ativas na barra superior."""
@@ -542,6 +789,38 @@ class MainWindow(QMainWindow):
         self._repolish(self.status_label)
         self.login_btn.setText("Conectar")
 
+
+    def clear_private_data(self) -> None:
+        """Remove credenciais e sessão salvas somente deste computador."""
+        if QMessageBox.question(
+            self,
+            "Limpar credenciais locais",
+            "Isso apagará API ID, API HASH, telefone e arquivos de sessão salvos "
+            "neste computador. Cursos/progresso continuam no banco local.\n\n"
+            "Depois será necessário fazer login novamente. Deseja continuar?",
+        ) != QMessageBox.Yes:
+            return
+        try:
+            for key in ("api_id", "api_hash", "phone_number", "auth_flood_wait_until"):
+                self.db.set_setting(key, "")
+            for path in SESSION_DIR.glob("*"):
+                try:
+                    if path.is_file():
+                        path.unlink()
+                except Exception:  # noqa: BLE001
+                    pass
+            QMessageBox.information(
+                self,
+                "Credenciais removidas",
+                f"Credenciais e sessões locais apagadas.\n\nPasta de dados deste computador:\n{DATA_DIR}",
+            )
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "Erro", f"Não foi possível limpar tudo: {exc}")
+        self.status_label.setText("Não conectado")
+        self.status_label.setObjectName("StatusLabel")
+        self._repolish(self.status_label)
+        self.login_btn.setText("Conectar")
+
     # =================================================================== cursos
     def add_courses_from_telegram(self) -> None:
         try:
@@ -558,8 +837,20 @@ class MainWindow(QMainWindow):
             self.refresh_courses()
             if selected:
                 QMessageBox.information(self, "Cursos", f"{len(selected)} curso(s) adicionado(s).")
+        except SessionRevokedError:
+            # Sessão revogada no servidor (ex.: AUTH_KEY_UNREGISTERED). O serviço
+            # já apagou o arquivo de sessão; aqui só precisamos reautenticar.
+            log.warning("Sessão revogada ao listar cursos; pedindo novo login.")
+            self._set_disconnected("Sessão expirada — entre novamente")
+            self._notify_session_revoked()
         except Exception as exc:  # noqa: BLE001
             log.exception("Erro ao adicionar cursos")
+            # Mesmo que o serviço não tenha classificado como SessionRevokedError,
+            # detectamos a assinatura clássica do erro e oferecemos reconexão.
+            if _looks_like_session_error(exc):
+                self._set_disconnected("Sessão expirada — entre novamente")
+                self._notify_session_revoked()
+                return
             QMessageBox.critical(
                 self, "Erro ao adicionar cursos",
                 f"{exc}\n\nSe a sessão aparecer conectada mas o erro continuar, "
@@ -724,14 +1015,23 @@ class MainWindow(QMainWindow):
                 f"{len(result.get('videos') or [])} vídeo(s) em "
                 f"{result.get('scanned')} mensagens analisadas.",
             )
+        except SessionRevokedError:
+            log.warning("Sessão revogada ao sincronizar; pedindo novo login.")
+            self._set_disconnected("Sessão expirada — entre novamente")
+            self._notify_session_revoked()
         except Exception as exc:  # noqa: BLE001
             log.exception("Erro ao sincronizar curso")
+            if _looks_like_session_error(exc):
+                self._set_disconnected("Sessão expirada — entre novamente")
+                self._notify_session_revoked()
+                return
             QMessageBox.critical(self, "Erro ao sincronizar", f"{exc}")
 
     def _apply_sync_result(self, course_id: int, result: dict[str, Any]) -> None:
         """Cria/atualiza matérias e liga cada vídeo à sua matéria, preservando edições."""
         # 1) Matérias (subjects). Mapa telegram_topic_id -> subject_id.
         topic_to_subject: dict[str, int] = {}
+        ordered_subject_ids: list[int] = []
         for s in result.get("subjects") or []:
             tg_id = str(s.get("telegram_topic_id") or "")
             subject_id = self.db.find_or_create_subject(
@@ -744,9 +1044,23 @@ class MainWindow(QMainWindow):
             # Atualiza o sumário vindo do Telegram apenas se a matéria não tiver
             # sido editada manualmente pelo usuário.
             existing = self.db.get_subject(subject_id)
-            if existing and not existing.manual and s.get("summary_text"):
-                self.db.update_subject_summary(subject_id, s.get("summary_text"))
+            if existing and not existing.manual:
+                new_title = s.get("title") or "Matéria"
+                if new_title and new_title != existing.title:
+                    self.db.rename_subject(subject_id, new_title)
+                if s.get("summary_text"):
+                    self.db.update_subject_summary(subject_id, s.get("summary_text"))
             topic_to_subject[tg_id] = subject_id
+            ordered_subject_ids.append(subject_id)
+
+        # Mantém a ordem detectada no Telegram (tópicos/sumários) também quando
+        # a matéria já existia no banco. Sem isso, ressincronizar não corrigia a
+        # ordem antiga e o sumário parecia continuar bagunçado.
+        if ordered_subject_ids:
+            try:
+                self.db.reorder_subjects(ordered_subject_ids)
+            except Exception:  # noqa: BLE001
+                pass
 
         # 2) Vídeos: resolve subject_id pelo telegram_topic_id de cada vídeo.
         videos = []
@@ -1046,6 +1360,8 @@ class MainWindow(QMainWindow):
             )
             self.video_tree.addTopLevelItem(placeholder)
         self.video_tree.expandToDepth(0 if not single_subject else 2)
+        self._refresh_tree_folder_labels()
+        self._update_action_buttons_state(False)
 
     def _show_empty_lessons(self, message: str) -> None:
         """Estado vazio amigável na lista de aulas (empty state)."""
@@ -1058,13 +1374,16 @@ class MainWindow(QMainWindow):
     ) -> bool:
         """Renderiza uma matéria: árvore módulo->aula->tipo + 'Sem módulo'."""
         result = match_videos_to_tree(subject.summary_text, subject_videos, subject.title)
-        matched_ids = result.matched_ids
+        # result.matched_ids fica disponível para diagnóstico futuro; a renderização
+        # usa um mapeamento mais robusto abaixo.
 
-        # Índice tag -> vídeo (primeiro com a hashtag) para casar nós do sumário.
-        tag_map: dict[str, Video] = {}
-        for v in subject_videos:
-            for tag in v.hashtags:
-                tag_map.setdefault("#" + tag.lstrip("#").upper(), v)
+        # Índice tag do SUMÁRIO -> vídeos. Quando o Telegram/vidsender coloca a
+        # mesma hashtag em várias aulas (ex.: tudo como #CAR01), o casamento por
+        # hashtag deixa o sumário bagunçado. Por isso esta função detecta baixa
+        # cobertura/duplicação e distribui as aulas pela ORDEM do sumário.
+        tag_map: dict[str, list[Video]] = self._assign_videos_to_summary_tags(
+            result.tree, subject_videos
+        )
 
         shown: set[int] = set()
 
@@ -1078,20 +1397,14 @@ class MainWindow(QMainWindow):
             if self._add_menu_node(subject_root, node, tag_map, shown, query, filter_key):
                 any_visible = True
 
-        # Vídeos da matéria que não casaram com o sumário -> "Sem módulo".
+        # Vídeos ainda não exibidos -> "Sem módulo". Isso cobre aulas extras,
+        # arquivos sem tag e qualquer sobra após a distribuição sequencial.
         leftover = [
             v for v in subject_videos
-            if v.id not in shown and v.id not in matched_ids
-            and self._video_passes(v, query, filter_key)
-        ]
-        # Também inclui vídeos casados por tag mas cujo nó não os exibiu (raro).
-        leftover += [
-            v for v in subject_videos
-            if v.id not in shown and v.id in matched_ids
-            and self._video_passes(v, query, filter_key)
+            if v.id not in shown and self._video_passes(v, query, filter_key)
         ]
         if leftover:
-            folder = self._make_folder("Sem módulo", "módulo")
+            folder = self._make_folder("Sem módulo / Não classificadas", "módulo")
             for v in sorted(leftover, key=lambda x: x.message_id):
                 folder.addChild(self._video_item(v))
                 shown.add(v.id)
@@ -1110,8 +1423,154 @@ class MainWindow(QMainWindow):
             return True
         return False
 
+    @staticmethod
+    def _video_relevance_for_node(video: Video, node_title: str) -> int:
+        """Pontua se a aula parece corresponder ao rótulo do sumário.
+
+        Necessário quando várias aulas compartilham a mesma hashtag (#PSI01, por
+        exemplo). Sem isso, a primeira ocorrência da tag engole todas as aulas e
+        o sumário fica aparentemente bagunçado.
+        """
+        title = (node_title or "").casefold()
+        # Ignora rótulos genéricos demais.
+        generic = {"videoaula", "video aula", "aulas", "aula", "resumo", "módulo", "modulo"}
+        if title.strip() in generic:
+            return 0
+        terms = [
+            t for t in re.findall(r"[a-zA-ZÀ-ÿ0-9]{3,}", title)
+            if t.casefold() not in {"video", "aula", "videoaula", "mp4", "mkv", "mov"}
+        ]
+        if not terms:
+            return 0
+        hay = " ".join([
+            video.title or "", video.file_name or "", video.caption or "",
+            video.module or "", video.lesson or "", video.type or "",
+        ]).casefold()
+        score = 0
+        for term in terms:
+            if term.casefold() in hay:
+                score += 2 if len(term) >= 5 else 1
+        return score
+
+    @staticmethod
+    def _summary_tags_in_order(node) -> list[str]:
+        """Retorna as hashtags do sumário na ordem visual da árvore."""
+        tags: list[str] = []
+
+        def walk(n) -> None:
+            for tag in getattr(n, "tags", []) or []:
+                norm = "#" + str(tag).lstrip("#").upper()
+                tags.append(norm)
+            for child in getattr(n, "children", []) or []:
+                walk(child)
+
+        walk(node)
+        return tags
+
+    @staticmethod
+    def _slots_look_like_sequential_course(tags: list[str]) -> bool:
+        """Detecta sumários tipo #CAR01 #CAR02 ... #CAR50.
+
+        Nesses cursos, os nomes reais dos arquivos podem vir todos com #CAR01
+        ou com códigos repetidos inferidos do padrão "CAR 1 01". Quando o sumário
+        é claramente uma sequência, a ordem visual do sumário deve vencer.
+        """
+        nums: list[int] = []
+        prefixes: set[str] = set()
+        for tag in tags:
+            m = re.fullmatch(r"#([A-ZÀ-Ÿ]{2,10})(\d{2,3})", str(tag).upper())
+            if not m:
+                continue
+            prefixes.add(m.group(1))
+            nums.append(int(m.group(2)))
+        if len(nums) < max(5, len(tags) * 0.7):
+            return False
+        if len(prefixes) != 1:
+            return False
+        nums_sorted = nums
+        sequential_hits = sum(1 for a, b in zip(nums_sorted, nums_sorted[1:]) if b == a + 1)
+        return sequential_hits >= max(3, len(nums_sorted) - 3)
+
+    @staticmethod
+    def _video_order_key(video: Video) -> tuple[int, int, str]:
+        # sort_order 0 em bancos antigos pode ser neutro para todos; message_id
+        # preserva a ordem do Telegram depois que a sync reverte o histórico.
+        return (int(video.sort_order or 0), int(video.message_id or 0), video.title or "")
+
+    @staticmethod
+    def _normalized_video_tags(video: Video) -> set[str]:
+        return {"#" + str(t).lstrip("#").upper() for t in (video.hashtags or [])}
+
+    def _assign_videos_to_summary_tags(self, tree, videos: list[Video]) -> dict[str, list[Video]]:
+        """Casa vídeos com as tags do sumário sem bagunçar a ordem.
+
+        Muitos canais criados por bots/vidsender colocam uma hashtag de tópico
+        no nome de TODAS as aulas (ex.: #CAR01), enquanto o sumário usa #CAR01,
+        #CAR02, #CAR03... como atalhos/slots. Se usarmos somente a hashtag, todas
+        as aulas caem no primeiro subtópico. A regra abaixo faz:
+
+        1. Usa casamento exato quando várias tags distintas cobrem os vídeos.
+        2. Se detectar baixa cobertura ou colisão forte, distribui pela ordem do
+           sumário e pela ordem das mensagens no Telegram.
+        3. Nunca esconde aulas; sobras aparecem em "Sem módulo".
+        """
+        slots = self._summary_tags_in_order(tree)
+        if not slots:
+            return {}
+        ordered_videos = sorted(videos, key=self._video_order_key)
+        exact: dict[str, list[Video]] = {tag: [] for tag in slots}
+        slot_set = set(slots)
+        for v in ordered_videos:
+            for tag in self._normalized_video_tags(v):
+                if tag in slot_set:
+                    exact.setdefault(tag, []).append(v)
+
+        distinct_slots_with_hits = sum(1 for tag, vals in exact.items() if vals)
+        max_collision = max((len(vals) for vals in exact.values()), default=0)
+        useful_slots = max(1, min(len(slots), len(ordered_videos)))
+        coverage = distinct_slots_with_hits / useful_slots
+        # Ambíguo: poucas tags distintas bateram, ou uma única tag engoliu muita
+        # coisa. Ex.: 50 aulas contendo #CAR01 e sumário com #CAR01..#CAR50.
+        sequential_summary = self._slots_look_like_sequential_course(slots)
+        ambiguous = bool(
+            len(slots) >= 3 and ordered_videos and (
+                sequential_summary
+                or coverage < 0.45
+                or max_collision >= max(4, len(ordered_videos) // 3)
+            )
+        )
+
+        assigned: dict[str, list[Video]] = {tag: [] for tag in slots}
+        used: set[int] = set()
+
+        if not ambiguous:
+            for tag in slots:
+                candidates = [v for v in exact.get(tag, []) if v.id not in used]
+                if not candidates:
+                    continue
+                # Em caso de colisão moderada, mantém só a primeira na ordem do
+                # Telegram; as demais continuam disponíveis para slots vazios.
+                chosen = sorted(candidates, key=self._video_order_key)[0]
+                assigned[tag].append(chosen)
+                used.add(chosen.id)
+
+        # Preenche slots vazios pela ordem do sumário. Este é o modo que corrige
+        # o caso CARDIO: CAR1/CAR2/CAR3 com tags sequenciais no sumário, mas tags
+        # repetidas nas aulas reais.
+        remaining = [v for v in ordered_videos if v.id not in used]
+        rem_idx = 0
+        for tag in slots:
+            if assigned.get(tag):
+                continue
+            if rem_idx < len(remaining):
+                assigned[tag].append(remaining[rem_idx])
+                used.add(remaining[rem_idx].id)
+                rem_idx += 1
+
+        return assigned
+
     def _add_menu_node(
-        self, parent, node, tag_map: dict[str, Video], shown: set[int],
+        self, parent, node, tag_map: dict[str, list[Video]], shown: set[int],
         query: str, filter_key: str,
     ) -> bool:
         item = self._make_folder(node.title, self._level_name(node.level))
@@ -1120,8 +1579,16 @@ class MainWindow(QMainWindow):
             if self._add_menu_node(item, child, tag_map, shown, query, filter_key):
                 any_visible = True
         for tag in node.tags:
-            video = tag_map.get("#" + tag.lstrip("#").upper())
-            if video and video.id not in shown and self._video_passes(video, query, filter_key):
+            videos_for_tag = [
+                v for v in tag_map.get("#" + tag.lstrip("#").upper(), [])
+                if v.id not in shown and self._video_passes(v, query, filter_key)
+            ]
+            if len(videos_for_tag) > 1:
+                ranked = [(self._video_relevance_for_node(v, node.title), v) for v in videos_for_tag]
+                best = [v for score, v in ranked if score > 0]
+                if best:
+                    videos_for_tag = best
+            for video in sorted(videos_for_tag, key=lambda x: x.message_id):
                 item.addChild(self._video_item(video, prefix=tag))
                 shown.add(video.id)
                 any_visible = True
@@ -1138,14 +1605,108 @@ class MainWindow(QMainWindow):
         return {1: "módulo", 2: "aula", 3: "tipo"}.get(level, "módulo")
 
     def _make_folder(self, title: str, kind: str) -> QTreeWidgetItem:
-        item = QTreeWidgetItem([title, "", "", kind])
+        # Pastas não preenchem as colunas Tipo/Duração/Status. Antes apareciam
+        # textos como "módulo"/"aula" no canto direito e a seleção ficava parecendo
+        # quebrada em blocos roxos separados.
+        item = QTreeWidgetItem([title, "", "", ""])
         item.setData(0, ROLE_NODE_TYPE, "folder")
+        item.setData(0, ROLE_RAW_TITLE, title)
+        item.setData(0, ROLE_RAW_TITLE + 1, kind)
         font = item.font(0)
         font.setBold(True)
         item.setFont(0, font)
         item.setForeground(0, QColor(palette(self.theme)["text"]))
+        item.setToolTip(0, "Pasta/tópico: expanda para escolher uma videoaula")
+        item.setSizeHint(0, QSize(0, 42))
         item.setExpanded(False)
+        self._refresh_folder_label(item)
         return item
+
+    @staticmethod
+    def _tree_item_depth(item: QTreeWidgetItem | None) -> int:
+        """Profundidade visual do item na árvore.
+
+        Como a seta nativa do Qt fica desativada para evitar a faixa azul/roxa
+        separada, aplicamos recuo textual. Isso devolve a hierarquia visual
+        (módulo > subtópico > tipo > aula) sem reintroduzir o bug da seleção.
+        """
+        depth = 0
+        parent = item.parent() if item is not None else None
+        while parent is not None:
+            depth += 1
+            parent = parent.parent()
+        return depth
+
+    @staticmethod
+    def _visual_indent(depth: int) -> str:
+        return "  " * max(0, depth)
+
+    def _refresh_folder_label(self, item: QTreeWidgetItem) -> None:
+        """Mantém seta textual e recuo hierárquico visíveis."""
+        try:
+            if item.data(0, ROLE_NODE_TYPE) != "folder":
+                return
+            raw = item.data(0, ROLE_RAW_TITLE) or item.text(0)
+            arrow = "▾" if item.isExpanded() else "▸"
+            icon = "📂" if item.isExpanded() else "📁"
+            indent = self._visual_indent(self._tree_item_depth(item))
+            item.setText(0, f"{indent}{arrow} {icon} {raw}")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _refresh_video_label(self, item: QTreeWidgetItem) -> None:
+        try:
+            if item.data(0, ROLE_NODE_TYPE) != "video":
+                return
+            raw = item.data(0, ROLE_RAW_TITLE) or item.text(0)
+            indent = self._visual_indent(self._tree_item_depth(item))
+            item.setText(0, f"{indent}{raw}")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _refresh_tree_folder_labels(self) -> None:
+        def walk(item: QTreeWidgetItem) -> None:
+            if item.data(0, ROLE_NODE_TYPE) == "folder":
+                self._refresh_folder_label(item)
+            elif item.data(0, ROLE_NODE_TYPE) == "video":
+                self._refresh_video_label(item)
+            for i in range(item.childCount()):
+                walk(item.child(i))
+        for i in range(self.video_tree.topLevelItemCount()):
+            walk(self.video_tree.topLevelItem(i))
+
+    @staticmethod
+    def _find_video_descendants(item: QTreeWidgetItem) -> list[QTreeWidgetItem]:
+        found: list[QTreeWidgetItem] = []
+        for i in range(item.childCount()):
+            child = item.child(i)
+            if child.data(0, ROLE_NODE_TYPE) == "video" and child.data(0, ROLE_VIDEO_ID):
+                found.append(child)
+            found.extend(MainWindow._find_video_descendants(child))
+        return found
+
+    @staticmethod
+    def _is_video_item(item: QTreeWidgetItem | None) -> bool:
+        return bool(item and item.data(0, ROLE_NODE_TYPE) == "video" and item.data(0, ROLE_VIDEO_ID))
+
+    @staticmethod
+    def _is_folder_item(item: QTreeWidgetItem | None) -> bool:
+        return bool(item and item.data(0, ROLE_NODE_TYPE) == "folder")
+
+    def selected_node_type(self) -> str | None:
+        items = self.video_tree.selectedItems()
+        if not items:
+            return None
+        return items[0].data(0, ROLE_NODE_TYPE)
+
+    def _update_action_buttons_state(self, has_video: bool | None = None) -> None:
+        if has_video is None:
+            items = self.video_tree.selectedItems() if hasattr(self, "video_tree") else []
+            has_video = bool(items and self._is_video_item(items[0]))
+        for name in ("watch_btn", "watch_vlc_btn", "resume_point_btn", "fav_btn", "edit_btn", "mark_btn"):
+            btn = getattr(self, name, None)
+            if btn is not None:
+                btn.setEnabled(bool(has_video))
 
     @staticmethod
     def _video_meta_badge(video: Video) -> str:
@@ -1175,8 +1736,15 @@ class MainWindow(QMainWindow):
 
     def _video_item(self, video: Video, prefix: str | None = None) -> QTreeWidgetItem:
         star = "★ " if video.favorite else ""
-        check = "✅ " if video.watched_at else "⬜ "
-        title = f"{check}{star}{prefix} — {video.title}" if prefix else f"{check}{star}{video.title}"
+        # Videoaula NÃO usa seta triangular para não confundir com pasta expansível.
+        # A seta ▸/▾ fica exclusiva dos módulos/tópicos.
+        media_icon = "🎬 "
+        progress_icon = "✓ " if video.watched_at else ("◐ " if video.progress and video.progress > 0.02 else "")
+        display_title = re.sub(r"^#\w+\s*[—–-]\s*", "", video.title or "Aula").strip()
+        title = (
+            f"{media_icon}{progress_icon}{star}{prefix} — {display_title}"
+            if prefix else f"{media_icon}{progress_icon}{star}{display_title}"
+        )
         if video.watched_at:
             status = "assistida"
         elif video.progress and video.progress > 0.02:
@@ -1191,7 +1759,11 @@ class MainWindow(QMainWindow):
         item = QTreeWidgetItem(
             [title, type_col, human_duration(video.duration), status]
         )
+        item.setData(0, ROLE_NODE_TYPE, "video")
         item.setData(0, ROLE_VIDEO_ID, video.id)
+        item.setData(0, ROLE_RAW_TITLE, title)
+        item.setSizeHint(0, QSize(0, 38))
+        item.setToolTip(0, "Videoaula: duplo clique para assistir")
         if video.watched_at:
             item.setForeground(0, QColor(palette(self.theme)["muted"]))
         return item
@@ -1208,39 +1780,60 @@ class MainWindow(QMainWindow):
         self.resume_bar.hide()
         self.fav_btn.setText("★ Favorito")
         self.mark_btn.setText("✓ Assistida")
+        self._update_action_buttons_state(False)
+
+    def on_tree_clicked(self, item: QTreeWidgetItem, column: int) -> None:
+        """Clique simples em pasta apenas atualiza a seta textual.
+
+        A expansão real fica no duplo clique, evitando abrir/fechar pastas sem
+        querer ao navegar pela lista. Com rootIsDecorated(False), a seta é parte
+        do texto e permanece alinhada/visível.
+        """
+        if self._is_folder_item(item) and column == 0:
+            self._refresh_folder_label(item)
 
     def on_tree_double_clicked(self, item: QTreeWidgetItem, _column: int) -> None:
-        video_id = item.data(0, ROLE_VIDEO_ID)
-        if video_id:
-            self.current_video_id = int(video_id)
-            self.watch_selected_internal()
+        if self._is_video_item(item):
+            self.current_video_id = int(item.data(0, ROLE_VIDEO_ID))
+            self.open_selected_in_telegram()
             return
-        if item.childCount() > 0:
-            item.setExpanded(not item.isExpanded())
+        if self._is_folder_item(item):
+            videos = self._find_video_descendants(item)
+            if len(videos) == 1:
+                self.video_tree.setCurrentItem(videos[0])
+                self.current_video_id = int(videos[0].data(0, ROLE_VIDEO_ID))
+                return
+            if item.childCount() > 0:
+                item.setExpanded(not item.isExpanded())
+                self._refresh_folder_label(item)
 
     def on_video_selected(self) -> None:
         items = self.video_tree.selectedItems()
         if not items:
+            self.current_video_id = None
+            self._clear_detail()
             return
         item = items[0]
         video_id = item.data(0, ROLE_VIDEO_ID)
-        if not video_id:
+        if not self._is_video_item(item):
             self.current_video_id = None
-            self.video_title.setText(item.text(0))
+            self.video_title.setText(str(item.data(0, ROLE_RAW_TITLE) or item.text(0)))
+            videos_inside = len(self._find_video_descendants(item))
             self.video_info.setText(
-                f"Pasta/agrupamento · {item.childCount()} item(ns). "
-                "Escolha uma aula para ver detalhes."
+                "Você selecionou uma pasta/tópico. Expanda esta seção e escolha "
+                f"uma videoaula.\n\nVideoaulas dentro desta pasta: {videos_inside}."
             )
             self.resume_bar.hide()
+            self._update_action_buttons_state(False)
             return
         self.current_video_id = int(video_id)
+        self._update_action_buttons_state(True)
         video = self.db.get_video(self.current_video_id)
         if not video:
             return
-        # Warm-up: aquece o início desta aula em 2º plano (debounce ~400 ms),
-        # para que clicar "Assistir" abra o vídeo quase instantaneamente.
-        self._schedule_warmup(self.current_video_id)
-        self.video_title.setText(("★ " if video.favorite else "") + video.title)
+        # O player local foi removido da rota principal; não fazemos mais warm-up
+        # de streaming ao selecionar uma aula, evitando travamentos/erros de peer.
+        self.video_title.setText(("★ " if video.favorite else "") + re.sub(r"^#\w+\s*[—–-]\s*", "", video.title or "Aula"))
         tags = " ".join(video.hashtags) or "sem hashtags"
         if video.watched_at:
             status = "Assistida"
@@ -1249,7 +1842,10 @@ class MainWindow(QMainWindow):
         else:
             status = "Não assistida"
         subject = self.db.get_subject(video.subject_id) if video.subject_id else None
-        line1 = f"{human_size(video.size)} · {human_duration(video.duration)} · {status}"
+        resume_text = ""
+        if video.position_ms and video.position_ms > 1000:
+            resume_text = f" · parou em {human_duration(video.position_ms // 1000)}"
+        line1 = f"{human_size(video.size)} · {human_duration(video.duration)} · {status}{resume_text}"
         badge = self._video_meta_badge(video)
         if badge:
             line1 += f" · {badge}"
@@ -1275,7 +1871,14 @@ class MainWindow(QMainWindow):
 
     def selected_video(self) -> Video | None:
         if not self.current_video_id:
-            QMessageBox.information(self, "Aula", "Selecione uma videoaula primeiro.")
+            node_type = self.selected_node_type()
+            if node_type == "folder":
+                QMessageBox.information(
+                    self, "Aula",
+                    "Você selecionou uma pasta/tópico. Expanda esta seção e escolha uma videoaula.",
+                )
+            else:
+                QMessageBox.information(self, "Aula", "Selecione uma videoaula primeiro.")
             return None
         return self.db.get_video(self.current_video_id)
 
@@ -1291,31 +1894,31 @@ class MainWindow(QMainWindow):
         if not video:
             return
         menu = QMenu(self)
-        watch = menu.addAction("▶ Assistir")
+        watch = menu.addAction("▶ Abrir no Telegram")
         vlc = menu.addAction("Abrir no VLC")
+        save_point = menu.addAction("⏱ Salvar ponto onde parei")
         menu.addSeparator()
         edit = menu.addAction("✎ Editar aula")
         fav = menu.addAction("☆ Remover favorito" if video.favorite else "★ Favoritar")
         mark = menu.addAction(
             "Marcar como NÃO assistida" if video.watched_at else "✓ Marcar como assistida"
         )
-        copy = menu.addAction("Copiar link temporário")
         tg_link = menu.addAction("Copiar link do Telegram (t.me)")
         menu.addSeparator()
         delete = menu.addAction("Remover da lista")
         action = menu.exec(self.video_tree.mapToGlobal(pos))
         if action == watch:
-            self.watch_selected_internal()
+            self.open_selected_in_telegram()
         elif action == vlc:
             self.watch_selected_vlc()
+        elif action == save_point:
+            self.save_resume_point_selected()
         elif action == edit:
             self.edit_selected_video()
         elif action == fav:
             self.toggle_favorite_selected()
         elif action == mark:
             self.toggle_watched_selected()
-        elif action == copy:
-            self.copy_stream_url()
         elif action == tg_link:
             self.copy_telegram_link()
         elif action == delete:
@@ -1371,11 +1974,70 @@ class MainWindow(QMainWindow):
         self._refresh_after_change()
         self._reselect_video(video.id)
 
+    def save_resume_point_selected(self) -> None:
+        """Salva manualmente o ponto em que o usuário parou no Telegram.
+
+        O Telegram Desktop/64Gram/Nekogram não expõe para apps externos o tempo
+        exato visto no player. Por isso o TgPlayer permite registrar manualmente
+        o minuto para exibir e retomar depois.
+        """
+        video = self.selected_video()
+        if not video:
+            return
+        default = human_duration((video.position_ms or 0) // 1000) if video.position_ms else "0:00"
+        text, ok = QInputDialog.getText(
+            self,
+            "Salvar ponto da aula",
+            "Em qual tempo você parou? Use mm:ss ou hh:mm:ss:",
+            text=default,
+        )
+        if not ok:
+            return
+        seconds = self._parse_time_to_seconds(text)
+        if seconds is None:
+            QMessageBox.warning(self, "Tempo inválido", "Digite no formato mm:ss ou hh:mm:ss. Exemplo: 12:34")
+            return
+        duration_ms = int(video.duration * 1000) if video.duration else None
+        self.db.save_progress(video.id, int(seconds * 1000), duration_ms)
+        self._refresh_after_change()
+        self._reselect_video(video.id)
+
+    @staticmethod
+    def _parse_time_to_seconds(text: str) -> int | None:
+        text = (text or "").strip().replace(",", ":")
+        if not text:
+            return None
+        if text.isdigit():
+            return int(text) * 60
+        parts = text.split(":")
+        if len(parts) not in (2, 3):
+            return None
+        try:
+            nums = [int(p) for p in parts]
+        except ValueError:
+            return None
+        if any(n < 0 for n in nums):
+            return None
+        if len(nums) == 2:
+            m, sec = nums
+            if sec >= 60:
+                return None
+            return m * 60 + sec
+        h, m, sec = nums
+        if m >= 60 or sec >= 60:
+            return None
+        return h * 3600 + m * 60 + sec
+
     # =================================================================== player
     def _stream_payload(self, video: Video) -> dict[str, Any]:
+        course = self.db.get_course(video.course_id)
         return {
+            "course_id": video.course_id,
             "chat_id": video.chat_id,
+            "chat_username": getattr(course, "username", None) if course else None,
             "message_id": video.message_id,
+            "file_id": getattr(video, "file_id", None),
+            "file_unique_id": getattr(video, "file_unique_id", None),
             "title": video.title,
             "file_name": video.file_name,
             "mime_type": video.mime_type,
@@ -1430,9 +2092,14 @@ class MainWindow(QMainWindow):
         video = self.db.get_video(video_id)
         if not video or not video.size:
             return
+        course = self.db.get_course(video.course_id)
         payload = {
+            "course_id": video.course_id,
             "chat_id": video.chat_id,
+            "chat_username": getattr(course, "username", None) if course else None,
             "message_id": video.message_id,
+            "file_id": getattr(video, "file_id", None),
+            "file_unique_id": getattr(video, "file_unique_id", None),
             "size": video.size,
             "mime_type": video.mime_type,
             "duration": video.duration,
@@ -1463,163 +2130,103 @@ class MainWindow(QMainWindow):
         except Exception:  # noqa: BLE001
             pass
 
-    def watch_selected_internal(self) -> None:
+    def _telegram_urls_for_video(self, video: Video) -> tuple[str | None, str | None]:
+        """Retorna (app_url, web_url) para abrir a mensagem original no Telegram.
+
+        - Canal/grupo público: tg://resolve?domain=...&post=... + https://t.me/...
+        - Canal/grupo privado/supergrupo: tg://privatepost?... + https://t.me/c/...
+
+        O link privado funciona quando o usuário é membro do chat no Telegram
+        Desktop/64Gram/Nekogram.
+        """
+        course = self.db.get_course(video.course_id) if video.course_id else None
+        username = (getattr(course, "username", None) or "").strip().lstrip("@") or None
+        return self.service.telegram_message_urls(username, video.chat_id, video.message_id)
+
+    def open_selected_in_telegram(self) -> None:
         video = self.selected_video()
         if not video:
             return
-        self._open_player_for(video)
+        app_url, web_url = self._telegram_urls_for_video(video)
+        if not app_url and not web_url:
+            QMessageBox.information(
+                self,
+                "Abrir no Telegram",
+                "Não consegui montar um link nativo para esta aula. "
+                "Tente sincronizar o curso novamente ou copie o link pelo menu.",
+            )
+            return
+        opened = False
+        # O protocolo tg:// abre Telegram Desktop e derivados quando registrados no Windows.
+        if app_url:
+            try:
+                opened = bool(QDesktopServices.openUrl(QUrl(app_url)))
+            except Exception:  # noqa: BLE001
+                opened = False
+        # Em links privados, ou quando tg:// não estiver registrado, t.me/c é o fallback.
+        if not opened and web_url:
+            try:
+                opened = bool(QDesktopServices.openUrl(QUrl(web_url)))
+            except Exception:  # noqa: BLE001
+                opened = False
+        if web_url:
+            QApplication.clipboard().setText(web_url)
+        if not opened:
+            QMessageBox.information(
+                self,
+                "Link copiado",
+                "Não consegui abrir automaticamente, mas copiei o link da aula. "
+                "Cole no Telegram Desktop ou no navegador.",
+            )
+        else:
+            # Não marca como assistida: abrir a mensagem no Telegram não prova que
+            # a aula foi vista. Registra apenas acesso mínimo para aparecer em continuar.
+            try:
+                duration_ms = int(video.duration * 1000) if video.duration else None
+                self.db.save_progress(video.id, max(1, int(video.position_ms or 0)), duration_ms)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def watch_selected_internal(self) -> None:
+        """Player local removido da interface principal.
+
+        Mantemos este método apenas por compatibilidade com versões antigas/tests.
+        """
+        QMessageBox.information(
+            self,
+            "Player local removido",
+            "O player local foi removido porque dependia de codecs/streaming instáveis. "
+            "Use Abrir no Telegram ou Abrir no VLC.",
+        )
 
     def _play_media_video(self, media: dict[str, Any]) -> None:
-        """Abre o player interno para um vídeo vindo da aba 🗂️ Arquivos.
-
-        A aba Arquivos lida com mídia avulsa (sem linha em `videos`); montamos
-        um payload de streaming direto e reutilizamos o `VideoPlayerDialog`.
-        """
+        """Abre mídia avulsa da aba Arquivos diretamente no Telegram quando possível."""
         try:
-            payload = {
-                "chat_id": media.get("chat_id"),
-                "message_id": media.get("message_id"),
-                "title": media.get("title") or media.get("file_name") or "Vídeo",
-                "file_name": media.get("file_name"),
-                "mime_type": media.get("mime_type"),
-                "size": media.get("size"),
-                "start_position_ms": 0,
-            }
-            stream = wait_future(
-                self.service.call(self.service.prepare_stream(payload)),
-                "Streaming", "Preparando o vídeo…", self,
-            )
-            if not isinstance(stream, dict):
-                return
-            try:
-                dlg = VideoPlayerDialog(
-                    payload["title"],
-                    stream.get("stream_url") or stream.get("url"),
-                    stream.get("token"),
-                    self.service,
-                    start_position_ms=0,
-                    on_progress=lambda *_: None,
-                    on_open_vlc=lambda: self._launch_vlc(
-                        stream.get("stream_url") or stream.get("url")
-                    ),
-                    player_url=stream.get("player_url"),
-                    source_width=media.get("width"),
-                    source_height=media.get("height"),
-                    parent=self,
-                )
-            except Exception as exc:  # noqa: BLE001
-                QMessageBox.critical(self, "Player indisponível", str(exc))
-                return
-            dlg.exec()
+            course = self.get_current_course()
+            username = getattr(course, "username", None) if course else None
+            chat_id = media.get("chat_id") or getattr(course, "chat_id", None)
+            message_id = int(media.get("message_id") or 0)
+            app_url, web_url = self.service.telegram_message_urls(username, chat_id, message_id)
+            opened = False
+            if app_url:
+                opened = bool(QDesktopServices.openUrl(QUrl(app_url)))
+            if not opened and web_url:
+                opened = bool(QDesktopServices.openUrl(QUrl(web_url)))
+            if web_url:
+                QApplication.clipboard().setText(web_url)
+            if not opened:
+                QMessageBox.information(self, "Abrir no Telegram", "Não consegui abrir automaticamente, mas copiei o link da mídia.")
         except Exception as exc:  # noqa: BLE001
-            log.exception("Erro ao abrir vídeo da aba Arquivos")
-            QMessageBox.critical(self, "Erro no streaming", f"{exc}")
+            log.exception("Erro ao abrir mídia no Telegram")
+            QMessageBox.critical(self, "Erro", str(exc))
 
     def _open_player_for(self, video: Video) -> None:
-        """Abre o player premium para `video`, com navegação/qualidade/debug."""
-        try:
-            stream = self._prepare_stream(video)
-            if not stream:
-                return
-            video_id = video.id
-            playlist, index = self._playlist_for(video)
-            # Pré-busca de metadados (resolução/duração) e miniatura em 2º plano.
-            if not (video.width and video.height):
-                self._prefetch_video_meta(video)
-
-            def save_progress(position_ms: int, duration_ms: int) -> None:
-                try:
-                    self.db.save_progress(video_id, position_ms, duration_ms)
-                except Exception:  # noqa: BLE001
-                    pass
-
-            def open_vlc() -> None:
-                self._launch_vlc(stream.get("stream_url") or stream.get("url"))
-
-            def quality_change(quality: str, adaptive: bool) -> None:
-                try:
-                    self.service.set_quality(quality, adaptive)
-                    self.db.set_setting("streaming_quality", quality)
-                    self.db.set_setting("adaptive_mode", "1" if adaptive else "0")
-                except Exception:  # noqa: BLE001
-                    pass
-
-            def clear_cache() -> None:
-                try:
-                    self.db.clear_moov_cache(video.chat_id, video.message_id)
-                except Exception:  # noqa: BLE001
-                    pass
-
-            def rate_change(rate: float) -> None:
-                try:
-                    self.db.set_setting(
-                        f"course_rate_{video.course_id}", f"{rate:g}"
-                    )
-                except Exception:  # noqa: BLE001
-                    pass
-
-            # Próxima/anterior: agenda a abertura da aula vizinha após fechar.
-            self._pending_navigation = None
-
-            def go_to(idx: int) -> None:
-                if 0 <= idx < len(playlist):
-                    self._pending_navigation = playlist[idx].id
-
-            on_next = (lambda: go_to(index + 1)) if index < len(playlist) - 1 else None
-            on_prev = (lambda: go_to(index - 1)) if index > 0 else None
-
-            saved_rate = self.db.get_setting(f"course_rate_{video.course_id}") or "1"
-            try:
-                playback_rate = float(saved_rate)
-            except Exception:  # noqa: BLE001
-                playback_rate = 1.0
-
-            try:
-                dlg = VideoPlayerDialog(
-                    video.title,
-                    stream.get("stream_url") or stream.get("url"),
-                    stream.get("token"),
-                    self.service,
-                    start_position_ms=video.position_ms,
-                    on_progress=save_progress,
-                    on_open_vlc=open_vlc,
-                    player_url=stream.get("player_url"),
-                    on_next=on_next,
-                    on_prev=on_prev,
-                    current_index=index,
-                    total_items=len(playlist),
-                    source_width=video.width,
-                    source_height=video.height,
-                    initial_quality=self.db.get_setting("streaming_quality") or "original",
-                    adaptive_mode=(self.db.get_setting("adaptive_mode") or "0") == "1",
-                    on_quality_change=quality_change,
-                    on_clear_cache=clear_cache,
-                    debug_overlay=(self.db.get_setting("debug_overlay") or "0") == "1",
-                    playback_rate=playback_rate,
-                    on_rate_change=rate_change,
-                    parent=self,
-                )
-            except Exception as exc:  # noqa: BLE001
-                if QMessageBox.question(
-                    self, "Player indisponível",
-                    f"Não consegui abrir o player interno ({exc}). Deseja tentar o VLC?",
-                ) == QMessageBox.Yes:
-                    self.watch_selected_vlc()
-                return
-            dlg.exec()
-            self._refresh_after_change()
-            self._reselect_video(video_id)
-            # Se o usuário pediu próxima/anterior, abre a aula vizinha.
-            nav_id = getattr(self, "_pending_navigation", None)
-            if nav_id:
-                self._pending_navigation = None
-                nxt = self.db.get_video(nav_id)
-                if nxt:
-                    self.current_video_id = nxt.id
-                    QTimer.singleShot(50, lambda: self._open_player_for(nxt))
-        except Exception as exc:  # noqa: BLE001
-            log.exception("Erro ao assistir no player interno")
-            QMessageBox.critical(self, "Erro no streaming", f"{exc}")
+        """Player local removido: mantido só para compatibilidade interna."""
+        QMessageBox.information(
+            self,
+            "Player local removido",
+            "O player local foi removido desta versão. Use Abrir no Telegram ou Abrir no VLC.",
+        )
 
     def watch_selected_vlc(self) -> None:
         video = self.selected_video()
@@ -1630,7 +2237,17 @@ class MainWindow(QMainWindow):
             if not stream:
                 return
             self._launch_vlc(stream.get("stream_url") or stream.get("url"))
-            self.db.mark_watched(video.id)
+            # Abrir no VLC não significa que a aula foi assistida. Mantemos o
+            # stream vivo por TTL e registramos só um acesso/progresso mínimo.
+            try:
+                self.service.call(self.service.release_stream_later(stream.get("token"), 7200))
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                duration_ms = int(video.duration * 1000) if video.duration else None
+                self.db.save_progress(video.id, max(1, int(video.position_ms or 0)), duration_ms)
+            except Exception:  # noqa: BLE001
+                pass
             self._refresh_after_change()
         except Exception as exc:  # noqa: BLE001
             log.exception("Erro ao assistir no VLC")
@@ -1666,23 +2283,22 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Erro", str(exc))
 
     def copy_telegram_link(self) -> None:
-        """Copia o link nativo t.me da aula (somente canais/grupos PÚBLICOS).
+        """Copia o link t.me da aula.
 
-        Ideia portada do recurso de 'copiar link nativo do Telegram' do projeto
-        de referência. Requer que o curso tenha `username` (canal público).
+        Funciona para canais públicos e também para chats privados/supergrupos
+        quando o Telegram aceita o formato t.me/c/<id>/<mensagem>.
         """
         video = self.selected_video()
         if not video:
             return
         course = self.db.get_course(video.course_id) if video.course_id else None
         username = course.username if course else None
-        link = self.service.telegram_message_link(username, video.message_id)
+        link = self.service.telegram_message_link(username, video.message_id, video.chat_id)
         if not link:
             QMessageBox.information(
                 self, "Link do Telegram",
-                "Esta aula está em um canal/grupo PRIVADO (sem nome de usuário "
-                "público), então não há um link t.me nativo. Use 'Copiar link "
-                "temporário' para reproduzir enquanto o app estiver aberto.",
+                "Não consegui montar um link t.me para esta aula. "
+                "Tente sincronizar novamente.",
             )
             return
         QApplication.clipboard().setText(link)
@@ -1739,9 +2355,8 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self, "Sobre",
             f"TgPlayer v{__version__}\n\n"
-            "Organize e assista às videoaulas dos seus cursos no Telegram, "
-            "com player premium, streaming sob demanda (sem armazenar os vídeos) "
-            "e módulo de acompanhamento de estudos.\n\n"
+            "Organize e abra as videoaulas dos seus cursos diretamente no Telegram, "
+            "com opção secundária de VLC e módulo de acompanhamento de estudos.\n\n"
             "Nunca compartilhe seu código de login, senha 2FA ou API HASH.",
         )
 
@@ -1765,16 +2380,15 @@ def excepthook(exc_type, exc, tb):
 def _configure_rendering() -> None:
     """Evita "caixas pretas" sobre o texto/widgets em alguns PCs Windows.
 
-    Em muitas placas de vídeo/drivers (e em builds empacotados com PyInstaller),
-    a composição por GPU do Qt/QtWebEngine desenha retângulos pretos por cima de
-    widgets. Forçar a composição por software e compartilhar o contexto OpenGL
+    Em algumas placas de vídeo/drivers, a composição por GPU do Qt desenha
+    retângulos pretos por cima de widgets. Forçar a composição por software
     resolve o problema de forma confiável, com impacto mínimo de desempenho.
     """
     import os
 
     from PySide6.QtCore import QCoreApplication
 
-    # Flags do Chromium do QtWebEngine: desliga GPU (causa das caixas pretas).
+    # Também define flags do Chromium caso alguma dependência futura carregue QtWebEngine.
     flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
     extra = "--disable-gpu --disable-gpu-compositing --disable-software-rasterizer"
     if extra not in flags:
@@ -1798,9 +2412,24 @@ def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName("TgPlayer")
     try:
+        icon_base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[2]))
+        icon_path = icon_base / "assets" / "icon.ico"
+        if icon_path.exists():
+            app.setWindowIcon(QIcon(str(icon_path)))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
         app.setFont(QFont("Segoe UI", 10))
     except Exception:  # noqa: BLE001
         pass
     window = MainWindow()
-    window.show()
+    try:
+        icon_base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[2]))
+        icon_path = icon_base / "assets" / "icon.ico"
+        if icon_path.exists():
+            window.setWindowIcon(QIcon(str(icon_path)))
+    except Exception:  # noqa: BLE001
+        pass
+    window.showMaximized()
+    window._update_window_buttons()
     sys.exit(app.exec())

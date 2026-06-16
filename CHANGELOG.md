@@ -1,5 +1,51 @@
 # Changelog — TgPlayer
 
+## v6.4.15
+
+Foco desta versão: **acompanhamento redesenhado** (dashboard de estudos) e a
+**correção do erro de sessão do Telegram** que impedia os usuários de listar
+cursos / receber o código.
+
+### 🔴 Correção: `401 AUTH_KEY_UNREGISTERED` ao adicionar cursos
+
+Vários usuários viam o erro:
+
+> `Telegram says: [401 AUTH_KEY_UNREGISTERED] - The key is not registered in the
+> system. Delete your session file and login again (caused by
+> "messages.GetDialogs")`
+
+**Causa:** o arquivo de sessão local (`tgclassplayer.session`) continuava
+existindo, mas o servidor do Telegram já havia **revogado a chave de
+autenticação** (sessão encerrada em outro dispositivo, troca de senha 2FA ou
+expiração por inatividade). O app validava o login apenas com `get_me()` — que
+às vezes passa — e só falhava depois, ao chamar `messages.GetDialogs`. Não havia
+recuperação automática: o usuário precisava apagar o arquivo manualmente.
+
+**O que mudou:**
+- Nova exceção `SessionRevokedError` e o detector `_is_auth_revoked_error()`,
+  que reconhecem `AUTH_KEY_UNREGISTERED`, `AUTH_KEY_INVALID`,
+  `AUTH_KEY_DUPLICATED`, `SESSION_REVOKED`, `SESSION_EXPIRED` e
+  `USER_DEACTIVATED`, tanto pela classe `Unauthorized` do Pyrogram quanto pela
+  mensagem de texto crua.
+- `clear_session_files()` **apaga automaticamente** os arquivos de sessão
+  inválidos (`.session` e `.session-journal`) — o usuário não precisa mais fazer
+  isso à mão.
+- `ensure_connected()` foi reescrito: ao detectar sessão revogada, limpa o
+  arquivo e **recria um client limpo já conectado**, devolvendo
+  `{"authorized": False, "session_revoked": True}`. Assim o login (envio de
+  código) funciona na mesma hora, sem precisar fechar/reabrir o app.
+- `list_dialog_courses()` e `sync_course()` agora capturam o erro de chave
+  revogada e disparam a limpeza + `SessionRevokedError` em vez de repetir a
+  falha.
+- Na interface (`app.py`), `add_courses_from_telegram()`,
+  `sync_current_course()` e `try_quick_connect()` tratam a sessão revogada
+  mostrando um aviso amigável ("Sua sessão expirou…") e **abrindo o login
+  automaticamente** para renovar a conta.
+
+### 📊 Acompanhamento redesenhado
+- Aba **Acompanhamento** reestruturada como dashboard (cards de métricas,
+  metas, gráficos de horas/aulas/progresso, Pomodoro e checklist).
+
 ## v6.4.0
 
 Foco desta versão: **partida quase instantânea** do vídeo, um **player

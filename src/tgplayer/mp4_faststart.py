@@ -124,7 +124,7 @@ def _patch_stco(moov: bytearray, payload_pos: int, box_end: int, delta: int, wid
         struct.pack_into(fmt, moov, off, new_value)
 
 
-def build_faststart_header(ftyp_bytes: bytes, moov_bytes: bytes) -> bytes:
+def build_faststart_header(ftyp_bytes: bytes, moov_bytes: bytes, mdat_offset: int | None = None) -> bytes:
     """Monta o cabeçalho faststart: ``ftyp`` + ``moov`` com offsets corrigidos.
 
     Args:
@@ -135,6 +135,11 @@ def build_faststart_header(ftyp_bytes: bytes, moov_bytes: bytes) -> bytes:
         ``bytes`` prontos para serem o NOVO começo do arquivo lógico. O ``mdat``
         (e qualquer resto) deve ser anexado em seguida pelo servidor, mantendo
         a ordem original dos dados de mídia.
+
+    Args adicionais:
+        mdat_offset: offset físico da box ``mdat`` no arquivo original. Quando
+        ausente, assume o layout simples ``ftyp + mdat + moov`` para manter
+        compatibilidade com versões anteriores.
 
     Raises:
         FaststartError: se as boxes forem inválidas ou grandes demais — o
@@ -147,13 +152,15 @@ def build_faststart_header(ftyp_bytes: bytes, moov_bytes: bytes) -> bytes:
     if len(moov_bytes) > MAX_MOOV_REWRITE:
         raise FaststartError(f"moov grande demais ({len(moov_bytes)} bytes)")
 
-    # No layout faststart, todo o `mdat` é deslocado para frente em exatamente
-    # o tamanho do cabeçalho que inserimos antes dele. No arquivo original
-    # (moov-at-end) a ordem era ftyp + mdat + ... + moov; o mdat começava logo
-    # após o ftyp. No novo layout o mdat começa após ftyp + moov, logo todos os
-    # offsets de chunk (que apontavam para dentro do mdat ORIGINAL) precisam
-    # somar exatamente len(moov_bytes).
-    delta = len(moov_bytes)
+    # No layout faststart, o mdat físico passa a aparecer depois do novo
+    # cabeçalho lógico (ftyp + moov). Em arquivos simples (ftyp+mdat+moov),
+    # isso equivale a somar len(moov). Em arquivos com boxes intermediárias
+    # (ftyp+free/wide+mdat+moov), precisamos descontar o prefixo removido até
+    # o mdat real, senão os offsets ficam errados e alguns players ficam
+    # eternamente em buffer.
+    if mdat_offset is None:
+        mdat_offset = len(ftyp_bytes)
+    delta = len(ftyp_bytes) + len(moov_bytes) - int(mdat_offset)
 
     moov = bytearray(moov_bytes)
     # Valida o cabeçalho do moov e percorre seus filhos corrigindo offsets.
@@ -188,3 +195,42 @@ def split_ftyp(head_bytes: bytes) -> tuple[bytes, int]:
     if box_size > len(head_bytes):
         raise FaststartError("ftyp não está inteiro no buffer inicial")
     return bytes(head_bytes[:box_size]), box_size
+
+
+def find_top_level_box(head_bytes: bytes, box_type: bytes, start: int = 0) -> tuple[int, int] | None:
+    """Procura uma box top-level em ``head_bytes``.
+
+    Retorna ``(offset, size)`` ou ``None``. É propositalmente conservador:
+    se o buffer terminar antes da próxima box completa, para e deixa o
+    chamador cair no fallback seguro. Usado para achar ``mdat`` quando há
+    boxes como ``free``/``wide`` entre ``ftyp`` e ``mdat``.
+    """
+    pos = max(0, int(start or 0))
+    limit = len(head_bytes)
+    while pos + 8 <= limit:
+        try:
+            box_size, current_type, header_len, _payload = _read_box_header(head_bytes, pos)
+        except FaststartError:
+            return None
+        if current_type == box_type:
+            return pos, box_size
+        if box_size < header_len:
+            return None
+        next_pos = pos + box_size
+        if next_pos <= pos:
+            return None
+        pos = next_pos
+    return None
+
+
+def find_mdat_start(head_bytes: bytes, start: int = 0) -> int:
+    """Retorna o offset físico da box ``mdat`` no começo do MP4.
+
+    Corrige o caso comum ``ftyp + free/wide + mdat + moov``. Versões antigas
+    assumiam que ``mdat`` começava logo após ``ftyp``; isso fazia o Range lógico
+    apontar para bytes errados e podia deixar o player local lento ou travado.
+    """
+    hit = find_top_level_box(head_bytes, b"mdat", start=start)
+    if hit is None:
+        raise FaststartError("box mdat não encontrada no cabeçalho inicial")
+    return hit[0]

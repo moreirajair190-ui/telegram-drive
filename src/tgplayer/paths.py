@@ -36,13 +36,12 @@ def _default_data_dir() -> Path:
             or os.environ.get("APPDATA")
             or str(Path.home())
         )
-        new_dir = Path(base) / APP_NAME
-        legacy_dir = Path(base) / LEGACY_APP_NAME
-        # Migração suave: se ainda não há pasta nova mas existe a antiga,
-        # reutilizamos a antiga (mantém login e progresso do usuário).
-        if not new_dir.exists() and legacy_dir.exists():
-            return legacy_dir
-        return new_dir
+        # Segurança: a partir da v6.4.13 não reutilizamos automaticamente
+        # a pasta legada TGClassPlayer. Isso evita a surpresa de uma build nova
+        # preencher API ID/API HASH a partir de dados antigos do mesmo PC.
+        # Quem quiser migrar sessão/progresso pode copiar manualmente os arquivos
+        # da pasta antiga para %LOCALAPPDATA%\TgPlayer.
+        return Path(base) / APP_NAME
     return app_root() / "data"
 
 

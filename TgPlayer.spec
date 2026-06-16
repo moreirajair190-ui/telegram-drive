@@ -1,10 +1,9 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
-PyInstaller spec do TgPlayer v6.2 (compatível com PyInstaller 6.x).
+PyInstaller spec do TgPlayer v6.4.15 (compatível com PyInstaller 6.x).
 
 Gera um executável de pasta única (onedir) — é a forma MAIS confiável para
-apps com QtWebEngine / QtMultimedia. O modo "onefile" também é possível,
-mas o WebEngine costuma falhar/ficar lento; por isso o padrão aqui é onedir.
+apps PySide6. O modo "onefile" também é possível, mas o padrão aqui é onedir por ser mais confiável.
 
 IMPORTANTE: o PyInstaller 6.x REMOVEU os argumentos antigos
 ``win_no_prefer_redirects``, ``win_private_assemblies``, ``cipher`` e
@@ -18,6 +17,7 @@ Resultado:
 """
 
 import os
+from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
@@ -55,22 +55,13 @@ try:
 except Exception:
     pass
 
-# QtWebEngine: precisa do QtWebEngineProcess + recursos (.pak, locales, ICU).
-for pkg in (
-    "PySide6.QtWebEngineCore",
-    "PySide6.QtWebEngineWidgets",
-):
-    _collect(pkg)
-
 # Submódulos PySide6 usados explicitamente.
+# O player local QtMultimedia/QtWebEngine foi removido da interface principal;
+# não coletamos esses módulos pesados para reduzir falhas e tamanho do build.
 hiddenimports += [
     "PySide6.QtCore",
     "PySide6.QtGui",
     "PySide6.QtWidgets",
-    "PySide6.QtMultimedia",
-    "PySide6.QtMultimediaWidgets",
-    "PySide6.QtWebEngineCore",
-    "PySide6.QtWebEngineWidgets",
     "PySide6.QtNetwork",
 ]
 
@@ -78,16 +69,20 @@ hiddenimports += [
 # (módulo charts.py). Se o pacote estiver instalado, coletamos; senão, ignora.
 _collect("PySide6.QtCharts")
 
-# Pacote da própria aplicação (em src/).
-try:
-    hiddenimports += collect_submodules("tgplayer")
-except Exception:
-    pass
+# O pacote tgplayer é descoberto a partir dos imports reais de TgPlayer.py/app.py.
+# Não usamos collect_submodules("tgplayer") para não embutir o player local legado
+# e módulos QtMultimedia/QtWebEngine que não são mais usados pela interface.
 
-# Ícone opcional (assets/icon.ico).
+# Ícone e assets visuais.
 icon_path = os.path.join("assets", "icon.ico")
 if not os.path.exists(icon_path):
     icon_path = None
+try:
+    for asset in Path("assets").glob("*"):
+        if asset.is_file():
+            datas.append((str(asset), "assets"))
+except Exception:
+    pass
 
 
 a = Analysis(
@@ -105,6 +100,10 @@ a = Analysis(
         "numpy",
         "PIL",
         "pytest",
+        "PySide6.QtWebEngineCore",
+        "PySide6.QtWebEngineWidgets",
+        "PySide6.QtMultimedia",
+        "PySide6.QtMultimediaWidgets",
     ],
     noarchive=False,
 )

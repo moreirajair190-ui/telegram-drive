@@ -92,8 +92,10 @@ QToolTip {{
 QSplitter::handle {{ background: {c['border_soft']}; }}
 
 /* ------------------------------------------------------------------- textos */
-#Brand {{ font-size: 22px; font-weight: 900; color: {c['text']}; letter-spacing: -0.5px; }}
-#BrandAccent {{ font-size: 22px; font-weight: 900; color: {c['accent']}; letter-spacing: -0.5px; }}
+#Brand {{ font-size: 21px; font-weight: 900; color: {c['text']}; letter-spacing: -0.5px; }}
+#BrandAccent {{ font-size: 21px; font-weight: 900; color: {c['accent']}; letter-spacing: -0.5px; }}
+#PomoTime {{ font-size: 42px; min-height: 46px; font-weight: 950; color: {c['text']}; letter-spacing: -1.2px; }}
+#PomoPhase {{ font-size: 14px; font-weight: 850; color: {c['text']}; }}
 #PageTitle {{ font-size: 22px; font-weight: 850; color: {c['text']}; }}
 #PanelTitle {{ font-size: 16px; font-weight: 800; color: {c['text']}; }}
 #SectionTitle {{ font-size: 11px; font-weight: 800; color: {c['muted2']};
@@ -122,11 +124,30 @@ QPushButton:disabled {{ color: {c['muted2']}; border-color: {c['border_soft']}; 
 }}
 #PrimaryButton:hover {{ background: {c['accent2']}; border-color: {c['accent2']}; }}
 #GhostButton {{ background: transparent; border: 1px dashed {c['border']}; color: {c['muted']}; }}
+
+#TopMenuButton {{
+    background: transparent; border: 1px solid transparent; border-radius: 8px;
+    padding: 6px 10px; color: {c['muted']}; font-weight: 800;
+}}
+#TopMenuButton:hover {{ background: {c['hover']}; color: {c['text']}; border-color: {c['border_soft']}; }}
+#TopMenuButton::menu-indicator {{ image: none; width: 0px; }}
 #GhostButton:hover {{ color: {c['text']}; border-color: {c['accent']}; }}
 #DangerButton {{ color: {c['danger']}; border-color: {c['border']}; }}
 #DangerButton:hover {{ background: {c['danger']}; color: #fff; border-color: {c['danger']}; }}
 #IconButton {{ padding: 8px 10px; min-width: 18px; }}
 #ThemeToggle {{ padding: 8px 12px; font-size: 15px; }}
+#WindowButton {{
+    padding: 0px; min-width: 34px; max-width: 34px; min-height: 30px; max-height: 30px;
+    border-radius: 8px; font-size: 14px; font-weight: 900; background: transparent;
+    border: 1px solid transparent; color: {c['muted']};
+}}
+#WindowButton:hover {{ background: {c['hover']}; color: {c['text']}; border-color: {c['border']}; }}
+#WindowCloseButton {{
+    padding: 0px; min-width: 34px; max-width: 34px; min-height: 30px; max-height: 30px;
+    border-radius: 8px; font-size: 17px; font-weight: 900; background: transparent;
+    border: 1px solid transparent; color: {c['muted']};
+}}
+#WindowCloseButton:hover {{ background: {c['danger']}; color: #ffffff; border-color: {c['danger']}; }}
 
 QPushButton:checkable {{ }}
 QPushButton:checked {{
@@ -150,6 +171,35 @@ QComboBox QAbstractItemView {{
     selection-color: {c['text']}; outline: none;
 }}
 
+QSpinBox {{
+    min-height: 30px;
+    qproperty-buttonSymbols: NoButtons;
+    font-weight: 800;
+}}
+QSpinBox::up-button, QSpinBox::down-button {{ width: 0px; height: 0px; border: none; }}
+QSpinBox::up-arrow, QSpinBox::down-arrow {{ width: 0px; height: 0px; }}
+
+#PomoSpin {{
+    min-height: 30px;
+    max-height: 34px;
+    padding: 5px 8px;
+    font-size: 13px;
+    font-weight: 850;
+}}
+#PomoButton {{
+    min-height: 30px;
+    padding: 6px 10px;
+    font-size: 12px;
+}}
+#PomoPreset {{
+    min-height: 28px;
+    padding: 5px 8px;
+    font-size: 11px;
+}}
+
+#StudyScroll {{ background: transparent; border: none; }}
+#StudyContent {{ background: transparent; }}
+
 /* ----------------------------------------------------------------- listas */
 QListWidget, QTreeWidget, QTableWidget {{
     background: {c['panel']}; color: {c['text']};
@@ -163,15 +213,25 @@ QListWidget::item:hover {{ background: {c['hover']}; }}
 QListWidget::item:selected {{
     background: {c['selection']}; color: {c['text']};
 }}
-QTreeWidget::item {{ padding: 7px 4px; border-radius: 7px; }}
+QTreeWidget {{ outline: 0; show-decoration-selected: 0; }}
+QTreeWidget::item {{ padding: 10px 8px; border: 0px; border-radius: 8px; margin: 3px 0px; }}
 QTreeWidget::item:hover {{ background: {c['hover']}; }}
-QTreeWidget::item:selected {{ background: {c['selection']}; color: {c['text']}; }}
+QTreeWidget::item:selected, QTreeWidget::item:selected:active, QTreeWidget::item:selected:!active {{
+    background: {c['selection']}; color: {c['text']}; border: 0px; outline: 0;
+}}
+QTreeWidget::item:focus {{ border: 0px; outline: 0; }}
+/* A seta nativa do Qt foi desativada: em alguns temas ela criava uma faixa
+   azul/roxa separada da linha. A árvore usa setas textuais ▸/▾ no próprio rótulo. */
+QTreeWidget::branch, QTreeWidget::branch:selected, QTreeWidget::branch:has-children:closed,
+QTreeWidget::branch:has-children:open, QTreeWidget::branch:closed:has-children:has-siblings,
+QTreeWidget::branch:open:has-children:has-siblings {{
+    width: 0px; min-width: 0px; max-width: 0px; border: 0px; border-image: none; image: none; background: transparent;
+}}
 QHeaderView::section {{
     background: {c['bg2']}; color: {c['muted']};
     border: none; border-bottom: 1px solid {c['border_soft']};
     padding: 8px 8px; font-weight: 800; font-size: 11px;
 }}
-QTreeWidget {{ outline: none; }}
 
 /* -------------------------------------------------------------------- abas */
 QTabWidget::pane {{ border: none; top: -1px; }}
