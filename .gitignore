@@ -20,6 +20,10 @@ data/
 *.session-journal
 *.log
 
+# Segredos da versao web (nunca commitar)
+.env
+web/backend/.env
+
 # Sistema operacional / editores
 .DS_Store
 Thumbs.db
