@@ -125,6 +125,13 @@ class LoginIn(BaseModel):
     password: str
 
 
+class SetupIn(BaseModel):
+    username: str
+    password: str
+    api_id: str | None = None
+    api_hash: str | None = None
+
+
 class TelegramCredsIn(BaseModel):
     api_id: str
     api_hash: str
@@ -149,9 +156,58 @@ class TaskIn(BaseModel):
 
 
 # =========================================================== AUTH (site)
+@app.get("/api/auth/state")
+async def auth_state() -> dict[str, Any]:
+    """Diz ao frontend se já existe conta (mostra login) ou não (mostra
+    a tela de "Criar conta"). Também informa se há env fixo configurado."""
+    has_account = auth.account_exists(db)
+    # Conta fixa por env conta como "já existe conta" para fins de fluxo,
+    # exceto se ainda estiver no padrão de desenvolvimento.
+    env_account = bool(
+        config.WEB_USERNAME
+        and config.WEB_PASSWORD
+        and not (config.WEB_USERNAME == "admin" and config.WEB_PASSWORD == "tgplayer123")
+    )
+    return {
+        "account_exists": bool(has_account or env_account),
+        "created_in_db": bool(has_account),
+    }
+
+
+@app.post("/api/setup")
+async def setup_account(data: SetupIn) -> dict[str, Any]:
+    """Cria a conta do site (login/senha) na primeira utilização.
+
+    Opcionalmente já recebe os dados do Telegram (API ID/HASH) e os salva,
+    deixando tudo pronto para o usuário só inserir o telefone/código depois.
+    Só permite criar enquanto NÃO existir conta no banco (evita sobrescrever).
+    """
+    if auth.account_exists(db):
+        raise HTTPException(status.HTTP_409_CONFLICT, "Uma conta já foi criada. Faça login.")
+
+    username = (data.username or "").strip()
+    password = data.password or ""
+    if len(username) < 3:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Usuário precisa ter ao menos 3 caracteres.")
+    if len(password) < 6:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Senha precisa ter ao menos 6 caracteres.")
+
+    auth.create_account(db, username, password)
+
+    # Se o usuário já forneceu os dados do Telegram, salva-os.
+    api_id = (data.api_id or "").strip()
+    api_hash = (data.api_hash or "").strip()
+    if api_id and api_hash:
+        db.set_setting("api_id", api_id)
+        db.set_setting("api_hash", api_hash)
+
+    token = auth.create_token(username)
+    return {"token": token, "user": username, "has_telegram_creds": bool(api_id and api_hash)}
+
+
 @app.post("/api/login")
 async def login(data: LoginIn) -> dict[str, Any]:
-    if not auth.check_credentials(data.username, data.password):
+    if not auth.check_credentials(db, data.username, data.password):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Usuário ou senha inválidos")
     token = auth.create_token(data.username)
     return {"token": token, "user": data.username}

@@ -49,6 +49,8 @@
     del(p) { return this.request("DELETE", p); },
 
     // ---- endpoints
+    authState() { return this.get("/api/auth/state"); },
+    setup(username, password, api_id, api_hash) { return this.post("/api/setup", { username, password, api_id, api_hash }); },
     login(username, password) { return this.post("/api/login", { username, password }); },
     tgStatus() { return this.get("/api/telegram/status"); },
     tgCredentials(api_id, api_hash) { return this.post("/api/telegram/credentials", { api_id, api_hash }); },
