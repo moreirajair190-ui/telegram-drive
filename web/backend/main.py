@@ -23,12 +23,16 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-# Garante que `src/` (pacote tgplayer) esteja no path.
+# Garante que o próprio diretório do backend e `src/` (pacote tgplayer) estejam
+# no path. Isso permite rodar tanto com `uvicorn main:app` (Root Directory =
+# web/backend, comum no Render) quanto com `uvicorn backend.main:app`.
 _THIS = Path(__file__).resolve()
+_BACKEND_DIR = _THIS.parent
 _REPO_ROOT = _THIS.parents[2]
 _SRC = _REPO_ROOT / "src"
-if str(_SRC) not in sys.path:
-    sys.path.insert(0, str(_SRC))
+for _p in (str(_BACKEND_DIR), str(_SRC)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 import aiohttp  # noqa: E402
 from fastapi import Depends, FastAPI, HTTPException, Request, status  # noqa: E402
@@ -45,14 +49,15 @@ from pydantic import BaseModel  # noqa: E402
 from tgplayer.db import Database  # noqa: E402
 from tgplayer.paths import CACHE_DIR, DB_PATH  # noqa: E402
 
-from . import auth, config  # noqa: E402
-from .services import (  # noqa: E402
+import auth  # noqa: E402
+import config  # noqa: E402
+from services import (  # noqa: E402
     EncryptionService,
     TelegramAccountService,
     TelegramAuthService,
 )
-from .services.telegram_auth import SessionRevokedError  # noqa: E402
-from .services.web_db import User, WebDatabase  # noqa: E402
+from services.telegram_auth import SessionRevokedError  # noqa: E402
+from services.web_db import User, WebDatabase  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"

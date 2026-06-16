@@ -33,17 +33,20 @@ import sys
 from pathlib import Path
 
 _THIS = Path(__file__).resolve()
+_BACKEND_DIR = _THIS.parent
 _REPO_ROOT = _THIS.parents[2]
 _SRC = _REPO_ROOT / "src"
-if str(_SRC) not in sys.path:
-    sys.path.insert(0, str(_SRC))
+for _p in (str(_BACKEND_DIR), str(_SRC)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from tgplayer.db import Database  # noqa: E402
 from tgplayer.paths import DB_PATH, SESSION_DIR  # noqa: E402
 
-from . import auth, config  # noqa: E402
-from .services import EncryptionService, TelegramAccountService  # noqa: E402
-from .services.web_db import WebDatabase  # noqa: E402
+import auth  # noqa: E402
+import config  # noqa: E402
+from services import EncryptionService, TelegramAccountService  # noqa: E402
+from services.web_db import WebDatabase  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger("tgplayer.web.migrate")
