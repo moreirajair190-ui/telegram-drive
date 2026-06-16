@@ -17,8 +17,10 @@
   <!-- Toasts -->
   <div id="toasts" class="toasts"></div>
 
-  <script src="/assets/config.js"></script>
-  <script src="/assets/api.js"></script>
-  <script src="/assets/app.js"></script>
+  <!-- ?v= força o navegador/CDN a baixar a versão nova quando o código muda
+       (cache-busting). Incremente o número a cada deploy de mudança em JS. -->
+  <script src="/assets/config.js?v=20260616"></script>
+  <script src="/assets/api.js?v=20260616"></script>
+  <script src="/assets/app.js?v=20260616"></script>
 </body>
 </html>
