@@ -67,13 +67,25 @@ FRONTEND_DIR = _THIS.parent.parent / "frontend"
 app = FastAPI(title="TgPlayer Web (multiusuário)", version="2.0.0")
 
 _cors_wildcard = "*" in config.CORS_ORIGINS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=config.CORS_ORIGINS,
-    allow_credentials=not _cors_wildcard,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Quando há regex de origem (ex.: liberar *.pages.dev), o navegador exige que o
+# allow-origin seja o domínio exato (não "*"); por isso usamos credentials=True
+# nesse caso. Só ficamos sem credentials quando a config é puramente wildcard.
+_cors_kwargs: dict[str, Any] = {
+    "allow_methods": ["*"],
+    "allow_headers": ["*"],
+}
+if _cors_wildcard and not config.CORS_ORIGIN_REGEX:
+    _cors_kwargs["allow_origins"] = ["*"]
+    _cors_kwargs["allow_credentials"] = False
+else:
+    # Mantém as origens fixas (se não forem só "*") e adiciona o regex.
+    _cors_kwargs["allow_origins"] = [
+        o for o in config.CORS_ORIGINS if o != "*"
+    ]
+    if config.CORS_ORIGIN_REGEX:
+        _cors_kwargs["allow_origin_regex"] = config.CORS_ORIGIN_REGEX
+    _cors_kwargs["allow_credentials"] = True
+app.add_middleware(CORSMiddleware, **_cors_kwargs)
 
 # Recursos globais (instanciados no startup).
 core_db: WebCoreDatabase = None  # type: ignore[assignment]

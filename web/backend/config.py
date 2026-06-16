@@ -101,3 +101,13 @@ CORS_ORIGINS = [
     for o in _get("TGWEB_CORS", "*").split(",")
     if o.strip()
 ] or ["*"]
+
+# Regex de origens permitidas (além das fixas em CORS_ORIGINS). Por padrão
+# libera QUALQUER subdomínio *.pages.dev (Cloudflare Pages, incluindo as URLs
+# de preview tipo abc123.meu-site.pages.dev) e *.onrender.com. Isso evita o
+# erro clássico de "faltou colocar o domínio exato no TGWEB_CORS". Pode ser
+# sobrescrito/desligado via TGWEB_CORS_REGEX.
+CORS_ORIGIN_REGEX = _get(
+    "TGWEB_CORS_REGEX",
+    r"https://([a-z0-9-]+\.)*(pages\.dev|onrender\.com)$",
+)
