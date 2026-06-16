@@ -1,0 +1,9 @@
+# Backend web do TgPlayer (FastAPI + reaproveita o core Pyrogram/aiohttp)
+fastapi>=0.110
+uvicorn[standard]>=0.27
+pydantic>=2.6
+
+# Núcleo herdado do app desktop
+pyrogram>=2.0
+TgCrypto>=1.2.5
+aiohttp>=3.9

@@ -1,0 +1,3 @@
+# Cloudflare Pages — SPA fallback
+# Toda rota desconhecida cai no index.html (roteamento feito no JS).
+/*    /index.html   200
