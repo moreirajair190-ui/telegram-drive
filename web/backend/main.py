@@ -513,6 +513,164 @@ async def course_videos(course_id: int, user: User = Depends(require_user)) -> l
     return [_video_dict(v) for v in core_db.list_videos(course_id)]
 
 
+@app.get("/api/courses/{course_id}/tree")
+async def course_tree(course_id: int, user: User = Depends(require_user)) -> dict[str, Any]:
+    """Estrutura hierárquica (pastas/subpastas) do curso, no estilo Windows.
+
+    Para CADA matéria, lê o ``summary_text`` (o "menu" publicado no Telegram com
+    ``= Módulo`` / ``== Aula`` / ``=== Tipo`` + hashtags ``#TAG``) e monta uma
+    árvore de pastas. Os vídeos são casados às folhas pela hashtag. Vídeos que
+    não casam com nenhuma hashtag do sumário caem numa pasta "Outros vídeos" da
+    própria matéria, garantindo que NENHUMA aula desapareça.
+
+    Retorna um dicionário pronto para a UI:
+        { "title", "type": "course", "nodes": [ ...pastas/aulas... ],
+          "total", "done" }
+    """
+    course = core_db.get_course(course_id)
+    if not course:
+        raise HTTPException(404, "Curso não encontrado")
+    subjects = core_db.list_subjects(course_id)
+    videos = core_db.list_videos(course_id)
+    return _build_course_tree(course, subjects, videos)
+
+
+def _build_course_tree(course, subjects, videos) -> dict[str, Any]:
+    """Constrói a árvore navegável do curso (pastas -> subpastas -> aulas)."""
+    from tgplayer.summary_parser import iter_nodes, parse_summary
+    from tgplayer.utils import extract_hashtags
+
+    # Indexa vídeos por matéria.
+    by_subject: dict[int | None, list] = {}
+    for v in videos:
+        by_subject.setdefault(v.subject_id, []).append(v)
+
+    def _norm(tag: str) -> str:
+        return "#" + tag.lstrip("#").upper()
+
+    def _video_node(v) -> dict[str, Any]:
+        d = _video_dict(v)
+        return {
+            "type": "video",
+            "id": v.id,
+            "title": v.title or v.file_name,
+            "file_name": v.file_name,
+            "duration": v.duration,
+            "size": v.size,
+            "width": v.width,
+            "height": v.height,
+            "progress": float(v.progress or 0.0),
+            "watched": bool(v.watched_at),
+            "tg_url": d.get("tg_url"),
+            "tme_url": d.get("tme_url"),
+        }
+
+    def _menu_to_nodes(menu_node, tag_index, used_ids) -> list[dict[str, Any]]:
+        """Converte um MenuNode (sumário) em nós de pasta/aula para a UI."""
+        out: list[dict[str, Any]] = []
+        # Vídeos casados diretamente neste nó (pela ordem das hashtags).
+        for tag in menu_node.tags:
+            for v in tag_index.get(_norm(tag), []):
+                if v.id in used_ids:
+                    continue
+                used_ids.add(v.id)
+                out.append(_video_node(v))
+        # Subpastas (filhos do sumário).
+        for child in menu_node.children:
+            child_nodes = _menu_to_nodes(child, tag_index, used_ids)
+            if not child_nodes:
+                continue
+            out.append({
+                "type": "folder",
+                "title": child.title,
+                "level": child.level,
+                "nodes": child_nodes,
+                "count": _count_videos(child_nodes),
+            })
+        return out
+
+    def _count_videos(nodes) -> int:
+        n = 0
+        for node in nodes:
+            if node["type"] == "video":
+                n += 1
+            else:
+                n += node.get("count") or _count_videos(node.get("nodes") or [])
+        return n
+
+    root_nodes: list[dict[str, Any]] = []
+    for s in subjects:
+        sub_videos = by_subject.get(s.id, [])
+        # Index de hashtags -> vídeos desta matéria.
+        tag_index: dict[str, list] = {}
+        for v in sub_videos:
+            for tag in (v.hashtags or []):
+                tag_index.setdefault(_norm(tag), []).append(v)
+
+        used_ids: set[int] = set()
+        menu = parse_summary(s.summary_text or "", s.title)
+        subject_nodes = _menu_to_nodes(menu, tag_index, used_ids)
+
+        # Vídeos da matéria que não casaram com o sumário (preserva a ordem).
+        leftovers = [v for v in sub_videos if v.id not in used_ids]
+        if leftovers:
+            leftover_nodes = [_video_node(v) for v in leftovers]
+            if subject_nodes:
+                subject_nodes.append({
+                    "type": "folder",
+                    "title": "Outros vídeos",
+                    "level": 2,
+                    "nodes": leftover_nodes,
+                    "count": len(leftover_nodes),
+                })
+            else:
+                # Sumário inexistente/sem match: matéria vira pasta plana.
+                subject_nodes = leftover_nodes
+
+        if not subject_nodes:
+            continue
+        root_nodes.append({
+            "type": "folder",
+            "title": s.title,
+            "level": 1,
+            "subject_id": s.id,
+            "nodes": subject_nodes,
+            "count": _count_videos(subject_nodes),
+        })
+
+    # Quando o curso tem UMA única matéria (canal/grupo simples) e essa matéria
+    # já contém uma hierarquia própria (= CAR 1, = CAR 2...), evitamos um nível
+    # redundante: promovemos os filhos da matéria para a raiz do curso.
+    real_subjects = [n for n in root_nodes if n.get("subject_id") not in (0, None)]
+    if len(real_subjects) == 1 and len(root_nodes) == 1:
+        only = root_nodes[0]
+        has_subfolders = any(n["type"] == "folder" for n in only["nodes"])
+        if has_subfolders:
+            root_nodes = only["nodes"]
+
+    # Vídeos sem matéria alguma.
+    orphan = by_subject.get(None, [])
+    if orphan:
+        root_nodes.append({
+            "type": "folder",
+            "title": "Sem matéria",
+            "level": 1,
+            "subject_id": 0,
+            "nodes": [_video_node(v) for v in orphan],
+            "count": len(orphan),
+        })
+
+    done, total = core_db.course_progress(course.id)
+    return {
+        "type": "course",
+        "title": course.title,
+        "course_id": course.id,
+        "nodes": root_nodes,
+        "total": total,
+        "done": done,
+    }
+
+
 def _video_dict(v) -> dict[str, Any]:
     data = asdict(v)
     course = core_db.get_course(v.course_id) if v.course_id else None

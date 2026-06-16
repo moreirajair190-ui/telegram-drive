@@ -10,10 +10,26 @@
     currentCourse: null,
     subjects: [],
     videos: [],
+    tree: null,          // árvore de pastas/subpastas do curso atual
+    openFolders: null,   // Set com os caminhos de pastas abertas (por curso)
     activeSubject: "all",
     search: "",
     tg: { connected: false, me: null, has_credentials: false },
+    // Cache leve em memória para evitar refetch (performance).
+    _treeCache: {},
   };
+
+  // Velocidade de reprodução preferida (persistida).
+  let playbackRate = parseFloat(localStorage.getItem("tgweb_rate") || "1") || 1;
+
+  // debounce util — evita re-render a cada tecla na busca (anti-travamento).
+  function debounce(fn, ms) {
+    let t = null;
+    return function (...args) {
+      if (t) clearTimeout(t);
+      t = setTimeout(() => { t = null; fn.apply(this, args); }, ms);
+    };
+  }
 
   // ---------------------------------------------------------------- helpers
   const $ = (sel, el = document) => el.querySelector(sel);
@@ -218,7 +234,10 @@
     $("#tgStatus").addEventListener("click", openTelegramModal);
     $("#menuBtn").addEventListener("click", () => $("#sidebar").classList.toggle("open"));
     const si = $("#searchInput");
-    if (si) si.addEventListener("input", (e) => { State.search = e.target.value.toLowerCase(); renderLessons(); });
+    if (si) {
+      const onSearch = debounce(() => { renderLessons(); }, 180);
+      si.addEventListener("input", (e) => { State.search = e.target.value.toLowerCase(); onSearch(); });
+    }
     renderView();
   }
 
@@ -231,6 +250,8 @@
 
   function renderView() {
     if ($("#sidebar")) $("#sidebar").classList.remove("open");
+    // Sair de um curso ao trocar de aba (evita estado preso).
+    if (State.view !== "courses") State.currentCourse = null;
     if (State.view === "dashboard") renderDashboard();
     else if (State.view === "courses") renderCourses();
     else if (State.view === "files") renderFiles();
@@ -516,71 +537,195 @@
   async function openCourse(id) {
     State.currentCourse = State.courses.find((c) => c.id === id);
     State.activeSubject = "all"; State.search = "";
+    State.openFolders = new Set();
     const c = $("#content"); loading(c);
     try {
-      State.subjects = await api.subjects(id);
-      State.videos = await api.videos(id);
+      // Usa cache quando disponível (performance) e revalida em segundo plano.
+      const cached = State._treeCache[id];
+      if (cached) {
+        State.tree = cached;
+        renderLessons();
+        api.tree(id).then((fresh) => {
+          State._treeCache[id] = fresh; State.tree = fresh;
+          if (State.currentCourse && State.currentCourse.id === id) renderLessons();
+        }).catch(() => {});
+        return;
+      }
+      State.tree = await api.tree(id);
+      State._treeCache[id] = State.tree;
     } catch (e) { c.innerHTML = errorBox(e); return; }
     renderLessons();
   }
 
+  // Conta vídeos visíveis após o filtro de busca, recursivamente.
+  function _countMatching(nodes) {
+    let n = 0;
+    for (const node of nodes) {
+      if (node.type === "video") { if (_matchSearch(node)) n++; }
+      else n += _countMatching(node.nodes || []);
+    }
+    return n;
+  }
+  function _matchSearch(v) {
+    if (!State.search) return true;
+    const q = State.search;
+    return (v.title || "").toLowerCase().includes(q) || (v.file_name || "").toLowerCase().includes(q);
+  }
+
+  // Auto-expande as duas primeiras camadas na primeira abertura.
+  function _autoExpand(nodes, path, depth) {
+    if (depth > 1) return;
+    for (let i = 0; i < nodes.length; i++) {
+      const node = nodes[i];
+      if (node.type !== "folder") continue;
+      const p = path + "/" + i;
+      if (depth === 0) State.openFolders.add(p);
+      _autoExpand(node.nodes || [], p, depth + 1);
+    }
+  }
+
   function renderLessons() {
     const co = State.currentCourse;
+    const tree = State.tree;
     setTitle(co.title, true);
     const c = $("#content");
 
-    const counts = {};
-    State.videos.forEach((v) => { const k = v.subject_id || 0; counts[k] = (counts[k] || 0) + 1; });
+    const total = (tree && tree.total) || 0;
+    const done = (tree && tree.done) || 0;
 
-    let vids = State.videos;
-    if (State.activeSubject !== "all") vids = vids.filter((v) => String(v.subject_id || 0) === String(State.activeSubject));
-    if (State.search) vids = vids.filter((v) => (v.title || "").toLowerCase().includes(State.search) || (v.file_name || "").toLowerCase().includes(State.search));
+    if (!tree || !tree.nodes || !tree.nodes.length) {
+      c.innerHTML = `
+        <div class="row between" style="margin-bottom:16px">
+          <button class="btn btn-sm btn-ghost" id="backBtn">← Voltar aos cursos</button>
+          <button class="btn btn-sm btn-primary sync">🔄 Sincronizar</button>
+        </div>
+        <div class="empty"><div class="big">🎞️</div><h3>Nenhuma aula ainda</h3>
+        <p class="muted">Clique em <b>🔄 Sincronizar</b> para indexar as aulas e montar as pastas do Telegram.</p></div>`;
+      $("#backBtn").addEventListener("click", () => { State.currentCourse = null; State.tree = null; renderCourses(); });
+      c.querySelector(".sync").addEventListener("click", () => syncCourse(co.id));
+      return;
+    }
 
+    // Na primeira render do curso, abre o primeiro nível.
+    if (State.openFolders.size === 0 && !State.search) _autoExpand(tree.nodes, "", 0);
+
+    const pct = total ? Math.round(done / total * 100) : 0;
     c.innerHTML = `
-      <div class="row between" style="margin-bottom:16px">
+      <div class="lessons-head">
         <button class="btn btn-sm btn-ghost" id="backBtn">← Voltar aos cursos</button>
-        <div class="row">
-          <span class="muted">${co.done}/${co.total} assistidas</span>
-          <button class="btn btn-sm sync">🔄 Sincronizar</button>
+        <div class="lessons-head-right">
+          <div class="course-progress-mini" title="${done} de ${total} aulas assistidas">
+            <div class="cpm-bar"><div class="cpm-fill" style="width:${pct}%"></div></div>
+            <span class="cpm-label">${done}/${total}</span>
+          </div>
+          <button class="btn btn-sm" id="expandAll" title="Expandir tudo">⊞</button>
+          <button class="btn btn-sm" id="collapseAll" title="Recolher tudo">⊟</button>
+          <button class="btn btn-sm btn-primary sync">🔄 Sincronizar</button>
         </div>
       </div>
-      <div class="lessons-layout">
-        <div class="panel">
-          <div class="section-title" style="margin-top:0;font-size:14px">Matérias</div>
-          <div class="subject-list">
-            <button class="subject-item ${State.activeSubject === "all" ? "active" : ""}" data-subj="all">
-              <span>📚 Todas</span><span class="count">${State.videos.length}</span>
-            </button>
-            ${State.subjects.map((s) => `
-              <button class="subject-item ${String(State.activeSubject) === String(s.id) ? "active" : ""}" data-subj="${s.id}">
-                <span>${esc(s.title)}</span><span class="count">${counts[s.id] || 0}</span>
-              </button>`).join("")}
-            ${counts[0] ? `<button class="subject-item ${State.activeSubject === "0" ? "active" : ""}" data-subj="0"><span>Sem matéria</span><span class="count">${counts[0]}</span></button>` : ""}
-          </div>
-        </div>
-        <div>
-          ${vids.length ? vids.map((v) => lessonRow(v)).join("") : `<div class="empty"><div class="big">🎞️</div><h3>Nenhuma aula aqui</h3><p class="muted">${State.videos.length ? "Tente outra matéria ou busca." : "Clique em 🔄 Sincronizar para buscar as aulas do Telegram."}</p></div>`}
-        </div>
+      <div class="explorer" id="explorer">
+        ${renderNodes(tree.nodes, "", 0)}
       </div>`;
 
-    $("#backBtn").addEventListener("click", () => { State.currentCourse = null; renderCourses(); });
+    $("#backBtn").addEventListener("click", () => { State.currentCourse = null; State.tree = null; renderCourses(); });
     c.querySelector(".sync").addEventListener("click", () => syncCourse(co.id));
-    c.querySelectorAll("[data-subj]").forEach((b) => b.addEventListener("click", () => { State.activeSubject = b.dataset.subj; renderLessons(); }));
-    c.querySelectorAll("[data-video]").forEach((el) => {
-      const v = State.videos.find((x) => x.id === +el.dataset.video);
-      el.querySelector(".play")?.addEventListener("click", () => openPlayer(v));
-      el.querySelector(".tg")?.addEventListener("click", () => openInTelegram(v));
-      el.querySelector(".watch")?.addEventListener("click", async () => {
-        if (v.watched) { await api.markUnwatched(v.id); v.watched = false; }
-        else { await api.markWatched(v.id); v.watched = true; }
-        renderLessons();
-      });
+    $("#expandAll").addEventListener("click", () => { _setAllFolders(tree.nodes, "", true); renderLessons(); });
+    $("#collapseAll").addEventListener("click", () => { State.openFolders.clear(); renderLessons(); });
+
+    bindExplorer(c.querySelector("#explorer"));
+  }
+
+  // Marca todas as pastas (recursivo) como abertas/fechadas.
+  function _setAllFolders(nodes, path, open) {
+    nodes.forEach((node, i) => {
+      if (node.type !== "folder") return;
+      const p = path + "/" + i;
+      if (open) State.openFolders.add(p); else State.openFolders.delete(p);
+      _setAllFolders(node.nodes || [], p, open);
     });
   }
 
-  function lessonRow(v) {
+  // Renderiza nós (pasta/aula) recursivamente como uma árvore tipo Explorer.
+  function renderNodes(nodes, path, depth) {
+    let html = "";
+    nodes.forEach((node, i) => {
+      const p = path + "/" + i;
+      if (node.type === "folder") {
+        const matching = State.search ? _countMatching(node.nodes || []) : (node.count || 0);
+        if (State.search && matching === 0) return; // some na busca
+        const open = State.openFolders.has(p) || (State.search && matching > 0);
+        const icon = open ? "📂" : "📁";
+        html += `
+          <div class="tree-folder" data-path="${p}" style="--depth:${depth}">
+            <button class="folder-head ${open ? "open" : ""}" data-toggle="${p}">
+              <span class="caret">${open ? "▾" : "▸"}</span>
+              <span class="folder-icon">${icon}</span>
+              <span class="folder-name">${esc(node.title)}</span>
+              <span class="folder-count">${matching}</span>
+            </button>
+            <div class="folder-body" ${open ? "" : "hidden"}>
+              ${open ? renderNodes(node.nodes || [], p, depth + 1) : ""}
+            </div>
+          </div>`;
+      } else {
+        if (!_matchSearch(node)) return;
+        html += lessonRow(node, depth);
+      }
+    });
+    return html;
+  }
+
+  function bindExplorer(root) {
+    if (!root) return;
+    // Toggle de pastas (event delegation evita N listeners — performance).
+    root.addEventListener("click", (e) => {
+      const head = e.target.closest("[data-toggle]");
+      if (head) {
+        const p = head.getAttribute("data-toggle");
+        if (State.openFolders.has(p)) State.openFolders.delete(p);
+        else State.openFolders.add(p);
+        renderLessons();
+        return;
+      }
+      const row = e.target.closest("[data-video]");
+      if (!row) return;
+      const id = +row.dataset.video;
+      const v = _findVideoNode(State.tree.nodes, id);
+      if (!v) return;
+      if (e.target.closest(".play")) { openPlayer(v); }
+      else if (e.target.closest(".tg")) { openInTelegram(v); }
+      else if (e.target.closest(".watch")) { toggleWatchedNode(v); }
+      else { openPlayer(v); } // clique na linha = assistir
+    });
+  }
+
+  function _findVideoNode(nodes, id) {
+    for (const node of nodes) {
+      if (node.type === "video") { if (node.id === id) return node; }
+      else { const f = _findVideoNode(node.nodes || [], id); if (f) return f; }
+    }
+    return null;
+  }
+
+  async function toggleWatchedNode(v) {
+    const next = !v.watched;
+    v.watched = next; // otimista
+    // Atualiza só a linha sem re-render completo (anti-travamento).
+    const row = document.querySelector(`.lesson-row[data-video="${v.id}"]`);
+    if (row) {
+      row.classList.toggle("done", next);
+      const thumb = row.querySelector(".lesson-thumb");
+      if (thumb) { thumb.classList.toggle("watched", next); thumb.textContent = next ? "✓" : "🎬"; }
+      const wb = row.querySelector(".watch");
+      if (wb) wb.textContent = next ? "↩" : "✓";
+    }
+    try { next ? await api.markWatched(v.id) : await api.markUnwatched(v.id); }
+    catch (e) { v.watched = !next; toast("Não foi possível atualizar", "err"); }
+  }
+
+  function lessonRow(v, depth = 0) {
     const prog = Math.round((v.progress || 0) * 100);
-    return `<div class="lesson-row" data-video="${v.id}">
+    return `<div class="lesson-row ${v.watched ? "done" : ""}" data-video="${v.id}" style="--depth:${depth}">
       <div class="lesson-thumb ${v.watched ? "watched" : ""}">${v.watched ? "✓" : "🎬"}</div>
       <div class="lesson-info">
         <div class="t">${esc(v.title || v.file_name)}</div>
@@ -600,17 +745,67 @@
   }
 
   async function syncCourse(id) {
-    toast("Sincronizando... isso pode levar um tempo", "");
+    const overlay = openSyncOverlay("Sincronizando aulas…",
+      "Buscando mensagens no Telegram e montando as pastas. Isso pode levar um tempo em canais grandes.");
     try {
       const r = await api.syncCourse(id, 99999);
-      toast(`✅ ${r.videos} aula(s) · ${r.detected}`, "ok");
+      closeSyncOverlay(overlay);
+      toast(`✅ ${r.videos} aula(s) sincronizada(s)`, "ok");
+      // Invalida o cache da árvore deste curso.
+      delete State._treeCache[r.course_id || id];
       State.courses = await api.courses();
-      if (State.currentCourse && State.currentCourse.id === id) await openCourse(r.course_id || id);
-      else renderCourses();
+      if (State.currentCourse && State.currentCourse.id === id) {
+        State.openFolders = new Set();
+        await openCourse(r.course_id || id);
+      } else {
+        renderCourses();
+      }
     } catch (e) {
+      closeSyncOverlay(overlay);
       if (String(e.body || e.message).includes("session_revoked")) return handleSessionRevoked();
       toast("Erro ao sincronizar: " + e.message, "err");
     }
+  }
+
+  // ---- Overlay animado de sincronização (feedback claro durante a espera) ----
+  function openSyncOverlay(title, subtitle) {
+    const node = h(`
+      <div class="sync-overlay">
+        <div class="sync-card">
+          <div class="sync-anim">
+            <div class="sync-ring"></div>
+            <div class="sync-ring r2"></div>
+            <div class="sync-ico">🔄</div>
+          </div>
+          <h3 class="sync-title">${esc(title)}</h3>
+          <p class="sync-sub">${esc(subtitle || "")}</p>
+          <div class="sync-bar"><div class="sync-bar-fill"></div></div>
+          <p class="sync-steps" id="syncStep">Conectando…</p>
+        </div>
+      </div>`);
+    document.body.appendChild(node);
+    // Mensagens rotativas para dar sensação de progresso (sem travar).
+    const steps = [
+      "Conectando ao Telegram…",
+      "Lendo o histórico do canal…",
+      "Detectando o menu/sumário…",
+      "Montando pastas e subpastas…",
+      "Casando aulas pelas hashtags…",
+      "Quase lá, finalizando…",
+    ];
+    let i = 0;
+    const stepEl = node.querySelector("#syncStep");
+    node._timer = setInterval(() => {
+      i = Math.min(i + 1, steps.length - 1);
+      if (stepEl) stepEl.textContent = steps[i];
+    }, 2200);
+    return node;
+  }
+  function closeSyncOverlay(node) {
+    if (!node) return;
+    if (node._timer) clearInterval(node._timer);
+    node.classList.add("closing");
+    setTimeout(() => node.remove(), 220);
   }
 
   // ================================================================ FILES
@@ -647,16 +842,31 @@
   }
 
   // ================================================================ PLAYER (web)
+  const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
+
   async function openPlayer(v) {
     const modal = h(`
-      <div class="modal wide">
+      <div class="modal wide player-modal">
         <div class="modal-head"><h3>${esc(v.title || v.file_name)}</h3><button class="close-x">✕</button></div>
         <div class="modal-body">
-          <div class="player-wrap" id="pw"><div class="spinner"></div></div>
+          <div class="player-wrap" id="pw">
+            <div class="player-loading">
+              <div class="spinner"></div>
+              <p class="muted" id="plStatus">Preparando streaming…</p>
+            </div>
+          </div>
           <div class="player-meta">
-            <div class="player-actions">
-              <button class="btn tg">📲 Abrir no Telegram (64Gram/Desktop)</button>
-              <button class="btn watch">${v.watched ? "↩ Marcar não vista" : "✓ Marcar como vista"}</button>
+            <div class="player-controls">
+              <div class="speed-control" id="speedCtl" title="Velocidade de reprodução">
+                <span class="speed-ico">⚡</span>
+                <select id="speedSel">
+                  ${SPEEDS.map((s) => `<option value="${s}" ${s === playbackRate ? "selected" : ""}>${s}×</option>`).join("")}
+                </select>
+              </div>
+              <div class="player-actions">
+                <button class="btn tg">📲 Abrir no Telegram</button>
+                <button class="btn watch">${v.watched ? "↩ Marcar não vista" : "✓ Marcar como vista"}</button>
+              </div>
             </div>
             <p class="muted mt" style="font-size:13px">💡 O streaming roda pela sua conexão. Se preferir o app nativo, use o botão acima.</p>
           </div>
@@ -669,24 +879,58 @@
       toast(v.watched ? "Marcada como vista ✓" : "Marcada como não vista", "ok");
     });
 
+    // Atalhos de teclado (espaço = play/pause, setas = seek 5s).
+    const onKey = (e) => {
+      const vid = modal.querySelector("video");
+      if (!vid) return;
+      if (e.key === " ") { e.preventDefault(); vid.paused ? vid.play() : vid.pause(); }
+      else if (e.key === "ArrowRight") { vid.currentTime += 5; }
+      else if (e.key === "ArrowLeft") { vid.currentTime -= 5; }
+    };
+    document.addEventListener("keydown", onKey);
+    bk.addEventListener("remove", () => document.removeEventListener("keydown", onKey), { once: true });
+    const _origRemove = bk.remove.bind(bk);
+    bk.remove = () => { document.removeEventListener("keydown", onKey); _origRemove(); };
+
     try {
       const s = await api.prepareStream(v.id);
       const url = api.streamUrl(s.token);
       const pw = modal.querySelector("#pw");
       pw.innerHTML = "";
-      const video = h(`<video controls autoplay playsinline></video>`);
+      // preload="auto" + faststart no backend → começa a tocar antes.
+      const video = h(`<video controls autoplay playsinline preload="auto"></video>`);
       video.src = url;
+      video.playbackRate = playbackRate;
       pw.appendChild(video);
-      // salva progresso a cada 10s
+
+      // Aplica/persiste a velocidade escolhida.
+      const sel = modal.querySelector("#speedSel");
+      sel.addEventListener("change", () => {
+        playbackRate = parseFloat(sel.value) || 1;
+        video.playbackRate = playbackRate;
+        localStorage.setItem("tgweb_rate", String(playbackRate));
+        toast(`Velocidade: ${playbackRate}×`, "");
+      });
+      // Mantém a taxa mesmo se o navegador resetar ao recarregar buffer.
+      video.addEventListener("ratechange", () => {
+        if (Math.abs(video.playbackRate - playbackRate) > 0.01) video.playbackRate = playbackRate;
+      });
+
+      // salva progresso a cada 15s (menos chamadas = mais leve)
       let last = 0;
       video.addEventListener("timeupdate", () => {
-        if (video.currentTime - last > 10) {
+        if (video.currentTime - last > 15) {
           last = video.currentTime;
           api.saveProgress(v.id, Math.round(video.currentTime * 1000), Math.round((video.duration || 0) * 1000)).catch(() => {});
         }
       });
-      if (s.start_position_ms) video.currentTime = s.start_position_ms / 1000;
-      video.addEventListener("ended", async () => { await api.markWatched(v.id); v.watched = true; toast("Aula concluída ✓", "ok"); });
+      if (s.start_position_ms) {
+        video.addEventListener("loadedmetadata", () => { video.currentTime = s.start_position_ms / 1000; }, { once: true });
+      }
+      video.addEventListener("ended", async () => {
+        try { await api.markWatched(v.id); } catch (e) {}
+        v.watched = true; toast("Aula concluída ✓", "ok");
+      });
     } catch (e) {
       if (String(e.body || e.message).includes("session_revoked")) { closeModal(bk); return handleSessionRevoked(); }
       modal.querySelector("#pw").innerHTML = `<div style="padding:40px;text-align:center;color:#fff">⚠️ ${esc(e.message)}<br/><small style="opacity:.7">Tente abrir no Telegram com o botão abaixo.</small></div>`;
@@ -844,11 +1088,18 @@
     });
     confirmBtn.addEventListener("click", async () => {
       const chosen = [...selected].map((i) => dialogs[i]);
-      await api.addCourses(chosen);
-      toast(`${chosen.length} curso(s) adicionado(s) ✓`, "ok");
       closeModal(bk);
-      State.courses = await api.courses();
-      renderCourses();
+      const overlay = openSyncOverlay("Adicionando cursos…", "Salvando os canais/grupos selecionados.");
+      try {
+        await api.addCourses(chosen);
+        closeSyncOverlay(overlay);
+        toast(`${chosen.length} curso(s) adicionado(s) ✓`, "ok");
+        State.courses = await api.courses();
+        renderCourses();
+      } catch (e) {
+        closeSyncOverlay(overlay);
+        toast("Erro ao adicionar: " + e.message, "err");
+      }
     });
   }
 
@@ -866,15 +1117,22 @@
 
   // ================================================================ BOOT
   async function boot() {
-    // Carrega o usuário atual (para saber se é admin) e o status do Telegram.
-    try {
-      const m = await api.me();
-      State.user = m.user || null;
-    } catch (e) {
-      if (e.status === 401) { api.token = ""; return startAuth(); }
+    // Carrega usuário e status do Telegram EM PARALELO (mais rápido no boot).
+    const [meRes, tgRes] = await Promise.allSettled([api.me(), api.tgStatus()]);
+
+    if (meRes.status === "fulfilled") {
+      State.user = (meRes.value && meRes.value.user) || null;
+    } else if (meRes.reason && meRes.reason.status === 401) {
+      api.token = ""; return startAuth();
     }
-    try { State.tg = await api.tgStatus(); }
-    catch (e) { if (e.status === 401) { api.token = ""; return startAuth(); } State.tg = { connected: false, has_credentials: false }; }
+
+    if (tgRes.status === "fulfilled") {
+      State.tg = tgRes.value;
+    } else if (tgRes.reason && tgRes.reason.status === 401) {
+      api.token = ""; return startAuth();
+    } else {
+      State.tg = { connected: false, has_credentials: false };
+    }
     renderShell();
   }
 
