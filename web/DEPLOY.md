@@ -45,9 +45,22 @@ python -c "import secrets; print(secrets.token_hex(32))"
 
 1. Faça push do repositório para o GitHub.
 2. No Render → **New +** → **Web Service** → conecte o repositório.
-3. Configurações:
-   - **Root Directory**: `web`
+3. Configurações (use **uma** das opções abaixo — ambas funcionam):
+
+   **Opção A — Root Directory = `web/backend` (recomendada)**
+   - **Root Directory**: `web/backend`
    - **Runtime**: Python 3
+   - **Build Command**:
+     ```bash
+     pip install -r requirements.txt
+     ```
+   - **Start Command**:
+     ```bash
+     uvicorn main:app --host 0.0.0.0 --port $PORT
+     ```
+
+   **Opção B — Root Directory = `web`**
+   - **Root Directory**: `web`
    - **Build Command**:
      ```bash
      pip install -r backend/requirements.txt
@@ -56,7 +69,11 @@ python -c "import secrets; print(secrets.token_hex(32))"
      ```bash
      uvicorn backend.main:app --host 0.0.0.0 --port $PORT
      ```
-     > O Render injeta a variável `PORT` automaticamente; o `config.py` já a lê.
+
+   > O Render injeta a variável `PORT` automaticamente; o `config.py` já a lê.
+   > O backend usa **imports absolutos** e ajusta o `sys.path` internamente,
+   > então inicia corretamente nas duas opções (e também via
+   > `python -m uvicorn web.backend.main:app` a partir da raiz do repositório).
 
 ### 2.2 Disco persistente (IMPORTANTE)
 

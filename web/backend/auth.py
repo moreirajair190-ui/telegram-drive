@@ -22,8 +22,8 @@ import re
 import secrets
 import time
 
-from . import config
-from .services.web_db import User, WebDatabase
+import config
+from services.web_db import User, WebDatabase
 
 log = logging.getLogger("tgplayer.web.auth")
 
