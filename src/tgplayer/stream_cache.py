@@ -61,7 +61,12 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .mp4_faststart import FaststartError, build_faststart_header, split_ftyp
+from .mp4_faststart import (
+    FaststartError,
+    build_faststart_header,
+    find_mdat_start,
+    split_ftyp,
+)
 
 if TYPE_CHECKING:  # pragma: no cover
     from pyrogram import Client
@@ -127,11 +132,15 @@ class StreamSession:
         mime_type: str | None = None,
         throttle_kbps: int = 0,
         max_retries: int = 2,
+        file_id: str | None = None,
+        chat_username: str | None = None,
     ) -> None:
         self.token = token
         self.client = client
         self.chat_id = chat_id
         self.message_id = int(message_id)
+        self.file_id = (file_id or "").strip() or None
+        self.chat_username = (chat_username or "").strip().lstrip("@") or None
         self.size = int(size or 0)
         self.cache_path = cache_path
         self.mime_type = mime_type or "video/mp4"
@@ -182,6 +191,7 @@ class StreamSession:
         # Início FÍSICO do mdat no arquivo original (geralmente logo após o
         # ftyp, em moov-at-end). Usado para mapear offsets lógicos -> físicos.
         self._mdat_phys_start: int = 0
+        self._media_phys_end: int | None = None
         # Lock para montar o header uma única vez (evita corrida entre o player
         # e a descoberta em 2º plano).
         self._faststart_lock = asyncio.Lock()
@@ -276,12 +286,67 @@ class StreamSession:
 
     # --------------------------------------------------------------- mensagem TG
     async def _get_message(self):
-        if self._message is None:
-            chat_id = self.chat_id
-            if str(chat_id).lstrip("-").isdigit():
-                chat_id = int(chat_id)
-            self._message = await self.client.get_messages(chat_id, self.message_id)
-        return self._message
+        """Busca a mensagem do Telegram com fallback de resolução de peer.
+
+        Pyrogram pode rejeitar alguns supergrupos/canais novos quando recebe o
+        id Bot API no formato ``-100...`` (erro ``Peer id invalid`` em ids acima
+        de 32 bits). Por isso, quando disponível, preferimos o @username do
+        curso; caso contrário tentamos o id numérico e, por último, o texto.
+        """
+        if self._message is not None:
+            return self._message
+
+        candidates: list[object] = []
+        if self.chat_username:
+            candidates.append("@" + self.chat_username)
+            candidates.append(self.chat_username)
+        raw = self.chat_id
+        if str(raw).lstrip("-").isdigit():
+            candidates.append(int(raw))
+        candidates.append(str(raw))
+
+        last_exc: Exception | None = None
+        seen: set[str] = set()
+        for candidate in candidates:
+            key = repr(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                self._message = await self.client.get_messages(candidate, self.message_id)
+                return self._message
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                msg = str(exc)
+                # Peer inválido: tenta próximo candidato sem sujar o log como erro fatal.
+                if "Peer id invalid" in msg or "ID not found" in msg:
+                    log.warning(
+                        "Peer %r não resolvido para mensagem %s/%s: %s",
+                        candidate, self.chat_id, self.message_id, msg,
+                    )
+                    continue
+                raise
+        if last_exc:
+            if not self.file_id and ("Peer id invalid" in str(last_exc) or "ID not found" in str(last_exc)):
+                raise RuntimeError(
+                    "Não foi possível resolver este chat pelo ID numérico do Telegram. "
+                    "Sincronize o curso novamente para salvar o file_id das aulas; "
+                    "se o curso for público, confirme também se o @username aparece na lista de cursos."
+                ) from last_exc
+            raise last_exc
+        raise RuntimeError(f"Não foi possível resolver o chat {self.chat_id}")
+
+    async def _stream_media_source(self):
+        """Retorna a fonte mais robusta para ``stream_media``.
+
+        Quando a sincronização já salvou ``file_id``, usamos esse identificador
+        diretamente. Isso evita o erro de peer numérico do Pyrogram e deixa o
+        player independente de resolver o chat a cada Range HTTP. Se o file_id
+        falhar, fazemos fallback para a mensagem.
+        """
+        if self.file_id:
+            return self.file_id
+        return await self._get_message()
 
     # --------------------------------------------------------------- downloads
     def _spawn_download(self, block: int) -> None:
@@ -329,38 +394,61 @@ class StreamSession:
                 while True:
                     written = self._block_filled.get(block, 0)
                     try:
-                        message = await self._get_message()
+                        media_source = await self._stream_media_source()
                         # Reposiciona o offset Pyrogram para o ponto já gravado
-                        # (em unidades de 1 MiB) na re-tentativa.
+                        # (em unidades de 1 MiB) na re-tentativa. Se a queda
+                        # ocorreu no meio de 1 MiB, voltamos também o ponteiro de
+                        # escrita para o limite alinhado; assim regravamos a faixa
+                        # parcial e NÃO duplicamos bytes no cache.
                         resume_mib = written // one_mib
-                        async for chunk in self.client.stream_media(
-                            message,
-                            offset=pyro_offset + resume_mib,
-                            limit=blocks_in_mib - resume_mib,
-                        ):
-                            if self.closed:
-                                return
-                            if not chunk:
-                                continue
-                            # Não escreve além do tamanho do bloco.
-                            remaining = target - written
-                            if remaining <= 0:
-                                break
-                            if len(chunk) > remaining:
-                                chunk = chunk[:remaining]
-                            await asyncio.to_thread(
-                                self._write_at, block_offset + written, bytes(chunk)
-                            )
-                            written += len(chunk)
+                        aligned_written = resume_mib * one_mib
+                        if aligned_written != written:
+                            written = aligned_written
                             self._block_filled[block] = written
-                            # Libera a PARTIDA RÁPIDA assim que possível.
-                            if not partial.is_set() and (
-                                written >= min(FAST_FIRST_BYTES, target)
-                            ):
-                                partial.set()
-                            self.last_access = time.time()
-                            if written >= target:
-                                break
+                        remaining_mib = max(0, blocks_in_mib - resume_mib)
+                        if remaining_mib <= 0:
+                            break
+                        try:
+                            stream_iter = self.client.stream_media(
+                                media_source,
+                                offset=pyro_offset + resume_mib,
+                                limit=remaining_mib,
+                            )
+                            async for chunk in stream_iter:
+                                if self.closed:
+                                    return
+                                if not chunk:
+                                    continue
+                                # Não escreve além do tamanho do bloco.
+                                remaining = target - written
+                                if remaining <= 0:
+                                    break
+                                if len(chunk) > remaining:
+                                    chunk = chunk[:remaining]
+                                await asyncio.to_thread(
+                                    self._write_at, block_offset + written, bytes(chunk)
+                                )
+                                written += len(chunk)
+                                self._block_filled[block] = written
+                                # Libera a PARTIDA RÁPIDA assim que possível.
+                                if not partial.is_set() and (
+                                    written >= min(FAST_FIRST_BYTES, target)
+                                ):
+                                    partial.set()
+                                self.last_access = time.time()
+                                if written >= target:
+                                    break
+                        except Exception as exc:  # noqa: BLE001
+                            # Se o file_id não for aceito por esta versão do Pyrogram,
+                            # desativa-o e refaz a tentativa com get_messages().
+                            if self.file_id and media_source == self.file_id:
+                                log.warning(
+                                    "stream_media(file_id) falhou; tentando via mensagem %s/%s: %s",
+                                    self.chat_id, self.message_id, exc,
+                                )
+                                self.file_id = None
+                                raise
+                            raise
                         # Sucesso (chegou ao fim do stream ou ao alvo).
                         last_exc = None
                         break
@@ -727,6 +815,10 @@ class StreamSession:
         sai do fim e vai para o começo, com o mesmo tamanho), o tamanho total
         permanece IGUAL ao original. Mantemos a propriedade para clareza.
         """
+        if self.faststart_active and self.faststart_header is not None:
+            media_end = self._media_phys_end if self._media_phys_end is not None else self.size - 1
+            media_len = max(0, int(media_end) - int(self._mdat_phys_start) + 1)
+            return len(self.faststart_header) + media_len
         return self.size
 
     async def ensure_faststart(self) -> bool:
@@ -762,15 +854,18 @@ class StreamSession:
             if moov_sz <= 0 or moov_off <= 0:
                 return False
             try:
-                # 1) Lê o ftyp do começo do arquivo (cabe no primeiro pedaço).
+                # 1) Lê o ftyp do começo do arquivo e encontra o mdat real.
+                # Alguns MP4 vêm como ftyp+free/wide+mdat+moov; assumir que o
+                # mdat começa logo após o ftyp deixa o player local lento/travado.
                 head = await self.read_exact(0, min(FIRST_CHUNK_SIZE, self.size), timeout=30.0)
                 ftyp_bytes, ftyp_size = split_ftyp(head)
+                mdat_start = find_mdat_start(head, start=ftyp_size)
                 # 2) Lê o moov inteiro da cauda.
                 moov_bytes = await self.read_exact(moov_off, moov_sz, timeout=45.0)
                 if len(moov_bytes) < moov_sz or moov_bytes[4:8] != b"moov":
                     raise FaststartError("moov incompleto/ inválido na cauda")
-                # 3) Monta o header faststart (offsets corrigidos).
-                header = build_faststart_header(ftyp_bytes, moov_bytes)
+                # 3) Monta o header faststart (offsets corrigidos para mdat real).
+                header = build_faststart_header(ftyp_bytes, moov_bytes, mdat_offset=mdat_start)
             except FaststartError as exc:
                 log.info("faststart desativado para %s: %s", self.token, exc)
                 return False
@@ -779,14 +874,16 @@ class StreamSession:
                 return False
 
             self.faststart_header = header
-            # O mdat (dados de mídia) fica logo após o ftyp no arquivo original.
-            self._mdat_phys_start = ftyp_size
+            # O mdat real pode vir após ftyp+free/wide; mapear pelo offset
+            # correto evita Range quebrado e partida lenta no player local.
+            self._mdat_phys_start = mdat_start
+            self._media_phys_end = max(mdat_start, moov_off) - 1
             self.faststart_active = True
             # Pré-aquece o INÍCIO do mdat para a partida fluir imediatamente.
             self._prewarm_range(self._mdat_phys_start, STARTUP_BUDGET_BYTES)
             log.info(
-                "faststart ATIVO para %s: header=%dB, mdat_phys_start=%d",
-                self.token, len(header), self._mdat_phys_start,
+                "faststart ATIVO para %s: header=%dB, mdat_phys_start=%d, media_end=%s",
+                self.token, len(header), self._mdat_phys_start, self._media_phys_end,
             )
             return True
 
@@ -834,8 +931,14 @@ class StreamSession:
 
         # 2) Parte que cai no MDAT (físico), mapeada de volta.
         if pos <= end:
+            media_end = self._media_phys_end if self._media_phys_end is not None else self.size - 1
+            logical_media_end = h + max(0, int(media_end) - int(self._mdat_phys_start))
+            if pos > logical_media_end:
+                return
             phys_start = self._logical_to_physical(pos)
-            phys_end = self._logical_to_physical(end)
+            phys_end = min(self._logical_to_physical(end), int(media_end))
+            if phys_end < phys_start:
+                return
             async for chunk in self.read_range(phys_start, phys_end, measure=measure):
                 yield chunk
 

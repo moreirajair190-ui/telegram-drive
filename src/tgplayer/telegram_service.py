@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import threading
 import time
 import uuid
@@ -48,6 +49,57 @@ log = logging.getLogger(__name__)
 INITIAL_RANGE_CHUNK = 4 * BLOCK_SIZE
 
 
+class SessionRevokedError(RuntimeError):
+    """Sessão do Telegram foi revogada/expirada no servidor.
+
+    Acontece quando o Telegram invalida a `auth_key` (ex.: o usuário encerrou
+    a sessão por outro dispositivo, trocou a senha, ou a sessão expirou por
+    inatividade). A chamada falha com erros como `401 AUTH_KEY_UNREGISTERED`,
+    `SESSION_REVOKED` ou `USER_DEACTIVATED`. Quando isso ocorre o arquivo de
+    sessão local é inútil e precisa ser apagado para um novo login.
+    """
+
+
+# Trechos que identificam, na mensagem do erro, uma sessão inválida no servidor.
+# Pyrogram nem sempre levanta a classe `Unauthorized`; em algumas versões o
+# erro chega como texto cru ("[401 AUTH_KEY_UNREGISTERED] ..."), por isso
+# também casamos pelo conteúdo da string.
+_AUTH_ERROR_MARKERS = (
+    "AUTH_KEY_UNREGISTERED",
+    "AUTH_KEY_INVALID",
+    "AUTH_KEY_DUPLICATED",
+    "SESSION_REVOKED",
+    "SESSION_EXPIRED",
+    "USER_DEACTIVATED",
+    "USER_DEACTIVATED_BAN",
+)
+
+
+def _is_auth_revoked_error(exc: BaseException) -> bool:
+    """Detecta se a exceção indica que a sessão foi revogada no servidor."""
+    try:
+        from pyrogram.errors import Unauthorized
+
+        if isinstance(exc, Unauthorized):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    text = f"{type(exc).__name__}: {exc}".upper()
+    return any(marker in text for marker in _AUTH_ERROR_MARKERS)
+
+
+def _natural_key(text: str) -> list[object]:
+    """Ordenação natural: PSI 2 vem antes de PSI 10."""
+    parts = re.split(r"(\d+)", (text or "").casefold())
+    return [int(p) if p.isdigit() else p for p in parts]
+
+
+def _topic_sort_key(topic: dict[str, Any]) -> tuple[int, list[object], int]:
+    title = str(topic.get("title") or "")
+    lowered = title.casefold().strip()
+    general = 0 if lowered in {"geral", "general"} else 1
+    return (general, _natural_key(title), int(topic.get("id") or 0))
+
 class TelegramService:
     """Pyrogram + servidor HTTP local, no mesmo event loop (thread dedicada)."""
 
@@ -64,6 +116,9 @@ class TelegramService:
         self.api_hash: str | None = None
         self.phone_code_hash: str | None = None
         self.phone_number: str | None = None
+        self._last_code_sent_at: float = 0.0
+        self._last_code_phone: str | None = None
+        self._flood_wait_until: float = 0.0
         self.runner: web.AppRunner | None = None
         self.site: web.TCPSite | None = None
         self.port: int | None = None
@@ -186,28 +241,67 @@ class TelegramService:
             log.exception("Erro ao fechar serviço")
         self.loop.call_soon_threadsafe(self.loop.stop)
 
-    # ------------------------------------------------------------------- login
-    async def ensure_connected(self, api_id: str | int, api_hash: str) -> dict[str, Any]:
-        from pyrogram import Client
-        from pyrogram.errors import Unauthorized
+    # ------------------------------------------------------- sessão / recuperação
+    # Nome de sessão legado ("tgclassplayer") para que usuários que atualizam do
+    # TGClassPlayer continuem logados sem refazer login.
+    SESSION_NAME = "tgclassplayer"
 
-        self.api_id = int(str(api_id).strip())
-        self.api_hash = str(api_hash).strip()
+    def _session_file_candidates(self) -> list[Path]:
+        """Arquivos que compõem a sessão local do Pyrogram."""
+        base = SESSION_DIR / self.SESSION_NAME
+        return [
+            base.with_suffix(".session"),
+            base.with_suffix(".session-journal"),
+            Path(f"{base}.session"),
+            Path(f"{base}.session-journal"),
+        ]
 
+    async def clear_session_files(self) -> None:
+        """Desconecta e APAGA os arquivos de sessão locais.
+
+        Necessário quando o servidor revoga a chave (AUTH_KEY_UNREGISTERED):
+        manter o arquivo antigo só faz o erro se repetir. Após isto o usuário
+        precisa entrar novamente.
+        """
         if self.client:
             try:
-                me = await self.client.get_me()
-                if me:
-                    return {"authorized": True, "me": self._user_to_dict(me)}
+                await self.client.disconnect()
             except Exception:  # noqa: BLE001
-                try:
-                    await self.client.disconnect()
-                except Exception:  # noqa: BLE001
-                    pass
-                self.client = None
+                pass
+            self.client = None
+        removed = 0
+        for path in self._session_file_candidates():
+            try:
+                if path.exists():
+                    path.unlink()
+                    removed += 1
+            except Exception:  # noqa: BLE001
+                log.exception("Não foi possível remover arquivo de sessão %s", path)
+        if removed:
+            log.warning("Sessão revogada: %d arquivo(s) de sessão removido(s).", removed)
+        # Esquece estado de login em memória.
+        self.phone_code_hash = None
+        self.phone_number = None
+        self._last_code_phone = None
+        self._last_code_sent_at = 0.0
 
-        # Mantemos o nome de sess\u00e3o legado ("tgclassplayer") para que usu\u00e1rios
-        # que atualizam do TGClassPlayer continuem logados sem refazer login.
+    async def _on_auth_revoked(self, exc: BaseException, context: str) -> None:
+        """Limpa a sessão local quando o servidor a revoga e levanta um erro claro."""
+        log.warning("Sessão do Telegram revogada (%s): %s", context, exc)
+        try:
+            await self.clear_session_files()
+        except Exception:  # noqa: BLE001
+            log.exception("Falha ao limpar sessão após revogação")
+        raise SessionRevokedError(
+            "Sua sessão do Telegram expirou ou foi encerrada. "
+            "Entre novamente em Conta → Entrar / trocar conta."
+        ) from exc
+
+    # ------------------------------------------------------------------- login
+    async def _new_client(self):
+        """Cria (sem conectar) um Pyrogram Client com as configurações atuais."""
+        from pyrogram import Client
+
         proxy = self._build_proxy()
         client_kwargs: dict[str, Any] = dict(
             api_id=self.api_id,
@@ -220,21 +314,138 @@ class TelegramService:
             client_kwargs["proxy"] = proxy
             log.info("Usando proxy %s://%s:%s", proxy.get("scheme"),
                      proxy.get("hostname"), proxy.get("port"))
-        self.client = Client("tgclassplayer", **client_kwargs)
-        await self.client.connect()
+        return Client(self.SESSION_NAME, **client_kwargs)
+
+    async def _connect_fresh(self) -> dict[str, Any]:
+        """Conecta um client novo a partir do arquivo de sessão local (se houver).
+
+        Trata sessão revogada apagando o arquivo e devolvendo um client LIMPO já
+        conectado, pronto para `send_code`/`sign_in` — assim o login funciona na
+        mesma hora, sem o usuário precisar fechar o app.
+        """
+        from pyrogram.errors import Unauthorized
+
+        self.client = await self._new_client()
         try:
+            await self.client.connect()
             me = await self.client.get_me()
             return {"authorized": True, "me": self._user_to_dict(me)}
         except Unauthorized:
+            # Não autorizado, mas a sessão é válida o suficiente para enviar
+            # código. Mantemos o client conectado.
             return {"authorized": False}
+        except Exception as exc:  # noqa: BLE001
+            if _is_auth_revoked_error(exc):
+                # Arquivo de sessão inútil: apaga e refaz um client limpo,
+                # já conectado, para permitir um novo login imediatamente.
+                await self.clear_session_files()
+                self.client = await self._new_client()
+                try:
+                    await self.client.connect()
+                except Unauthorized:
+                    pass
+                except Exception:  # noqa: BLE001
+                    log.exception("Falha ao reconectar após limpar sessão revogada")
+                return {"authorized": False, "session_revoked": True}
+            raise
+
+    async def ensure_connected(self, api_id: str | int, api_hash: str) -> dict[str, Any]:
+        self.api_id = int(str(api_id).strip())
+        self.api_hash = str(api_hash).strip()
+
+        if self.client:
+            try:
+                me = await self.client.get_me()
+                if me:
+                    return {"authorized": True, "me": self._user_to_dict(me)}
+            except Exception as exc:  # noqa: BLE001
+                # Se a sessão foi revogada no servidor, não adianta reconectar
+                # com o mesmo arquivo: apagamos e recriamos um client limpo.
+                if _is_auth_revoked_error(exc):
+                    await self.clear_session_files()
+                    result = await self._connect_fresh()
+                    result["session_revoked"] = True
+                    return result
+                try:
+                    await self.client.disconnect()
+                except Exception:  # noqa: BLE001
+                    pass
+                self.client = None
+
+        return await self._connect_fresh()
 
     async def send_code(self, phone_number: str) -> dict[str, Any]:
+        """Envia código de login com proteção contra FLOOD_WAIT.
+
+        O Telegram bloqueia novos códigos por horas quando o usuário clica várias
+        vezes em "Conectar"/"reenviar". Não existe forma segura de burlar isso;
+        a correção é NÃO repetir auth.SendCode enquanto houver hash/cooldown e
+        mostrar o tempo restante com clareza.
+        """
         if not self.client:
             raise RuntimeError("Cliente Telegram não conectado.")
         phone_number = phone_number.strip().replace(" ", "")
-        sent_code = await self.client.send_code(phone_number)
+
+        now = time.time()
+        # Cooldown persistente: se o usuário fechar/abrir o app durante um
+        # FLOOD_WAIT, não tentamos auth.SendCode de novo por acidente.
+        if self.db:
+            try:
+                stored_until = int(float(self.db.get_setting("auth_flood_wait_until") or 0))
+                if stored_until > now:
+                    self._flood_wait_until = stored_until
+            except Exception:  # noqa: BLE001
+                pass
+        if self._flood_wait_until and now < self._flood_wait_until:
+            wait = int(self._flood_wait_until - now)
+            return {"sent": False, "flood_wait": wait}
+
+        # Se acabamos de mandar código para o mesmo telefone, reutiliza o hash em
+        # vez de disparar outro auth.SendCode. Isso evita o erro 420 FLOOD_WAIT.
+        if (
+            self.phone_code_hash
+            and self._last_code_phone == phone_number
+            and now - self._last_code_sent_at < 300
+        ):
+            return {
+                "sent": True,
+                "reused": True,
+                "phone_code_hash": self.phone_code_hash,
+                "cooldown": int(300 - (now - self._last_code_sent_at)),
+            }
+
+        try:
+            sent_code = await self.client.send_code(phone_number)
+        except Exception as exc:  # noqa: BLE001
+            # Pyrogram normalmente levanta FloodWait(value), mas em algumas
+            # versões/ambientes a mensagem vem como texto: [420 FLOOD_WAIT_X] ...
+            wait = getattr(exc, "value", None)
+            if wait is None:
+                m = re.search(r"FLOOD_WAIT_?(\d+)?|wait of (\d+) seconds", str(exc), re.I)
+                if m:
+                    wait = int(next(g for g in m.groups() if g))
+            if wait is not None:
+                wait = int(wait)
+                self._flood_wait_until = time.time() + wait
+                if self.db:
+                    try:
+                        self.db.set_setting("auth_flood_wait_until", str(int(self._flood_wait_until)))
+                    except Exception:  # noqa: BLE001
+                        pass
+                log.warning("Telegram impôs FLOOD_WAIT de %ss ao enviar código", wait)
+                return {"sent": False, "flood_wait": wait}
+            raise
+
         self.phone_number = phone_number
         self.phone_code_hash = sent_code.phone_code_hash
+        self._last_code_phone = phone_number
+        self._last_code_sent_at = time.time()
+        self._flood_wait_until = 0
+        if self.db:
+            try:
+                self.db.set_setting("auth_flood_wait_until", "0")
+            except Exception:  # noqa: BLE001
+                pass
         return {"sent": True, "phone_code_hash": self.phone_code_hash}
 
     async def sign_in(self, code: str) -> dict[str, Any]:
@@ -280,23 +491,32 @@ class TelegramService:
 
         allowed = {ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL}
         courses: list[dict[str, Any]] = []
-        async for dialog in self.client.get_dialogs(limit=limit):
-            chat = dialog.chat
-            if chat.type not in allowed:
-                continue
-            title = first_non_empty(
-                [getattr(chat, "title", None), getattr(chat, "first_name", None)],
-                str(chat.id),
-            )
-            courses.append(
-                {
-                    "chat_id": str(chat.id),
-                    "title": title,
-                    "username": getattr(chat, "username", None),
-                    "chat_type": str(chat.type).split(".")[-1],
-                    "is_forum": 1 if getattr(chat, "is_forum", False) else 0,
-                }
-            )
+        try:
+            async for dialog in self.client.get_dialogs(limit=limit):
+                chat = dialog.chat
+                if chat.type not in allowed:
+                    continue
+                title = first_non_empty(
+                    [getattr(chat, "title", None), getattr(chat, "first_name", None)],
+                    str(chat.id),
+                )
+                courses.append(
+                    {
+                        "chat_id": str(chat.id),
+                        "title": title,
+                        "username": getattr(chat, "username", None),
+                        "chat_type": str(chat.type).split(".")[-1],
+                        "is_forum": 1 if getattr(chat, "is_forum", False) else 0,
+                    }
+                )
+        except Exception as exc:  # noqa: BLE001
+            # Causa do erro reportado pelos usuários:
+            # [401 AUTH_KEY_UNREGISTERED] ... caused by "messages.GetDialogs".
+            # A sessão local existe mas o servidor já a revogou. Apagamos o
+            # arquivo e pedimos novo login em vez de repetir o erro.
+            if _is_auth_revoked_error(exc):
+                await self._on_auth_revoked(exc, "messages.GetDialogs")
+            raise
         courses.sort(key=lambda item: item["title"].lower())
         return courses
 
@@ -377,18 +597,23 @@ class TelegramService:
         from pyrogram.enums import ChatType
 
         chat_id = int(chat_id) if str(chat_id).lstrip("-").isdigit() else chat_id
-        chat = await self.client.get_chat(chat_id)
-        chat_type = getattr(chat, "type", None)
-        is_forum = False
-        if chat_type == ChatType.SUPERGROUP:
-            is_forum = await self._is_forum(chat)
+        try:
+            chat = await self.client.get_chat(chat_id)
+            chat_type = getattr(chat, "type", None)
+            is_forum = False
+            if chat_type == ChatType.SUPERGROUP:
+                is_forum = await self._is_forum(chat)
 
-        if is_forum:
-            subjects, videos, scanned = await self._sync_forum(chat, limit, progress_cb)
-        elif chat_type == ChatType.CHANNEL:
-            subjects, videos, scanned = await self._sync_channel(chat, limit, progress_cb)
-        else:
-            subjects, videos, scanned = await self._sync_group(chat, limit, progress_cb)
+            if is_forum:
+                subjects, videos, scanned = await self._sync_forum(chat, limit, progress_cb)
+            elif chat_type == ChatType.CHANNEL:
+                subjects, videos, scanned = await self._sync_channel(chat, limit, progress_cb)
+            else:
+                subjects, videos, scanned = await self._sync_group(chat, limit, progress_cb)
+        except Exception as exc:  # noqa: BLE001
+            if _is_auth_revoked_error(exc):
+                await self._on_auth_revoked(exc, "sync_course")
+            raise
 
         return {
             "chat": {
@@ -418,6 +643,10 @@ class TelegramService:
         tópico correto — cada tópico = uma matéria com o SEU próprio sumário.
         """
         topics = await self._raw_get_forum_topics(chat, limit=400)
+        # A API costuma devolver tópicos por atividade recente; para um curso isso
+        # bagunça a navegação. Ordenamos naturalmente pelo título do tópico para
+        # preservar sequências como PSI 1, PSI 2, PRE 1, CIR 10 etc.
+        topics = sorted(topics, key=_topic_sort_key)
         history_limit = max(0, int(limit or 0))
         per_topic_limit = history_limit if history_limit else 0  # 0 = tudo
 
@@ -514,6 +743,8 @@ class TelegramService:
                 ok = False
 
         topic_videos.reverse()
+        for idx, video in enumerate(topic_videos):
+            video["sort_order"] = idx
         return topic_videos, best_summary, scanned
 
     # ---- B) Grupo/supergrupo normal: uma matéria ----------------------------
@@ -576,6 +807,8 @@ class TelegramService:
                 videos.append(video)
 
         videos.reverse()
+        for idx, video in enumerate(videos):
+            video["sort_order"] = idx
         return videos, best_summary, scanned
 
     # ---- helpers de mensagem ------------------------------------------------
@@ -649,6 +882,8 @@ class TelegramService:
             "date": date.isoformat() if date else None,
             "hashtags": tags,
             "caption": caption,
+            "file_id": getattr(media, "file_id", None),
+            "file_unique_id": getattr(media, "file_unique_id", None),
             "telegram_topic_id": str(topic_id) if topic_id else "general",
         }
 
@@ -659,6 +894,13 @@ class TelegramService:
         await self._ensure_stream_server()
         token = uuid.uuid4().hex
         filename = safe_filename(video.get("file_name") or video.get("title") or "video.mp4")
+        chat_username = (video.get("chat_username") or "").strip().lstrip("@") or None
+        if not chat_username and self.db and video.get("course_id"):
+            try:
+                course = self.db.get_course(int(video.get("course_id")))
+                chat_username = (getattr(course, "username", None) or "").strip().lstrip("@") or None
+            except Exception:  # noqa: BLE001
+                chat_username = None
         cache_path = self.stream_cache_dir / f"{token}.part"
         session = StreamSession(
             token=token,
@@ -670,6 +912,8 @@ class TelegramService:
             mime_type=video.get("mime_type"),
             throttle_kbps=self._current_throttle_kbps(),
             max_retries=self._current_max_retries(),
+            file_id=video.get("file_id"),
+            chat_username=chat_username,
         )
         self.sessions[token] = session
         # Partida rápida: já dispara o download do início + cauda (moov).
@@ -757,6 +1001,13 @@ class TelegramService:
             return {"warmed": False}
         chat_id = video.get("chat_id")
         message_id = int(video.get("message_id") or 0)
+        chat_username = (video.get("chat_username") or "").strip().lstrip("@") or None
+        if not chat_username and self.db and video.get("course_id"):
+            try:
+                course = self.db.get_course(int(video.get("course_id")))
+                chat_username = (getattr(course, "username", None) or "").strip().lstrip("@") or None
+            except Exception:  # noqa: BLE001
+                chat_username = None
         size = int(video.get("size") or 0)
         if not chat_id or not message_id or not size:
             return {"warmed": False}
@@ -773,6 +1024,8 @@ class TelegramService:
             mime_type=video.get("mime_type"),
             throttle_kbps=0,  # warm-up sempre na velocidade máxima
             max_retries=1,
+            file_id=video.get("file_id"),
+            chat_username=chat_username,
         )
         try:
             # Reaproveita o moov_cache para não redescobrir.
@@ -1228,18 +1481,53 @@ class TelegramService:
             except Exception:  # noqa: BLE001
                 pass
 
-    def telegram_message_link(self, username: str | None, message_id: int) -> str | None:
-        """Gera o link nativo t.me de uma mensagem em canal/grupo PÚBLICO.
+    @staticmethod
+    def _private_tme_id(chat_id: str | int | None) -> str | None:
+        """Converte -1001234567890 -> 1234567890 para links t.me/c."""
+        if chat_id is None:
+            return None
+        raw = str(chat_id).strip()
+        if not raw:
+            return None
+        raw = raw.lstrip("+")
+        if raw.startswith("-100") and raw[4:].isdigit():
+            return raw[4:]
+        if raw.startswith("100") and raw[3:].isdigit():
+            return raw[3:]
+        if raw.startswith("-") and raw[1:].isdigit():
+            # Para grupos/canais sem prefixo -100, usa o valor absoluto como último fallback.
+            return raw[1:]
+        return raw if raw.isdigit() else None
 
-        Ideia portada do recurso de "copiar link nativo do Telegram" do projeto
-        de referência. Só funciona quando o chat tem `username` (é público).
+    def telegram_message_urls(
+        self, username: str | None, chat_id: str | int | None, message_id: int
+    ) -> tuple[str | None, str | None]:
+        """Retorna (tg_url, web_url) para abrir a mensagem original.
+
+        Público:  tg://resolve?domain=<username>&post=<id>  e https://t.me/<username>/<id>
+        Privado:  tg://privatepost?channel=<id>&post=<id>   e https://t.me/c/<id>/<id>
         """
-        if not username:
-            return None
-        uname = str(username).lstrip("@").strip()
-        if not uname:
-            return None
-        return f"https://t.me/{uname}/{int(message_id)}"
+        mid = int(message_id)
+        uname = str(username or "").lstrip("@").strip()
+        if uname:
+            # O Telegram não documenta deep link que abra diretamente o visualizador
+            # de mídia. O parâmetro ?single melhora o foco na mensagem no web/t.me,
+            # mas no app desktop ainda pode exigir um clique no vídeo.
+            return f"tg://resolve?domain={uname}&post={mid}", f"https://t.me/{uname}/{mid}?single"
+        private_id = self._private_tme_id(chat_id)
+        if private_id:
+            return (
+                f"tg://privatepost?channel={private_id}&post={mid}",
+                f"https://t.me/c/{private_id}/{mid}?single",
+            )
+        return None, None
+
+    def telegram_message_link(
+        self, username: str | None, message_id: int, chat_id: str | int | None = None
+    ) -> str | None:
+        """Gera link t.me da mensagem. Funciona em público e, quando possível, em privado."""
+        _app_url, web_url = self.telegram_message_urls(username, chat_id, message_id)
+        return web_url
 
     async def release_stream(self, token: str, delete_file: bool = True) -> dict[str, Any]:
         self.session_meta.pop(token, None)
@@ -1248,6 +1536,36 @@ class TelegramService:
             return {"released": False}
         await session.close()
         return {"released": True}
+
+    async def release_stream_later(
+        self, token: str, ttl_seconds: int = 7200, delete_file: bool = True
+    ) -> dict[str, Any]:
+        """Mantém um stream vivo por TTL para VLC externo/URL copiada.
+
+        O VLC abre a URL local fora do ciclo de vida da janela do player. Se o
+        player interno libera o token no closeEvent, o VLC recebe 404/stream
+        expirado. Esta rotina agenda a liberação sem travar a UI.
+        """
+        if token not in self.sessions:
+            return {"scheduled": False}
+        ttl = max(60, int(ttl_seconds or 7200))
+        meta = self.session_meta.setdefault(token, {})
+        meta["external_until"] = time.time() + ttl
+
+        async def _later() -> None:
+            await asyncio.sleep(ttl)
+            # Não derruba se a sessão foi reutilizada/acessada muito recentemente.
+            session = self.sessions.get(token)
+            if not session:
+                return
+            until = float(self.session_meta.get(token, {}).get("external_until") or 0)
+            if until and time.time() < until:
+                return
+            await self.release_stream(token, delete_file=delete_file)
+
+        asyncio.ensure_future(_later())
+        log.info("Stream %s mantido vivo por %ss para player externo", token[:8], ttl)
+        return {"scheduled": True, "ttl_seconds": ttl}
 
     async def _ensure_stream_server(self) -> None:
         if self.runner and self.port:
@@ -1422,7 +1740,13 @@ class TelegramService:
 
         total = session.logical_size
         range_header = request.headers.get("Range")
-        start, end = self._parse_range(range_header, total)
+        if range_header:
+            start, end = self._parse_range(range_header, total)
+        else:
+            # Sem Range: HTTP correto é 200 com o tamanho total. A entrega continua
+            # em streaming e sob demanda; não baixamos tudo antes de responder.
+            start = 0
+            end = (total - 1) if total else (INITIAL_RANGE_CHUNK - 1)
 
         if total and start >= total:
             return web.Response(status=416, headers={"Content-Range": f"bytes */{total}"})
@@ -1431,7 +1755,7 @@ class TelegramService:
         if end < start:
             end = start
 
-        is_partial = bool(range_header) or (total and (start != 0 or end != total - 1))
+        is_partial = bool(range_header)
         status = 206 if is_partial else 200
         length = (end - start + 1) if total else None
 
@@ -1440,8 +1764,9 @@ class TelegramService:
             "Content-Type": session.mime_type,
             "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
             "Pragma": "no-cache",
-            "Access-Control-Allow-Origin": "*",
             "Connection": "keep-alive",
+            "Content-Disposition": "inline",
+            "X-Content-Type-Options": "nosniff",
         }
         if total:
             if is_partial:

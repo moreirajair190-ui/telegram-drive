@@ -1,218 +1,65 @@
-============================================================
-  TgPlayer v6.4 - COMO USAR (guia rapido, em portugues)
-============================================================
+TgPlayer v6.4.15 — Como gerar e distribuir o EXE
+==================================================
 
-O TgPlayer organiza e reproduz as videoaulas dos seus cursos do
-Telegram, com player premium e streaming sob demanda (o video NAO fica
-salvo no seu computador). Tem temas claro/escuro, navegacao por materias
-e uma aba de Acompanhamento de estudos (Pomodoro, tarefas e graficos).
+1) Extraia o projeto em uma pasta simples, por exemplo:
 
-NOVO na v6.4:
-  - PARTIDA RAPIDA: o video agora comeca em 2 a 5 segundos (antes podia
-    levar quase 1 minuto). O app reorganiza o cabecalho do MP4 em memoria
-    (faststart virtual) e ja "aquece" o inicio assim que voce SELECIONA a
-    aula. Se algo falhar, ele volta ao modo antigo sem quebrar.
-  - PLAYER REDESENHADO: uma so cor de destaque, um menu de engrenagem (⚙)
-    que reune Qualidade, Velocidade e "Abrir no VLC", barra de progresso
-    com faixa de buffer e dica de tempo, cabecalho limpo e um indicador
-    de carregamento giratorio com porcentagem. Os atalhos sao os mesmos.
-  - NOVA ABA "🗂️ Arquivos": navegue por TODA a midia de um chat
-    (videos, PDFs, imagens, ZIP, audios) com miniaturas, busca e filtros;
-    baixe para o disco e envie arquivos com barra de progresso; pre-veja
-    imagens, abra videos no player interno e copie o link t.me.
+   C:\TgPlayer
 
+2) Instale Python 3.11 ou 3.12 de 64 bits pelo site python.org.
+   Na instalação, marque:
 
-------------------------------------------------------------
-1) GERAR O APLICATIVO (.EXE) NO WINDOWS
-------------------------------------------------------------
-1. Instale o Python 3.11 ou 3.12 (64 bits):
-   https://www.python.org/downloads/
-   IMPORTANTE: marque a opcao "Add Python to PATH" na instalacao.
-   (Evite o Python 3.13 por enquanto - o TgCrypto pode nao instalar nele.)
+   Add Python to PATH
 
-2. De DUPLO CLIQUE em "build_exe.bat".
-   - Ele cria um ambiente virtual, instala tudo e gera o executavel.
-   - Pode demorar alguns minutos na primeira vez.
-   - Se aparecer um AVISO de que o TgCrypto nao foi instalado, tudo bem:
-     ele e opcional e o aplicativo funciona normalmente sem ele.
+3) Dentro da pasta do projeto, execute:
 
-3. O aplicativo ficara em:
-       dist\TgPlayer\TgPlayer.exe
+   build_exe.bat --clean
 
-4. Para distribuir, copie a PASTA INTEIRA "dist\TgPlayer".
+4) Aguarde. A primeira vez pode demorar porque o script instala PySide6.
 
-(Para apenas testar sem gerar .exe, de duplo clique em "run_dev.bat".)
+5) Ao terminar, use SOMENTE um destes:
 
+   TgPlayer_PORTABLE_PARA_ENVIAR.zip
 
-------------------------------------------------------------
-2) PEGAR O API ID E O API HASH (uma unica vez)
-------------------------------------------------------------
-1. Acesse https://my.telegram.org e entre com o seu numero.
-2. Abra "API development tools".
-3. Crie um app (qualquer nome). Anote o api_id (numero) e o
-   api_hash (texto).
+   ou
 
-ATENCAO: nunca compartilhe seu API HASH, seu codigo de login ou a
-sua senha de verificacao em duas etapas (2FA) com ninguem.
+   dist\TgPlayer\TgPlayer.exe
 
+6) Para enviar ao usuário final, envie:
 
-------------------------------------------------------------
-3) CONECTAR A SUA CONTA
-------------------------------------------------------------
-1. Abra o app e clique em "Conectar" (canto superior direito).
-2. Preencha API ID, API HASH e seu telefone com DDI
-   (ex.: +5547999999999).
-3. Digite o codigo que chega no proprio Telegram.
-4. Se voce usa verificacao em duas etapas, informe a senha 2FA.
+   TgPlayer_PORTABLE_PARA_ENVIAR.zip
 
+   ou compacte/envie a pasta inteira:
 
-------------------------------------------------------------
-4) ADICIONAR CURSOS E SINCRONIZAR
-------------------------------------------------------------
-1. Na barra lateral, clique em "+ Adicionar cursos".
-2. Marque os grupos/canais/foruns que sao seus cursos e confirme.
-3. Selecione um curso e clique em "Sincronizar".
+   dist\TgPlayer
 
-O app DETECTA SOZINHO o tipo do chat:
- - Forum (com topicos): cada TOPICO vira uma MATERIA.
- - Grupo normal: uma materia unica.
- - Canal: lista linear de aulas (em ordem).
+7) NÃO execute e NÃO envie estas pastas:
 
-Voce nao precisa configurar nada. Depois pode editar tudo manualmente.
+   build\TgPlayer
+   build_intermediario_NAO_EXECUTAR\TgPlayer
+   .venv
+   .venv-build
 
+Essas pastas são internas/temporárias do build. Se você executar o EXE de dentro delas,
+pode aparecer o erro:
 
-------------------------------------------------------------
-5) NAVEGAR E ASSISTIR
-------------------------------------------------------------
-- A barra do topo mostra o curso/materia e o PROGRESSO GERAL
-  (aulas assistidas/total e horas).
-- Escolha a MATERIA na lista da esquerda.
-- No centro, as aulas aparecem organizadas por MODULO > AULA > TIPO.
-- Use a busca e os filtros: Todas / Assistidas / Pendentes / Favoritas.
-- Clique em uma aula e em "Assistir agora" (ou clique 2x na aula).
-- O player retoma de onde voce parou e salva o progresso.
-- O player usa os codecs do proprio Windows (reproduz MP4/H.264 sem problema).
-- Se mesmo assim alguma aula nao tocar, clique em "Tentar de novo" ou no
-  botao "Abrir no VLC" (instale o VLC gratis em https://www.videolan.org/).
+   Failed to load Python DLL ... _internal\python311.dll
 
-NOVO na v6.3 - dentro do player:
-- Engrenagem de QUALIDADE (canto): 360p / 480p / 720p / 1080p / original,
-  ou modo "Auto" (adaptativo) que ajusta pela sua banda.
-- Badges no topo mostram qualidade, resolucao e a posicao na playlist.
-- Botoes < e > (e as teclas P / N) trocam para a aula anterior/proxima.
-- Ao terminar (ou perto do fim), aparece a contagem de AUTO-PLAY da proxima.
-- Atalhos uteis: Espaco (play/pausa), <-/-> (10s), J/L (10s), cima/baixo
-  (volume), F (tela cheia), M (mudo), [ e ] (velocidade), 0-9 (saltar %),
-  D (overlay de debug com banda e buffer).
-- A velocidade de reproducao e lembrada POR CURSO.
+Esse erro significa que o EXE está sem a pasta _internal ou que o pacote foi copiado incompleto.
 
-NOVO na v6.4 - dentro do player:
-- A engrenagem (⚙) agora reune Qualidade, Velocidade e "Abrir no VLC"
-  num so menu escuro, deixando a barra de controles bem limpa.
-- O cabecalho mostra apenas posicao na playlist, resolucao e o backend
-  (ex.: ⚡ Nativo), sem badges repetidos.
-- Enquanto carrega, aparece um indicador giratorio com a porcentagem.
+8) Se o erro persistir mesmo em dist\TgPlayer:
 
-NOVO na v6.3 - na lista de aulas:
-- A resolucao aparece como badge (ex.: 1080p) quando conhecida.
-- O filtro "Continuar assistindo" (lista de materias) reune as aulas em
-  andamento; a lista de cursos mostra o % concluido de cada curso.
-- No botao direito da aula: "Copiar link do Telegram (t.me)" gera o link
-  nativo (somente para canais/grupos PUBLICOS).
+   - execute build_exe.bat --clean;
+   - confira se existe dist\TgPlayer\_internal\python311.dll;
+   - veja se o antivírus colocou python311.dll em quarentena;
+   - instale Python 3.11/3.12 de 64 bits;
+   - envie o arquivo build_log.txt para análise.
 
-------------------------------------------------------------
-5B) ABA "🗂️ Arquivos" (NOVO na v6.4)
-------------------------------------------------------------
-A aba "Arquivos" transforma qualquer chat sincronizado numa especie de
-"nuvem" navegavel:
-- Escolha o CHAT no seletor do topo e clique em "Atualizar".
-- Os arquivos aparecem em GRADE com miniaturas. Use a BUSCA (por nome ou
-  legenda) e os FILTROS por tipo: Tudo / Videos / Imagens / PDFs /
-  Compactados / Audios / Outros.
-- Clique 2x num item:
-    * Video  -> abre no player interno;
-    * Imagem -> abre a pre-visualizacao;
-    * Outros -> oferece salvar no disco.
-- Botao direito num item: "Baixar para o disco" (com barra de progresso)
-  e "Copiar link t.me" (chats publicos).
-- Botao "Enviar arquivo": escolha um arquivo do seu PC para enviar ao
-  chat, com barra de progresso. Se o chat nao permitir envio (somente
-  leitura), o app avisa de forma amigavel.
+9) Build alternativo:
 
+   build_exe_unico.bat --clean
 
-------------------------------------------------------------
-6) SUMARIO (MENU) DE CADA MATERIA
-------------------------------------------------------------
-O sumario liga as hashtags das aulas a um menu organizado. Formato:
+Gera um único arquivo em:
 
-   = Modulo 1 - Introducao
-   == Aula 1 - Boas-vindas
-   === Videoaula
-   #AULA01
-   === Resumo
-   #RESUMO01
+   dist_onefile\TgPlayer.exe
 
- - "="   = Modulo
- - "=="  = Aula
- - "===" = Tipo (Videoaula / Resumo / Bonus ...)
- - As linhas com #TAG ligam o item do menu a aula com a MESMA hashtag.
- - Aulas sem correspondencia aparecem em "Sem modulo".
-
-Edite em "Editar materias/sumarios" (barra lateral) ou clicando com o
-botao direito sobre a materia.
-
-
-------------------------------------------------------------
-7) EDITAR TUDO (botao direito)
-------------------------------------------------------------
-- Cursos: renomear, definir cor, reordenar, sincronizar, excluir.
-- Materias: nova, renomear, editar sumario, reordenar, excluir.
-- Aulas: editar (titulo, materia, modulo, tipo, hashtags, notas),
-  favoritar, marcar assistida/pendente, copiar link temporario,
-  copiar link do Telegram (t.me, canais publicos), remover.
-
-
-------------------------------------------------------------
-8) ABA "ACOMPANHAMENTO" (estudos)
-------------------------------------------------------------
-- Pomodoro: defina foco / pausa curta / pausa longa e use
-  Iniciar / Pausar / Zerar. Os ciclos de foco sao registrados.
-- Tarefas: crie itens "A fazer", marque como "Feito", defina
-  prioridade e prazo (botao direito para editar/excluir/reordenar).
-- Graficos: tempo de estudo por dia, aulas concluidas por curso e
-  anel de progresso do curso atual.
-
-
-------------------------------------------------------------
-9) STREAMING & REDE (novo na v6.3)
-------------------------------------------------------------
-Menu "Ferramentas" > "Streaming & Rede...". Ali voce define:
-- Qualidade padrao e o modo adaptativo (Auto).
-- Limite de banda (kbps) - util para nao saturar a sua conexao.
-- Tamanho do bloco e numero de re-tentativas de rede.
-- Modo "conexao instavel": mais re-tentativas com espera (backoff),
-  ideal para redes ruins/instaveis.
-- Proxy: SOCKS5, HTTP ou MTProto (host, porta, usuario e senha).
-  Os ajustes de proxy passam a valer na proxima conexao.
-
-Quando ha streaming ativo, a barra do topo mostra a BANDA em tempo real.
-
-
-------------------------------------------------------------
-10) TEMA CLARO / ESCURO
-------------------------------------------------------------
-Clique no botao de tema (lua/sol) no canto superior direito. A sua
-escolha fica salva automaticamente.
-
-
-------------------------------------------------------------
-11) PRIVACIDADE E LIMITES
-------------------------------------------------------------
-- O video NAO e salvo de forma permanente (apenas cache temporario,
-  apagado ao fechar o player).
-- Use somente com conteudo a que voce tem acesso legitimo.
-- Sua sessao e suas credenciais ficam SOMENTE no seu computador
-  (pasta %LOCALAPPDATA%\TgPlayer quando rodando como .exe).
-
-
-Bons estudos! :)
+Mas a versão em pasta é recomendada para maior estabilidade.

@@ -126,6 +126,24 @@ def parse_summary(text: str | None, root_title: str = "Sumário") -> MenuNode:
                     root.children.append(generic)
                     stack = [root, generic]
                 target = stack[-1]
+
+            # Muitos sumários do Telegram usam linhas do tipo:
+            #   #PSI01 — Delirium
+            #   #PSI01 MiniAula 01
+            # Antes o parser jogava todas essas tags no nó "Videoaula", fazendo
+            # todas as aulas da mesma hashtag aparecerem juntas e fora de ordem.
+            # Agora, quando a linha tem um rótulo além da hashtag, criamos uma
+            # folha própria na ordem do sumário e deixamos a tag nela.
+            label = re.sub(r"#[\wÀ-ÿ]+", "", line).strip(" 	-–—:·•|[]()")
+            label = re.sub(r"\s+", " ", label).strip()
+            if label and not _is_decoration(label):
+                leaf = MenuNode(title=label, level=min(target.level + 1, 3))
+                for tag in tags:
+                    if tag not in leaf.tags:
+                        leaf.tags.append(tag)
+                target.children.append(leaf)
+                continue
+
             for tag in tags:
                 if tag not in target.tags:
                     target.tags.append(tag)

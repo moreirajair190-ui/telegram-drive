@@ -1,3 +1,3 @@
-"""TgPlayer — Player premium de videoaulas do Telegram."""
+"""TgPlayer — organizador de videoaulas do Telegram."""
 
-__version__ = "6.4.0"
+__version__ = "6.4.15"

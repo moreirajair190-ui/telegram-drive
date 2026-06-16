@@ -83,6 +83,8 @@ class Video:
     height: int | None = None
     hashtags: list[str] = field(default_factory=list)
     caption: str | None = None
+    file_id: str | None = None
+    file_unique_id: str | None = None
     watched_at: str | None = None
     module: str | None = None
     lesson: str | None = None
@@ -191,6 +193,8 @@ class Database:
                     date        TEXT,
                     hashtags_json TEXT,
                     caption     TEXT,
+                    file_id     TEXT,
+                    file_unique_id TEXT,
                     watched_at  TEXT,
                     module      TEXT,
                     lesson      TEXT,
@@ -274,6 +278,10 @@ class Database:
             self._ensure_column(conn, "videos", "note", "TEXT")
             self._ensure_column(conn, "videos", "sort_order", "INTEGER DEFAULT 0")
             self._ensure_column(conn, "videos", "manual", "INTEGER DEFAULT 0")
+            # v6.4.2: file_id permite streaming sem depender de peer_id numérico
+            # (Pyrogram pode rejeitar canais novos com id -100... acima de 32 bits).
+            self._ensure_column(conn, "videos", "file_id", "TEXT")
+            self._ensure_column(conn, "videos", "file_unique_id", "TEXT")
             # Migração v6.2 -> v6.3: resolução + timestamp do último acesso.
             self._ensure_column(conn, "videos", "width", "INTEGER")
             self._ensure_column(conn, "videos", "height", "INTEGER")
@@ -602,7 +610,10 @@ class Database:
                         """
                         UPDATE videos SET
                             course_id=?, file_name=?, mime_type=?, size=?, duration=?,
-                            width=?, height=?, date=?, hashtags_json=?, caption=?
+                            width=?, height=?, date=?, hashtags_json=?, caption=?,
+                            file_id=COALESCE(NULLIF(?, ''), file_id),
+                            file_unique_id=COALESCE(NULLIF(?, ''), file_unique_id),
+                            sort_order=COALESCE(?, sort_order)
                         WHERE chat_id=? AND message_id=?
                         """,
                         (
@@ -616,15 +627,20 @@ class Database:
                             video.get("date"),
                             json.dumps(video.get("hashtags") or [], ensure_ascii=False),
                             video.get("caption"),
+                            video.get("file_id"),
+                            video.get("file_unique_id"),
+                            video.get("sort_order"),
                             str(video["chat_id"]),
                             int(video["message_id"]),
                         ),
                     )
-                    # Só preenche a matéria se ela ainda estiver vazia (respeita edição manual).
+                    # Atualiza matéria reclassificada pela sincronização quando o
+                    # usuário ainda não editou manualmente a aula. Antes só preenchia
+                    # se subject_id fosse NULL, o que fazia erros antigos persistirem.
                     if video.get("subject_id") is not None:
                         conn.execute(
                             "UPDATE videos SET subject_id=? "
-                            "WHERE chat_id=? AND message_id=? AND subject_id IS NULL",
+                            "WHERE chat_id=? AND message_id=? AND COALESCE(manual,0)=0",
                             (video.get("subject_id"), str(video["chat_id"]), int(video["message_id"])),
                         )
                     # Atualiza módulo/aula/tipo só se ainda não definidos.
@@ -641,8 +657,8 @@ class Database:
                         INSERT INTO videos(
                             course_id, subject_id, chat_id, message_id, title, file_name,
                             mime_type, size, duration, width, height, date, hashtags_json,
-                            caption, module, lesson, type
-                        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            caption, file_id, file_unique_id, module, lesson, type, sort_order
+                        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             course_id,
@@ -659,9 +675,12 @@ class Database:
                             video.get("date"),
                             json.dumps(video.get("hashtags") or [], ensure_ascii=False),
                             video.get("caption"),
+                            video.get("file_id"),
+                            video.get("file_unique_id"),
                             video.get("module"),
                             video.get("lesson"),
                             video.get("type"),
+                            video.get("sort_order"),
                         ),
                     )
             conn.execute("UPDATE courses SET last_sync=? WHERE id=?", (self.now(), course_id))
@@ -704,12 +723,12 @@ class Database:
     def rename_video(self, video_id: int, title: str) -> None:
         with self.connect() as conn:
             conn.execute(
-                "UPDATE videos SET title=? WHERE id=?", (title.strip() or "Aula", video_id)
+                "UPDATE videos SET title=?, manual=1 WHERE id=?", (title.strip() or "Aula", video_id)
             )
 
     def set_video_subject(self, video_id: int, subject_id: int | None) -> None:
         with self.connect() as conn:
-            conn.execute("UPDATE videos SET subject_id=? WHERE id=?", (subject_id, video_id))
+            conn.execute("UPDATE videos SET subject_id=?, manual=1 WHERE id=?", (subject_id, video_id))
 
     def set_video_dimensions(
         self,
@@ -925,6 +944,113 @@ class Database:
             ).fetchall()
         return [(r["title"], int(r["watched"] or 0)) for r in rows]
 
+
+    # ---- dashboard / acompanhamento ----------------------------------------
+    def today_study_seconds(self) -> int:
+        """Tempo registrado hoje no módulo de acompanhamento."""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(seconds),0) AS s FROM study_log WHERE day=?",
+                (self.today(),),
+            ).fetchone()
+            return int(row["s"] or 0)
+
+    def week_study_seconds(self) -> int:
+        """Tempo da semana atual, segunda-feira -> hoje."""
+        from datetime import timedelta
+
+        today = datetime.now()
+        start = today - timedelta(days=today.weekday())
+        start_day = start.strftime("%Y-%m-%d")
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(seconds),0) AS s FROM study_log WHERE day>=?",
+                (start_day,),
+            ).fetchone()
+            return int(row["s"] or 0)
+
+    def task_counts(self) -> dict[str, int]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT done, COUNT(*) AS n FROM tasks GROUP BY done"
+            ).fetchall()
+        out = {"open": 0, "done": 0, "total": 0}
+        for row in rows:
+            key = "done" if int(row["done"] or 0) else "open"
+            out[key] = int(row["n"] or 0)
+        out["total"] = out["open"] + out["done"]
+        return out
+
+    def video_totals(self) -> tuple[int, int]:
+        """Retorna (aulas_concluidas, total_aulas) em todos os cursos."""
+        with self.connect() as conn:
+            total = conn.execute("SELECT COUNT(*) AS n FROM videos").fetchone()["n"]
+            done = conn.execute(
+                "SELECT COUNT(*) AS n FROM videos WHERE watched_at IS NOT NULL OR progress>=0.92"
+            ).fetchone()["n"]
+        return int(done or 0), int(total or 0)
+
+    def course_completion_stats(self) -> list[dict[str, Any]]:
+        """Resumo de progresso por curso para dashboard/gráfico."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT c.id, c.title,
+                       COUNT(v.id) AS total,
+                       SUM(CASE WHEN v.watched_at IS NOT NULL OR v.progress>=0.92 THEN 1 ELSE 0 END) AS done
+                FROM courses c
+                LEFT JOIN videos v ON v.course_id=c.id
+                GROUP BY c.id
+                ORDER BY done DESC, total DESC, c.title COLLATE NOCASE
+                """
+            ).fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            total = int(row["total"] or 0)
+            done = int(row["done"] or 0)
+            out.append({"id": int(row["id"]), "title": row["title"], "total": total, "done": done, "pct": int(done / total * 100) if total else 0})
+        return out
+
+    def subject_completion_stats(self, course_id: int) -> list[dict[str, Any]]:
+        """Resumo de progresso por matéria/tópico dentro do curso atual."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT COALESCE(s.title, 'Sem matéria') AS title,
+                       COUNT(v.id) AS total,
+                       SUM(CASE WHEN v.watched_at IS NOT NULL OR v.progress>=0.92 THEN 1 ELSE 0 END) AS done,
+                       COALESCE(s.sort_order, 999999) AS ord
+                FROM videos v
+                LEFT JOIN subjects s ON s.id=v.subject_id
+                WHERE v.course_id=?
+                GROUP BY COALESCE(s.id, -1), COALESCE(s.title, 'Sem matéria')
+                ORDER BY ord ASC, title COLLATE NOCASE
+                """,
+                (course_id,),
+            ).fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            total = int(row["total"] or 0)
+            done = int(row["done"] or 0)
+            out.append({"title": row["title"], "total": total, "done": done, "pct": int(done / total * 100) if total else 0})
+        return out
+
+    def recent_completed_videos(self, limit: int = 8) -> list[dict[str, Any]]:
+        """Aulas marcadas como assistidas recentemente."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT v.id, v.title, v.watched_at, c.title AS course_title
+                FROM videos v
+                LEFT JOIN courses c ON c.id=v.course_id
+                WHERE v.watched_at IS NOT NULL
+                ORDER BY v.watched_at DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     # ---- tasks --------------------------------------------------------------
     def list_tasks(self, include_done: bool = True) -> list[dict[str, Any]]:
         with self.connect() as conn:
@@ -1043,6 +1169,8 @@ class Database:
             height=data.get("height"),
             hashtags=tags,
             caption=data.get("caption"),
+            file_id=data.get("file_id"),
+            file_unique_id=data.get("file_unique_id"),
             watched_at=data.get("watched_at"),
             module=data.get("module"),
             lesson=data.get("lesson"),

@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TgPlayer v6.4 — Ponto de entrada (entry point).
+TgPlayer v6.4.15 — Ponto de entrada (entry point).
 
-Player premium de videoaulas do Telegram com streaming sob demanda
-(carrega a aula sem baixar/armazenar o vídeo inteiro e sem travar).
+Organizador de videoaulas do Telegram. Abre as aulas no Telegram Desktop/64Gram/Nekogram e mantém VLC como alternativa.
 
 Como rodar em modo desenvolvimento:
     pip install -r requirements.txt

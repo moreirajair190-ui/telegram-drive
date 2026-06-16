@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from PySide6.QtCore import Qt, QTimer
@@ -69,6 +70,17 @@ def wait_future(
     return future.result()
 
 
+def format_wait_seconds(seconds: int) -> str:
+    seconds = max(0, int(seconds or 0))
+    h, rem = divmod(seconds, 3600)
+    m, sec = divmod(rem, 60)
+    if h:
+        return f"{h}h {m:02d}min"
+    if m:
+        return f"{m}min {sec:02d}s"
+    return f"{sec}s"
+
+
 # ----------------------------------------------------------------------- Login
 class LoginDialog(QDialog):
     def __init__(self, service: TelegramService, db: Database, parent: QWidget | None = None):
@@ -128,6 +140,53 @@ class LoginDialog(QDialog):
         layout.addLayout(buttons)
 
         self.step = "connect"
+        self._flood_until = 0
+        self._cooldown_timer = QTimer(self)
+        self._cooldown_timer.timeout.connect(self._refresh_flood_wait_status)
+        self._refresh_flood_wait_status()
+
+    def _stored_flood_wait_seconds(self) -> int:
+        try:
+            until = int(float(self.db.get_setting("auth_flood_wait_until") or 0))
+        except Exception:
+            until = 0
+        wait = max(0, until - int(time.time()))
+        self._flood_until = until if wait > 0 else 0
+        return wait
+
+    def _refresh_flood_wait_status(self) -> None:
+        if self.step != "connect":
+            return
+        wait = self._stored_flood_wait_seconds()
+        if wait > 0:
+            wait_txt = format_wait_seconds(wait)
+            self.next_btn.setText("Verificar sessão")
+            self.status.setText(
+                "O Telegram bloqueou temporariamente novos códigos de login. "
+                f"Tempo restante aproximado: {wait_txt}. "
+                "Você ainda pode clicar em Verificar sessão para usar uma sessão já conectada, "
+                "mas o TgPlayer não pedirá outro código até o prazo terminar."
+            )
+            if not self._cooldown_timer.isActive():
+                self._cooldown_timer.start(1000)
+        else:
+            if self._cooldown_timer.isActive():
+                self._cooldown_timer.stop()
+            self.next_btn.setText("Conectar")
+
+    def _show_flood_wait_message(self, wait_seconds: int) -> None:
+        wait_txt = format_wait_seconds(wait_seconds)
+        self.db.set_setting("auth_flood_wait_until", str(int(time.time()) + int(wait_seconds)))
+        self._refresh_flood_wait_status()
+        QMessageBox.warning(
+            self,
+            "Aguarde para tentar login",
+            "O Telegram recusou o envio de um novo código porque houve muitas tentativas.\n\n"
+            f"Tempo restante aproximado: {wait_txt}.\n\n"
+            "Isso é uma proteção do próprio Telegram e o TgPlayer não consegue burlar. "
+            "Não clique várias vezes em Conectar. Aguarde o prazo ou copie a pasta 'data' "
+            "de uma instalação antiga que já estava logada.",
+        )
 
     def on_next(self) -> None:
         try:
@@ -146,6 +205,7 @@ class LoginDialog(QDialog):
                     "Telegram", "Conectando ao Telegram...", self,
                 )
                 if result.get("authorized"):
+                    self.db.set_setting("auth_flood_wait_until", "0")
                     self.accept()
                     return
                 if not phone or phone == "+55":
@@ -154,16 +214,29 @@ class LoginDialog(QDialog):
                         "Informe o telefone com DDI. Exemplo: +5547999999999",
                     )
                     return
-                wait_future(
+                stored_wait = self._stored_flood_wait_seconds()
+                if stored_wait > 0:
+                    self._show_flood_wait_message(stored_wait)
+                    return
+                sent = wait_future(
                     self.service.call(self.service.send_code(phone)),
                     "Telegram", "Enviando código de login...", self,
                 )
+                if sent.get("flood_wait"):
+                    self._show_flood_wait_message(int(sent.get("flood_wait") or 0))
+                    return
                 self.code.show()
                 self.step = "code"
                 self.next_btn.setText("Confirmar código")
-                self.status.setText(
-                    "Digite o código recebido no Telegram. Nunca compartilhe esse código."
-                )
+                if sent.get("reused"):
+                    self.status.setText(
+                        "Use o código que já foi enviado ao Telegram. Para evitar bloqueio, "
+                        "o TgPlayer não pediu um novo código."
+                    )
+                else:
+                    self.status.setText(
+                        "Digite o código recebido no Telegram. Nunca compartilhe esse código."
+                    )
                 return
 
             if self.step == "code":
@@ -180,6 +253,7 @@ class LoginDialog(QDialog):
                     )
                     return
                 if result.get("authorized"):
+                    self.db.set_setting("auth_flood_wait_until", "0")
                     self.accept()
                     return
 
@@ -189,6 +263,7 @@ class LoginDialog(QDialog):
                     "Telegram", "Confirmando senha...", self,
                 )
                 if result.get("authorized"):
+                    self.db.set_setting("auth_flood_wait_until", "0")
                     self.accept()
                     return
         except Exception as exc:  # noqa: BLE001

@@ -1,4 +1,4 @@
-# TgPlayer v6.4 — dependências
+# TgPlayer v6.4.15 — dependências
 #
 # Instale com:
 #     pip install -r requirements.txt
@@ -23,7 +23,7 @@ Pyrogram==2.0.106
 # Pythons (ex.: 3.13) o TgCrypto não tem "wheel" pronto e tenta compilar em C,
 # o que pode falhar. Se a instalação do TgCrypto falhar, o build_exe.bat
 # continua mesmo assim e o app roda normalmente.
-TgCrypto>=1.2.5 ; python_version < "3.13"
+# TgCrypto>=1.2.5 ; python_version < "3.13"  # opcional; deixe comentado para evitar falhas de build em PCs sem compilador C
 
 # Servidor HTTP local assíncrono usado para o streaming sob demanda.
 aiohttp>=3.9
