@@ -1,3 +1,11 @@
-# Cloudflare Pages — SPA fallback
-# Toda rota desconhecida cai no index.html (roteamento feito no JS).
-/*    /index.html   200
+# Cloudflare Pages — regras de redirect
+
+# As rotas de API são servidas pelo BACKEND (Render), nunca pelo Cloudflare.
+# Esta regra impede que /api/* seja capturado pelo SPA fallback abaixo (o que
+# transformaria um POST /api/login em "405 Method Not Allowed" ao tentar
+# servir o index.html estático). 404 deixa claro que a API não vive aqui.
+/api/*    /404.html   404
+
+# SPA fallback: toda rota desconhecida (de navegação) cai no index.html.
+# O roteamento da interface é feito no JavaScript.
+/*        /index.html   200
