@@ -504,7 +504,11 @@
     $("#addBtn").addEventListener("click", openAddCoursesModal);
     c.querySelectorAll("[data-course]").forEach((el) => {
       const id = +el.dataset.course;
-      el.querySelector(".open").addEventListener("click", () => openCourse(id));
+      // Há vários elementos ".open" no card (capa, título e botão "Abrir").
+      // Antes só o primeiro (a capa azul) recebia o listener — por isso o
+      // botão "Abrir" não funcionava. Agora TODOS abrem o curso.
+      el.querySelectorAll(".open").forEach((o) =>
+        o.addEventListener("click", (e) => { e.stopPropagation(); openCourse(id); }));
       el.querySelector(".sync").addEventListener("click", (e) => { e.stopPropagation(); syncCourse(id); });
       el.querySelector(".del").addEventListener("click", async (e) => {
         e.stopPropagation();
@@ -675,6 +679,19 @@
     return html;
   }
 
+  // Encontra o array de nós correspondente a um path "/0/2/1".
+  function _nodesAtPath(p) {
+    const parts = p.split("/").filter((x) => x !== "");
+    let nodes = (State.tree && State.tree.nodes) || [];
+    let node = null;
+    for (const idx of parts) {
+      node = nodes[+idx];
+      if (!node) return null;
+      nodes = node.nodes || [];
+    }
+    return node;
+  }
+
   function bindExplorer(root) {
     if (!root) return;
     // Toggle de pastas (event delegation evita N listeners — performance).
@@ -682,8 +699,32 @@
       const head = e.target.closest("[data-toggle]");
       if (head) {
         const p = head.getAttribute("data-toggle");
-        if (State.openFolders.has(p)) State.openFolders.delete(p);
-        else State.openFolders.add(p);
+        const opening = !State.openFolders.has(p);
+        if (opening) State.openFolders.add(p);
+        else State.openFolders.delete(p);
+
+        // PERFORMANCE: em vez de re-renderizar a árvore inteira (pesado com
+        // 1000+ aulas e causa travamento), atualizamos SÓ a pasta clicada.
+        const folder = head.closest(".tree-folder");
+        const body = folder && folder.querySelector(":scope > .folder-body");
+        if (!State.search && folder && body) {
+          const node = _nodesAtPath(p);
+          const depth = parseInt(folder.style.getPropertyValue("--depth") || "0", 10);
+          if (opening) {
+            body.innerHTML = renderNodes((node && node.nodes) || [], p, depth + 1);
+            body.hidden = false;
+          } else {
+            body.hidden = true;
+            body.innerHTML = ""; // libera DOM (mais leve)
+          }
+          head.classList.toggle("open", opening);
+          const caret = head.querySelector(".caret");
+          if (caret) caret.textContent = opening ? "▾" : "▸";
+          const ico = head.querySelector(".folder-icon");
+          if (ico) ico.textContent = opening ? "📂" : "📁";
+          return;
+        }
+        // Fallback (durante busca): re-render completo.
         renderLessons();
         return;
       }
@@ -892,16 +933,57 @@
     const _origRemove = bk.remove.bind(bk);
     bk.remove = () => { document.removeEventListener("keydown", onKey); _origRemove(); };
 
+    const setStatus = (txt) => { const el = modal.querySelector("#plStatus"); if (el) el.textContent = txt; };
+    const showError = (msg, token) => {
+      const pw = modal.querySelector("#pw");
+      if (!pw) return;
+      pw.innerHTML = `<div class="player-error">
+          <p>⚠️ ${esc(msg)}</p>
+          <div class="player-error-actions">
+            <button class="btn retry">↻ Tentar novamente</button>
+            <button class="btn tg2">📲 Abrir no Telegram</button>
+          </div>
+        </div>`;
+      const rb = pw.querySelector(".retry");
+      if (rb) rb.addEventListener("click", () => { closeModal(bk); openPlayer(v); });
+      const tb = pw.querySelector(".tg2");
+      if (tb) tb.addEventListener("click", () => openInTelegram(v));
+    };
+
     try {
-      const s = await api.prepareStream(v.id);
+      setStatus("Preparando streaming…");
+      // Timeout defensivo: se o backend demorar demais, não trava a tela.
+      const s = await Promise.race([
+        api.prepareStream(v.id),
+        new Promise((_, rej) => setTimeout(() => rej(new Error("Tempo esgotado ao preparar o streaming.")), 45000)),
+      ]);
       const url = api.streamUrl(s.token);
       const pw = modal.querySelector("#pw");
+      if (!pw) return; // modal já foi fechado
+      setStatus("Carregando vídeo…");
       pw.innerHTML = "";
       // preload="auto" + faststart no backend → começa a tocar antes.
       const video = h(`<video controls autoplay playsinline preload="auto"></video>`);
       video.src = url;
       video.playbackRate = playbackRate;
       pw.appendChild(video);
+
+      // Trata erro de carregamento do vídeo (rede/codec) sem deixar tela presa.
+      let retried = false;
+      video.addEventListener("error", () => {
+        const code = video.error && video.error.code;
+        if (!retried && code === 2 /* network */) {
+          retried = true;
+          // Uma nova tentativa rápida de carregar a mesma fonte.
+          setTimeout(() => { try { video.load(); video.play().catch(() => {}); } catch (e) {} }, 800);
+          return;
+        }
+        showError("Não foi possível carregar o vídeo. Verifique sua conexão ou abra no Telegram.", s.token);
+      });
+      // Se em 25s não houver dados, oferece retry/Telegram.
+      let gotData = false;
+      video.addEventListener("loadeddata", () => { gotData = true; });
+      setTimeout(() => { if (!gotData && modal.isConnected) showError("O vídeo está demorando para carregar. Tente novamente ou abra no Telegram.", s.token); }, 25000);
 
       // Aplica/persiste a velocidade escolhida.
       const sel = modal.querySelector("#speedSel");
@@ -933,7 +1015,7 @@
       });
     } catch (e) {
       if (String(e.body || e.message).includes("session_revoked")) { closeModal(bk); return handleSessionRevoked(); }
-      modal.querySelector("#pw").innerHTML = `<div style="padding:40px;text-align:center;color:#fff">⚠️ ${esc(e.message)}<br/><small style="opacity:.7">Tente abrir no Telegram com o botão abaixo.</small></div>`;
+      showError(e.message || "Falha ao preparar o streaming.");
     }
   }
 

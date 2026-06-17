@@ -534,6 +534,10 @@ a { color: inherit; text-decoration: none; }
 }
 .speed-control select option { background: var(--surface); color: var(--text); }
 
+.player-error { padding: 48px 24px; text-align: center; color: #fff; display: flex; flex-direction: column; align-items: center; gap: 16px; }
+.player-error p { margin: 0; font-size: 15px; max-width: 420px; line-height: 1.5; }
+.player-error-actions { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; }
+
 /* ===================================================== Admin panel */
 .admin-list { display: flex; flex-direction: column; gap: 16px; }
 .admin-card { background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 18px; box-shadow: var(--shadow-sm, none); }

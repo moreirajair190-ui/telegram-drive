@@ -6,9 +6,13 @@ from pathlib import Path
 from typing import Iterable
 
 HASHTAG_RE = re.compile(r"(?<!\w)#([\wÀ-ÿ]+)", re.UNICODE)
-# Reconhece padrões como "CAR 1 01 Eletro..." -> #CAR01 ou "VMED 12" -> #VMED12.
+# Reconhece padrões como:
+#   "CAR 1 01 Eletro..."  -> módulo=1, aula=01  (PREFIX MÓDULO AULA)
+#   "CAR 01 Eletro..."     -> aula=01            (PREFIX AULA)
+#   "VMED 12"              -> aula=12
+# O grupo 1 = prefixo (letras), grupo 2 = nº do módulo (opcional), grupo 3 = aula.
 COURSE_CODE_RE = re.compile(
-    r"\b([A-Za-z]{2,8})[\s_\-]*(?:\d{1,2}[\s_\-]+)?(\d{2,3})(?!\d)", re.UNICODE
+    r"\b([A-Za-z]{2,8})[\s_\-]*(?:(\d{1,2})[\s_\-]+)?(\d{2,3})(?!\d)", re.UNICODE
 )
 WINDOWS_BAD_CHARS = '<>:"/\\|?*'
 
@@ -27,17 +31,33 @@ def extract_hashtags(text: str | None) -> list[str]:
 
 
 def infer_hashtags(text: str | None) -> list[str]:
-    """Extrai hashtags reais e tenta inferir códigos de aula em nomes de arquivo."""
+    """Extrai hashtags reais e infere códigos de aula em nomes de arquivo.
+
+    Para evitar COLISÃO entre módulos (ex.: "CAR 1 01" e "CAR 2 01" gerarem
+    ambos #CAR01), quando o nome traz o número do módulo geramos uma hashtag
+    com escopo de módulo (``#CAR1_01``) ALÉM da hashtag plana (``#CAR01``).
+    Assim tanto sumários antigos (que usam #CAR01) quanto o casamento por
+    módulo (#CAR1_01) funcionam.
+    """
     found = extract_hashtags(text)
     seen = set(found)
-    if not text:
-        return found
-    clean = text.replace(".", " ").replace("/", " ").replace("\\", " ")
-    for prefix, number in COURSE_CODE_RE.findall(clean):
-        tag = f"#{prefix.upper()}{number.zfill(2)}"
+
+    def _add(tag: str) -> None:
         if tag not in seen:
             seen.add(tag)
             found.append(tag)
+
+    if not text:
+        return found
+    clean = text.replace(".", " ").replace("/", " ").replace("\\", " ")
+    for prefix, module, number in COURSE_CODE_RE.findall(clean):
+        prefix = prefix.upper()
+        lesson = number.zfill(2)
+        if module:
+            # Hashtag com escopo de módulo (desambigua CAR 1 x CAR 2).
+            _add(f"#{prefix}{module}_{lesson}")
+        # Hashtag plana (compatibilidade com sumários que usam #CAR01).
+        _add(f"#{prefix}{lesson}")
     return found
 
 
