@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -535,6 +536,19 @@ async def course_tree(course_id: int, user: User = Depends(require_user)) -> dic
     return _build_course_tree(course, subjects, videos)
 
 
+_MODULE_HEAD_RE = re.compile(r"\b([A-Za-z]{2,8})[\s_\-]*(\d{1,2})\b")
+
+
+def _module_from_title(title: str) -> tuple[str, str] | None:
+    """Extrai (prefixo, módulo) de um título de pasta como ``CAR 1`` -> (CAR, 1)."""
+    if not title:
+        return None
+    m = _MODULE_HEAD_RE.search(title)
+    if not m:
+        return None
+    return m.group(1).upper(), m.group(2)
+
+
 def _build_course_tree(course, subjects, videos) -> dict[str, Any]:
     """Constrói a árvore navegável do curso (pastas -> subpastas -> aulas)."""
     from tgplayer.summary_parser import iter_nodes, parse_summary
@@ -545,11 +559,16 @@ def _build_course_tree(course, subjects, videos) -> dict[str, Any]:
     for v in videos:
         by_subject.setdefault(v.subject_id, []).append(v)
 
+    # PERFORMANCE: o username do curso é o MESMO para todos os vídeos. Antes,
+    # _video_dict() fazia 1 consulta ao banco POR vídeo (get_course) — com 1000+
+    # aulas isso causava lentidão enorme. Agora resolvemos UMA vez só.
+    course_username = getattr(course, "username", None)
+
     def _norm(tag: str) -> str:
         return "#" + tag.lstrip("#").upper()
 
     def _video_node(v) -> dict[str, Any]:
-        d = _video_dict(v)
+        tg_url, tme_url = tg.telegram_message_urls(course_username, v.chat_id, v.message_id)
         return {
             "type": "video",
             "id": v.id,
@@ -561,23 +580,63 @@ def _build_course_tree(course, subjects, videos) -> dict[str, Any]:
             "height": v.height,
             "progress": float(v.progress or 0.0),
             "watched": bool(v.watched_at),
-            "tg_url": d.get("tg_url"),
-            "tme_url": d.get("tme_url"),
+            "tg_url": tg_url,
+            "tme_url": tme_url,
         }
 
-    def _menu_to_nodes(menu_node, tag_index, used_ids) -> list[dict[str, Any]]:
-        """Converte um MenuNode (sumário) em nós de pasta/aula para a UI."""
+    def _candidate_tags(tag: str, module: tuple[str, str] | None) -> list[str]:
+        """Variações de hashtag a tentar, da MAIS específica para a mais geral.
+
+        Resolve a colisão "CAR 1 01" x "CAR 2 01": ambos os vídeos têm a tag
+        plana ``#CAR01``, mas só o do módulo certo tem ``#CAR1_01``. Quando
+        estamos dentro da pasta ``= CAR 1`` (module=(CAR,1)) e o sumário cita
+        ``#CAR01``, tentamos primeiro ``#CAR1_01`` para pegar SÓ o vídeo do
+        módulo 1.
+        """
+        norm = _norm(tag)
+        cands: list[str] = []
+        if module:
+            prefix, mod = module
+            body = norm.lstrip("#")
+            # Se a tag plana começa com o prefixo do módulo (ex.: CAR01),
+            # injeta o nº do módulo: CAR01 -> CAR1_01.
+            if body.startswith(prefix) and "_" not in body:
+                rest = body[len(prefix):]
+                if rest.isdigit():
+                    cands.append(f"#{prefix}{mod}_{rest}")
+        cands.append(norm)
+        return cands
+
+    def _menu_to_nodes(menu_node, tag_index, used_ids, module=None) -> list[dict[str, Any]]:
+        """Converte um MenuNode (sumário) em nós de pasta/aula para a UI.
+
+        ``module`` carrega o (prefixo, nº) do módulo de nível 1 corrente, para
+        que o casamento de hashtags fique RESTRITO ao módulo certo e não
+        misture CAR 1 com CAR 2.
+        """
         out: list[dict[str, Any]] = []
         # Vídeos casados diretamente neste nó (pela ordem das hashtags).
         for tag in menu_node.tags:
-            for v in tag_index.get(_norm(tag), []):
+            picked = None
+            for cand in _candidate_tags(tag, module):
+                bucket = tag_index.get(cand)
+                if bucket:
+                    picked = bucket
+                    break
+            for v in (picked or []):
                 if v.id in used_ids:
                     continue
                 used_ids.add(v.id)
                 out.append(_video_node(v))
         # Subpastas (filhos do sumário).
         for child in menu_node.children:
-            child_nodes = _menu_to_nodes(child, tag_index, used_ids)
+            # Um cabeçalho de nível 1 (= CAR 1) define o módulo corrente.
+            child_module = module
+            if child.level <= 1:
+                detected = _module_from_title(child.title)
+                if detected:
+                    child_module = detected
+            child_nodes = _menu_to_nodes(child, tag_index, used_ids, child_module)
             if not child_nodes:
                 continue
             out.append({
@@ -598,13 +657,36 @@ def _build_course_tree(course, subjects, videos) -> dict[str, Any]:
                 n += node.get("count") or _count_videos(node.get("nodes") or [])
         return n
 
+    from tgplayer.utils import infer_hashtags as _infer
+
+    def _video_tags(v) -> list[str]:
+        """Hashtags do vídeo (re-inferidas para incluir o escopo de módulo).
+
+        Mesmo em cursos JÁ sincronizados (cujas tags salvas podem ser as antigas
+        ``#CAR01`` sem módulo), re-inferimos a partir do título/arquivo/legenda
+        para obter ``#CAR1_01`` e desfazer a mistura CAR 1 x CAR 2 SEM precisar
+        re-sincronizar.
+        """
+        text = "\n".join(
+            str(x) for x in (
+                getattr(v, "caption", "") or "",
+                getattr(v, "file_name", "") or "",
+                getattr(v, "title", "") or "",
+            ) if x
+        )
+        tags = list(v.hashtags or [])
+        for t in _infer(text):
+            if t not in tags:
+                tags.append(t)
+        return tags
+
     root_nodes: list[dict[str, Any]] = []
     for s in subjects:
         sub_videos = by_subject.get(s.id, [])
         # Index de hashtags -> vídeos desta matéria.
         tag_index: dict[str, list] = {}
         for v in sub_videos:
-            for tag in (v.hashtags or []):
+            for tag in _video_tags(v):
                 tag_index.setdefault(_norm(tag), []).append(v)
 
         used_ids: set[int] = set()
