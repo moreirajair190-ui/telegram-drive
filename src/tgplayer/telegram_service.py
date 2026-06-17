@@ -1728,16 +1728,35 @@ class TelegramService:
             return web.Response(status=404, text="Stream expirado ou inexistente.")
         session.last_access = time.time()
 
-        # FASTSTART VIRTUAL (v6.4): para o PRIMEIRO acesso, tentamos montar o
-        # cabeçalho ftyp+moov em memória (moov reposicionado para o início) de
-        # modo que o player nativo comece a tocar sem esperar a cauda. É um
-        # no-op barato se o arquivo já for faststart ou se já tiver sido tentado.
-        # Falhas caem automaticamente no modo legado (servir o arquivo original).
-        try:
-            await session.ensure_faststart()
-        except Exception:  # noqa: BLE001
-            log.exception("faststart: ensure falhou; seguindo no modo legado")
+        # FASTSTART VIRTUAL (v6.5): o cabeçalho ftyp+moov é montado em 2º plano
+        # (ver _build_faststart_bg em prepare_stream). Aqui NÃO bloqueamos a
+        # resposta esperando o faststart ficar pronto — para arquivos grandes a
+        # descoberta do moov (baixar a cauda do Telegram) pode levar dezenas de
+        # segundos e deixava o player preso na tela de "carregando" / erro.
+        #
+        # Estratégia:
+        #   • Se o faststart JÁ está ativo, usamos (partida instantânea).
+        #   • Senão, damos uma janela CURTA (best-effort) para ele ficar pronto;
+        #     se não der a tempo, servimos o arquivo ORIGINAL imediatamente
+        #     (modo legado). Os Ranges seguintes do navegador já pegam o
+        #     faststart assim que o cabeçalho terminar de montar em 2º plano.
+        if not session.faststart_active:
+            try:
+                await asyncio.wait_for(session.ensure_faststart(), timeout=3.0)
+            except asyncio.TimeoutError:
+                # Faststart ainda montando: segue no modo legado sem travar.
+                log.info(
+                    "faststart ainda não pronto (token %s); servindo original",
+                    token,
+                )
+            except Exception:  # noqa: BLE001
+                log.exception("faststart: ensure falhou; seguindo no modo legado")
 
+        # SNAPSHOT: fixa a decisão de faststart para ESTA resposta inteira. Se o
+        # faststart ficar ativo em 2º plano no meio do streaming, não trocamos o
+        # mapeamento de bytes no meio do caminho (evita vídeo corrompido). O
+        # tamanho total é o MESMO nos dois modos (faststart só reordena bytes).
+        use_faststart = bool(session.faststart_active and session.faststart_header is not None)
         total = session.logical_size
         range_header = request.headers.get("Range")
         if range_header:
@@ -1781,7 +1800,7 @@ class TelegramService:
         try:
             # read_logical_range serve o header faststart (se ativo) e mapeia o
             # restante para o mdat físico; sem faststart, delega a read_range.
-            async for data in session.read_logical_range(start, end):
+            async for data in session.read_logical_range(start, end, use_faststart=use_faststart):
                 if session.closed:
                     break
                 await response.write(data)

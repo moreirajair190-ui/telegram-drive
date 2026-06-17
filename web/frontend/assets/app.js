@@ -952,10 +952,12 @@
 
     try {
       setStatus("Preparando streaming…");
-      // Timeout defensivo: se o backend demorar demais, não trava a tela.
+      // O backend prepara o stream rápido (faststart roda em 2º plano e o
+      // arquivo já é servido enquanto o moov é montado). Damos uma folga maior
+      // só para a chamada de preparo (não para o carregamento do vídeo).
       const s = await Promise.race([
         api.prepareStream(v.id),
-        new Promise((_, rej) => setTimeout(() => rej(new Error("Tempo esgotado ao preparar o streaming.")), 45000)),
+        new Promise((_, rej) => setTimeout(() => rej(new Error("Tempo esgotado ao preparar o streaming.")), 60000)),
       ]);
       const url = api.streamUrl(s.token);
       const pw = modal.querySelector("#pw");
@@ -964,26 +966,61 @@
       pw.innerHTML = "";
       // preload="auto" + faststart no backend → começa a tocar antes.
       const video = h(`<video controls autoplay playsinline preload="auto"></video>`);
+      // Camada de "carregando" sobreposta ao vídeo: o vídeo SEMPRE fica montado
+      // (nunca trocamos por uma tela de erro a menos que haja erro REAL). Assim
+      // o player continua tentando carregar — é o que o usuário pediu.
+      const loadingOv = h(`
+        <div class="player-loading-ov" id="plOv">
+          <div class="spinner"></div>
+          <p class="muted" id="plOvStatus">Carregando vídeo…</p>
+        </div>`);
+      pw.appendChild(video);
+      pw.appendChild(loadingOv);
       video.src = url;
       video.playbackRate = playbackRate;
-      pw.appendChild(video);
 
-      // Trata erro de carregamento do vídeo (rede/codec) sem deixar tela presa.
-      let retried = false;
+      const ovStatus = (txt) => { const el = pw.querySelector("#plOvStatus"); if (el) el.textContent = txt; };
+      const hideOverlay = () => { const ov = pw.querySelector("#plOv"); if (ov) ov.remove(); };
+      // Quando começa a tocar / tem dados suficientes, esconde o "carregando".
+      video.addEventListener("playing", hideOverlay);
+      video.addEventListener("canplay", hideOverlay);
+      video.addEventListener("loadeddata", hideOverlay);
+      // Mensagens informativas conforme o buffer inicial — NUNCA é erro.
+      video.addEventListener("waiting", () => ovStatus("Armazenando buffer…"));
+      video.addEventListener("loadstart", () => ovStatus("Carregando vídeo…"));
+      // Dica amigável se a partida demorar (sem culpar o usuário e sem travar).
+      setTimeout(() => { if (pw.querySelector("#plOv")) ovStatus("Preparando o vídeo… o primeiro carregamento pode levar alguns segundos."); }, 8000);
+      setTimeout(() => { if (pw.querySelector("#plOv")) ovStatus("Quase lá… buffer inicial em andamento."); }, 20000);
+
+      // Trata APENAS erro REAL do <video> (rede/codec). Auto-retry algumas vezes
+      // antes de, em último caso, oferecer o Telegram. Nunca mostramos a tela de
+      // erro só por demora de carregamento.
+      let retryCount = 0;
+      const MAX_RETRIES = 3;
       video.addEventListener("error", () => {
-        const code = video.error && video.error.code;
-        if (!retried && code === 2 /* network */) {
-          retried = true;
-          // Uma nova tentativa rápida de carregar a mesma fonte.
-          setTimeout(() => { try { video.load(); video.play().catch(() => {}); } catch (e) {} }, 800);
+        const err = video.error;
+        const code = err && err.code; // 1=aborted 2=network 3=decode 4=src
+        // MEDIA_ERR_ABORTED (1): geralmente o usuário fechou/trocou — ignora.
+        if (code === 1) return;
+        if (retryCount < MAX_RETRIES && (code === 2 || code === 3 || code == null)) {
+          retryCount += 1;
+          ovStatus(`Reconectando… (tentativa ${retryCount}/${MAX_RETRIES})`);
+          // re-anexa o overlay caso tenha sido removido
+          if (!pw.querySelector("#plOv")) pw.appendChild(loadingOv);
+          const t = Math.min(1500 * retryCount, 4000);
+          setTimeout(() => {
+            try {
+              // bust de cache para forçar um pedido novo ao backend
+              video.src = url + (url.includes("?") ? "&" : "?") + "r=" + Date.now();
+              video.load();
+              video.play().catch(() => {});
+            } catch (e) {}
+          }, t);
           return;
         }
-        showError("Não foi possível carregar o vídeo. Verifique sua conexão ou abra no Telegram.", s.token);
+        // Esgotou as tentativas: aí sim oferecemos abrir no Telegram.
+        showError("Não foi possível carregar o vídeo agora. Tente novamente ou abra no Telegram.", s.token);
       });
-      // Se em 25s não houver dados, oferece retry/Telegram.
-      let gotData = false;
-      video.addEventListener("loadeddata", () => { gotData = true; });
-      setTimeout(() => { if (!gotData && modal.isConnected) showError("O vídeo está demorando para carregar. Tente novamente ou abra no Telegram.", s.token); }, 25000);
 
       // Aplica/persiste a velocidade escolhida.
       const sel = modal.querySelector("#speedSel");

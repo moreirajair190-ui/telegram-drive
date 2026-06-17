@@ -536,17 +536,77 @@ async def course_tree(course_id: int, user: User = Depends(require_user)) -> dic
     return _build_course_tree(course, subjects, videos)
 
 
-_MODULE_HEAD_RE = re.compile(r"\b([A-Za-z]{2,8})[\s_\-]*(\d{1,2})\b")
+def _norm_tag(tag: str) -> str:
+    return "#" + tag.lstrip("#").upper()
 
 
-def _module_from_title(title: str) -> tuple[str, str] | None:
-    """Extrai (prefixo, módulo) de um título de pasta como ``CAR 1`` -> (CAR, 1)."""
-    if not title:
-        return None
-    m = _MODULE_HEAD_RE.search(title)
-    if not m:
-        return None
-    return m.group(1).upper(), m.group(2)
+def _summary_tags_in_order(menu_node) -> list[str]:
+    """Coleta TODAS as hashtags do sumário na ordem de leitura (documento).
+
+    A ordem é exatamente a do sumário: ``#CAR01 #CAR02 ... #CAR50``. Essa
+    ordem corresponde à ordem dos vídeos no tópico do Telegram.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def walk(node):
+        for tag in node.tags:
+            n = _norm_tag(tag)
+            if n not in seen:
+                seen.add(n)
+                out.append(n)
+        for child in node.children:
+            walk(child)
+
+    walk(menu_node)
+    return out
+
+
+def _map_summary_videos(menu_node, sub_videos) -> dict[str, Any]:
+    """Casa cada hashtag do sumário com 1 vídeo, de forma POSICIONAL.
+
+    Princípio (confirmado pelo usuário): "Utilize as # para saltar entre os
+    vídeos". As hashtags do sumário (#CAR01, #CAR02, ...) são um ÍNDICE
+    sequencial dos vídeos do tópico. O 1º # do sumário = 1º vídeo (sort_order
+    0), o 2º # = 2º vídeo, etc. Isso reproduz EXATAMENTE a ordem e o
+    agrupamento do sumário publicado no Telegram, sem depender do nome do
+    arquivo (que pode estar fora de padrão).
+
+    Estratégia:
+    1. Se TODAS as hashtags do sumário já existem como tag explícita nos
+       vídeos (e cada uma casa com 1 vídeo único), usa-se esse casamento
+       direto — respeita o que o autor marcou manualmente.
+    2. Caso contrário (caso comum: vídeos sem # próprio), faz-se o
+       mapeamento POSICIONAL: tag[i] -> video[i].
+    """
+    ordered_tags = _summary_tags_in_order(menu_node)
+    if not ordered_tags:
+        return {}
+
+    # --- Tentativa 1: casamento explícito por hashtag já presente no vídeo ---
+    explicit: dict[str, Any] = {}
+    tag_to_vids: dict[str, list] = {}
+    for v in sub_videos:
+        for tag in (getattr(v, "hashtags", None) or []):
+            tag_to_vids.setdefault(_norm_tag(tag), []).append(v)
+    # Só confiamos no explícito se a maioria das tags do sumário casa 1:1.
+    matched_unique = sum(
+        1 for t in ordered_tags if len(tag_to_vids.get(t, [])) == 1
+    )
+    if ordered_tags and matched_unique >= max(1, int(len(ordered_tags) * 0.8)):
+        for t in ordered_tags:
+            vids = tag_to_vids.get(t)
+            if vids and len(vids) == 1:
+                explicit[t] = vids[0]
+        if len(explicit) == len(ordered_tags):
+            return explicit
+
+    # --- Tentativa 2: mapeamento POSICIONAL (tag[i] -> video[i]) -------------
+    mapping: dict[str, Any] = {}
+    for i, tag in enumerate(ordered_tags):
+        if i < len(sub_videos):
+            mapping[tag] = sub_videos[i]
+    return mapping
 
 
 def _build_course_tree(course, subjects, videos) -> dict[str, Any]:
@@ -584,59 +644,33 @@ def _build_course_tree(course, subjects, videos) -> dict[str, Any]:
             "tme_url": tme_url,
         }
 
-    def _candidate_tags(tag: str, module: tuple[str, str] | None) -> list[str]:
-        """Variações de hashtag a tentar, da MAIS específica para a mais geral.
+    def _count_videos(nodes) -> int:
+        n = 0
+        for node in nodes:
+            if node["type"] == "video":
+                n += 1
+            else:
+                n += node.get("count") or _count_videos(node.get("nodes") or [])
+        return n
 
-        Resolve a colisão "CAR 1 01" x "CAR 2 01": ambos os vídeos têm a tag
-        plana ``#CAR01``, mas só o do módulo certo tem ``#CAR1_01``. Quando
-        estamos dentro da pasta ``= CAR 1`` (module=(CAR,1)) e o sumário cita
-        ``#CAR01``, tentamos primeiro ``#CAR1_01`` para pegar SÓ o vídeo do
-        módulo 1.
-        """
-        norm = _norm(tag)
-        cands: list[str] = []
-        if module:
-            prefix, mod = module
-            body = norm.lstrip("#")
-            # Se a tag plana começa com o prefixo do módulo (ex.: CAR01),
-            # injeta o nº do módulo: CAR01 -> CAR1_01.
-            if body.startswith(prefix) and "_" not in body:
-                rest = body[len(prefix):]
-                if rest.isdigit():
-                    cands.append(f"#{prefix}{mod}_{rest}")
-        cands.append(norm)
-        return cands
-
-    def _menu_to_nodes(menu_node, tag_index, used_ids, module=None) -> list[dict[str, Any]]:
+    def _menu_to_nodes(menu_node, video_by_tag, used_ids) -> list[dict[str, Any]]:
         """Converte um MenuNode (sumário) em nós de pasta/aula para a UI.
 
-        ``module`` carrega o (prefixo, nº) do módulo de nível 1 corrente, para
-        que o casamento de hashtags fique RESTRITO ao módulo certo e não
-        misture CAR 1 com CAR 2.
+        Cada hashtag do sumário aponta para EXATAMENTE UM vídeo (mapeamento
+        posicional feito em ``_map_summary_videos``). Assim a ordem e o
+        agrupamento ficam IDÊNTICOS ao sumário publicado no Telegram.
         """
         out: list[dict[str, Any]] = []
-        # Vídeos casados diretamente neste nó (pela ordem das hashtags).
+        # Vídeos casados a este nó, na ordem das hashtags do sumário.
         for tag in menu_node.tags:
-            picked = None
-            for cand in _candidate_tags(tag, module):
-                bucket = tag_index.get(cand)
-                if bucket:
-                    picked = bucket
-                    break
-            for v in (picked or []):
-                if v.id in used_ids:
-                    continue
-                used_ids.add(v.id)
-                out.append(_video_node(v))
+            v = video_by_tag.get(_norm(tag))
+            if v is None or v.id in used_ids:
+                continue
+            used_ids.add(v.id)
+            out.append(_video_node(v))
         # Subpastas (filhos do sumário).
         for child in menu_node.children:
-            # Um cabeçalho de nível 1 (= CAR 1) define o módulo corrente.
-            child_module = module
-            if child.level <= 1:
-                detected = _module_from_title(child.title)
-                if detected:
-                    child_module = detected
-            child_nodes = _menu_to_nodes(child, tag_index, used_ids, child_module)
+            child_nodes = _menu_to_nodes(child, video_by_tag, used_ids)
             if not child_nodes:
                 continue
             out.append({
@@ -648,50 +682,17 @@ def _build_course_tree(course, subjects, videos) -> dict[str, Any]:
             })
         return out
 
-    def _count_videos(nodes) -> int:
-        n = 0
-        for node in nodes:
-            if node["type"] == "video":
-                n += 1
-            else:
-                n += node.get("count") or _count_videos(node.get("nodes") or [])
-        return n
-
-    from tgplayer.utils import infer_hashtags as _infer
-
-    def _video_tags(v) -> list[str]:
-        """Hashtags do vídeo (re-inferidas para incluir o escopo de módulo).
-
-        Mesmo em cursos JÁ sincronizados (cujas tags salvas podem ser as antigas
-        ``#CAR01`` sem módulo), re-inferimos a partir do título/arquivo/legenda
-        para obter ``#CAR1_01`` e desfazer a mistura CAR 1 x CAR 2 SEM precisar
-        re-sincronizar.
-        """
-        text = "\n".join(
-            str(x) for x in (
-                getattr(v, "caption", "") or "",
-                getattr(v, "file_name", "") or "",
-                getattr(v, "title", "") or "",
-            ) if x
-        )
-        tags = list(v.hashtags or [])
-        for t in _infer(text):
-            if t not in tags:
-                tags.append(t)
-        return tags
-
     root_nodes: list[dict[str, Any]] = []
     for s in subjects:
+        # Vídeos da matéria, JÁ na ordem do tópico (sort_order, message_id).
         sub_videos = by_subject.get(s.id, [])
-        # Index de hashtags -> vídeos desta matéria.
-        tag_index: dict[str, list] = {}
-        for v in sub_videos:
-            for tag in _video_tags(v):
-                tag_index.setdefault(_norm(tag), []).append(v)
+
+        menu = parse_summary(s.summary_text or "", s.title)
+        # Mapeia cada hashtag do sumário -> 1 vídeo, POSICIONALMENTE.
+        video_by_tag = _map_summary_videos(menu, sub_videos)
 
         used_ids: set[int] = set()
-        menu = parse_summary(s.summary_text or "", s.title)
-        subject_nodes = _menu_to_nodes(menu, tag_index, used_ids)
+        subject_nodes = _menu_to_nodes(menu, video_by_tag, used_ids)
 
         # Vídeos da matéria que não casaram com o sumário (preserva a ordem).
         leftovers = [v for v in sub_videos if v.id not in used_ids]
