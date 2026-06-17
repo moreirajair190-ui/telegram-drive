@@ -902,15 +902,25 @@ class StreamSession:
         h = len(self.faststart_header or b"")
         return self._mdat_phys_start + (logical_off - h)
 
-    async def read_logical_range(self, start: int, end: int, measure: bool = True):
+    async def read_logical_range(
+        self, start: int, end: int, measure: bool = True, use_faststart: bool | None = None
+    ):
         """Gerador que entrega bytes do arquivo LÓGICO [start, end].
 
         Quando o faststart está ativo, serve primeiro o cabeçalho em memória
         (ftyp+moov reposicionado) e depois mapeia o restante para o ``mdat``
         físico. Quando NÃO está ativo, delega para :meth:`read_range` (arquivo
         servido como está) — fallback seguro.
+
+        ``use_faststart`` permite ao chamador FIXAR a decisão (snapshot) no
+        início da resposta HTTP. Isso evita uma corrida em que o faststart fica
+        ativo em 2º plano NO MEIO de uma resposta já iniciada em modo legado,
+        o que bagunçaria o mapeamento de bytes. Se ``None`` (padrão), usa o
+        estado atual da sessão.
         """
-        if not (self.faststart_active and self.faststart_header is not None):
+        if use_faststart is None:
+            use_faststart = self.faststart_active and self.faststart_header is not None
+        if not (use_faststart and self.faststart_header is not None):
             async for chunk in self.read_range(start, end, measure=measure):
                 yield chunk
             return

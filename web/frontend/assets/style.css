@@ -357,8 +357,18 @@ a { color: inherit; text-decoration: none; }
 .close-x { width: 34px; height: 34px; border-radius: 9px; background: var(--surface-2); display: grid; place-items: center; font-size: 17px; transition: var(--trans); }
 .close-x:hover { background: var(--danger); color: white; }
 
-.player-wrap { background: #000; border-radius: var(--radius); overflow: hidden; }
+.player-wrap { background: #000; border-radius: var(--radius); overflow: hidden; position: relative; }
 .player-wrap video { width: 100%; display: block; max-height: 64vh; background: #000; }
+/* Camada de "carregando" sobreposta ao vídeo (o vídeo nunca é removido). */
+.player-loading-ov {
+  position: absolute; inset: 0; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 10px;
+  background: rgba(0, 0, 0, 0.55); backdrop-filter: blur(2px);
+  color: #e9edff; text-align: center; padding: 24px; pointer-events: none;
+  z-index: 2;
+}
+.player-loading-ov .spinner { margin: 0; }
+.player-loading-ov .muted { color: #cbd3f0; max-width: 360px; line-height: 1.45; margin: 0; }
 .player-meta { padding: 16px 4px 0; }
 .player-meta h3 { font-size: 18px; font-weight: 700; }
 .player-actions { display: flex; gap: 10px; margin-top: 14px; flex-wrap: wrap; }
