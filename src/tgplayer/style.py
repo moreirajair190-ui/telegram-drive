@@ -34,12 +34,16 @@ DARK = {
     "selection": "#26315a",
     "chart_grid": "#22304d",
     # Faixas das pastas/tópicos na árvore de aulas (substituem o "roxo bugado").
-    # Tons suaves e neutros que combinam com o tema escuro, sem aspecto quebrado.
-    "folder_l0": "#19223b",   # módulo / matéria (nível 0)
-    "folder_l1": "#161e34",   # subtópico (nível 1)
-    "folder_l2": "#141b2f",   # tipo / videoaula (nível 2+)
-    "folder_border": "#2b3a5e",
-    "row_alt": "#0f1626",     # listras suaves nas linhas de vídeo
+    # Estratégia nova: o nível 0 (matéria/módulo) ganha uma faixa levemente
+    # destacada; os níveis mais profundos ficam praticamente transparentes para
+    # não empilhar "cinza sobre cinza" — quem dá a hierarquia é a indentação e
+    # um pequeno indicador colorido à esquerda, deixando tudo mais leve e limpo.
+    "folder_l0": "#18223c",   # módulo / matéria (nível 0) — faixa principal
+    "folder_l1": "#131b30",   # subtópico (nível 1) — bem sutil
+    "folder_l2": "#10172a",   # tipo / videoaula (nível 2+) — quase do fundo
+    "folder_border": "#283a60",
+    "folder_tint": "#7c5cff",  # indicador de pasta (acento) à esquerda
+    "row_alt": "#0e1525",     # listras suaves nas linhas de vídeo
 }
 
 LIGHT = {
@@ -67,11 +71,15 @@ LIGHT = {
     "selection": "#e4ddff",
     "chart_grid": "#dde3ee",
     # Faixas das pastas/tópicos na árvore de aulas (tema claro).
-    "folder_l0": "#eef1fa",
-    "folder_l1": "#f3f5fc",
-    "folder_l2": "#f6f8fd",
-    "folder_border": "#dbe2f1",
-    "row_alt": "#f7f9fd",
+    # Cores muito mais claras e harmônicas: só o nível 0 recebe uma faixa
+    # delicada (quase branca com um toque de violeta); os níveis profundos
+    # ficam transparentes. Isso elimina o aspecto "cinza-azulado pesado".
+    "folder_l0": "#f1f0fb",   # módulo / matéria — leve tom violeta
+    "folder_l1": "#f9fafe",   # subtópico — quase branco
+    "folder_l2": "#ffffff",   # tipo / videoaula — branco (some no fundo)
+    "folder_border": "#e7e3f6",
+    "folder_tint": "#6d4bff",  # indicador de pasta (acento) à esquerda
+    "row_alt": "#f8fafe",
 }
 
 
@@ -230,7 +238,10 @@ QListWidget::item:selected {{
    linha inteira sem emendas/gaps. Por isso o QSS dos itens fica neutro:
    sem margin (que criava as faixas roxas "quebradas" entre as colunas) e sem
    background de seleção — quem cuida do destaque é o delegate. */
-QTreeWidget {{ outline: 0; show-decoration-selected: 1; }}
+/* show-decoration-selected: 0 → a seleção NÃO pinta a área de indentação/branch
+   à esquerda da 1ª coluna (era de lá que vinha a "faixa azul" solta). Quem
+   desenha o realce é exclusivamente o LessonTreeDelegate. */
+QTreeWidget {{ outline: 0; show-decoration-selected: 0; }}
 QTreeWidget::item {{ padding: 10px 8px; border: 0px; margin: 0px; }}
 QTreeWidget::item:hover {{ background: transparent; }}
 QTreeWidget::item:selected, QTreeWidget::item:selected:active, QTreeWidget::item:selected:!active {{
@@ -292,24 +303,22 @@ QTabBar::tab:selected {{
 #KanbanCard:hover {{ border: 1px solid {c['accent']}; }}
 #KanbanCardTitle {{ color: {c['text']}; font-weight: 700; font-size: 12px; }}
 
-/* Calendário do planejador */
-#PlannerCalendar {{
-    background: {c['panel']}; border: 1px solid {c['border_soft']};
-    border-radius: 12px;
+/* Calendário grande do planejador */
+#CalMonth {{ font-size: 18px; font-weight: 900; color: {c['text']}; letter-spacing: -0.4px; }}
+#CalNav {{
+    background: {c['panel']}; color: {c['text']}; border: 1px solid {c['border']};
+    border-radius: 9px; font-size: 18px; font-weight: 900; padding: 0px;
 }}
-#PlannerCalendar QToolButton {{
-    color: {c['text']}; background: transparent; border: none;
-    padding: 6px 10px; border-radius: 8px; font-weight: 700;
+#CalNav:hover {{ background: {c['hover']}; border-color: {c['accent']}; color: {c['accent']}; }}
+#CalWeekday {{
+    color: {c['muted2']}; font-size: 10.5px; font-weight: 900;
+    letter-spacing: 1px; padding: 2px 0;
 }}
-#PlannerCalendar QToolButton:hover {{ background: {c['hover']}; }}
-#PlannerCalendar QMenu {{ background: {c['panel']}; color: {c['text']}; }}
-#PlannerCalendar QSpinBox {{ background: {c['panel2']}; color: {c['text']}; border: none; }}
-#PlannerCalendar QAbstractItemView {{
-    background: {c['panel']}; color: {c['text']};
-    selection-background-color: {c['accent']}; selection-color: {c['accent_text']};
-    outline: 0; border: none;
-}}
-#PlannerCalendar QWidget {{ alternate-background-color: {c['panel']}; }}
+#CalSelectedDay {{ color: {c['muted']}; font-size: 12px; font-weight: 700; padding-top: 2px; }}
+/* As células do calendário (DayCell) recebem estilo dinâmico no próprio
+   widget (cores dependem de hoje/selecionado/fora-do-mês). */
+#DayCell {{ background: {c['panel']}; border: 1px solid {c['border_soft']}; border-radius: 12px; }}
+#DayCell:hover {{ border-color: {c['accent']}; }}
 
 /* -------------------------------------------------------------- progresso */
 QProgressBar {{
