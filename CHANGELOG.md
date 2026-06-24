@@ -1,5 +1,60 @@
 # Changelog — TgPlayer
 
+## v6.6.0
+
+Foco desta versão: **reverter o player do Windows ao formato anterior**
+(Telegram como player principal + VLC como segunda opção), **corrigir o "bug
+roxo" das divisões na árvore de aulas** e **adicionar um Planejador de aulas**
+completo (Kanban + calendário).
+
+### 📲 Player revertido (sem player embutido)
+
+- **Removido o player embutido (QtWebEngine).** A reprodução voltou ao formato
+  anterior, como pedido:
+  - **Player principal:** abrir a aula **no Telegram instalado** (Telegram
+    Desktop, **64Gram** ou Telegram oficial), reproduzindo o vídeo **direto
+    dentro do app** do Telegram (via `tg://` com fallback para `t.me`).
+  - **Segunda opção:** **VLC local** (streaming).
+- Botões do painel de detalhes: **"📲 Assistir no Telegram"** (destaque),
+  **"🎬 Assistir no VLC"** e **"🗓 Adicionar ao planejamento"**.
+- Duplo clique numa aula abre direto no Telegram.
+- Removidos `player.py` e `tests/test_player_ui.py`; o `TgPlayer.spec` e o
+  `requirements.txt` não coletam/instalam mais QtWebEngine — **executável menor**.
+  (O `player_html.py` continua, pois é usado pelo streaming web do serviço.)
+
+### 🎨 Árvore de aulas: fim do "bug roxo" + rolagem suave
+
+- As pastas/tópicos e a seleção agora são desenhadas por um **delegate**
+  (`LessonTreeDelegate`) que pinta a **linha inteira como uma faixa contínua**,
+  sem as emendas/blocos roxos quebrados entre as colunas (Tipo/Duração/Status).
+- Faixas suaves por profundidade (módulo › subtópico › tipo) e um realce de
+  seleção elegante com um filete de acento à esquerda.
+- **Barra de rolagem mais suave**: mais fina, arredondada, trilho transparente
+  e alça que ganha cor de destaque ao passar o mouse/arrastar.
+
+### 🗓 Planejador de aulas (novo!)
+
+- Nova aba **🗓 Planejador**: um **quadro estilo Kanban/Trello** com colunas
+  **Backlog**, **Para o dia**, **Esta semana** e **Concluído**, com **cartões
+  que você arrasta** entre as colunas.
+- **Calendário integrado e funcional**: clique num dia para ver/agendar as aulas
+  daquele dia; **arraste um cartão e solte no calendário** para agendá-lo. Dias
+  com aulas agendadas ficam destacados.
+- Adicione aulas dos seus **grupos/canais/supergrupos** do Telegram pelo botão
+  **"+ Aula"** ou pelo menu de contexto da aba Aulas
+  (**"🗓 Adicionar ao planejamento"**). Também dá para criar **tarefas livres**.
+- Cartões mostram curso/módulo e progresso; menu de contexto para mover, mudar
+  cor, marcar como concluído, abrir no Telegram ou remover.
+- Integrado ao **Acompanhamento**: ao mudar o planejamento, o dashboard atualiza.
+- Persistência em nova tabela `plan_items` (migração suave; bancos antigos
+  continuam funcionando).
+
+### ✅ Qualidade
+
+- 13 testes passando + novo smoke headless `tests/smoke_v66.py` validando o
+  player revertido, o CRUD/drag-drop do Planejador e capturando screenshots das
+  3 abas nos temas claro e escuro.
+
 ## v6.5.1
 
 Foco desta versão: **revisão geral do app Windows** — layout mais bonito,

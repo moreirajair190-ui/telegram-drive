@@ -33,6 +33,13 @@ DARK = {
     "hover": "#1c2740",
     "selection": "#26315a",
     "chart_grid": "#22304d",
+    # Faixas das pastas/tópicos na árvore de aulas (substituem o "roxo bugado").
+    # Tons suaves e neutros que combinam com o tema escuro, sem aspecto quebrado.
+    "folder_l0": "#19223b",   # módulo / matéria (nível 0)
+    "folder_l1": "#161e34",   # subtópico (nível 1)
+    "folder_l2": "#141b2f",   # tipo / videoaula (nível 2+)
+    "folder_border": "#2b3a5e",
+    "row_alt": "#0f1626",     # listras suaves nas linhas de vídeo
 }
 
 LIGHT = {
@@ -59,6 +66,12 @@ LIGHT = {
     "hover": "#eef2fb",
     "selection": "#e4ddff",
     "chart_grid": "#dde3ee",
+    # Faixas das pastas/tópicos na árvore de aulas (tema claro).
+    "folder_l0": "#eef1fa",
+    "folder_l1": "#f3f5fc",
+    "folder_l2": "#f6f8fd",
+    "folder_border": "#dbe2f1",
+    "row_alt": "#f7f9fd",
 }
 
 
@@ -213,11 +226,15 @@ QListWidget::item:hover {{ background: {c['hover']}; }}
 QListWidget::item:selected {{
     background: {c['selection']}; color: {c['text']};
 }}
-QTreeWidget {{ outline: 0; show-decoration-selected: 0; }}
-QTreeWidget::item {{ padding: 10px 8px; border: 0px; border-radius: 8px; margin: 3px 0px; }}
-QTreeWidget::item:hover {{ background: {c['hover']}; }}
+/* A árvore agora é pintada por um delegate (LessonTreeDelegate) que desenha a
+   linha inteira sem emendas/gaps. Por isso o QSS dos itens fica neutro:
+   sem margin (que criava as faixas roxas "quebradas" entre as colunas) e sem
+   background de seleção — quem cuida do destaque é o delegate. */
+QTreeWidget {{ outline: 0; show-decoration-selected: 1; }}
+QTreeWidget::item {{ padding: 10px 8px; border: 0px; margin: 0px; }}
+QTreeWidget::item:hover {{ background: transparent; }}
 QTreeWidget::item:selected, QTreeWidget::item:selected:active, QTreeWidget::item:selected:!active {{
-    background: {c['selection']}; color: {c['text']}; border: 0px; outline: 0;
+    background: transparent; color: {c['text']}; border: 0px; outline: 0;
 }}
 QTreeWidget::item:focus {{ border: 0px; outline: 0; }}
 /* A seta nativa do Qt foi desativada: em alguns temas ela criava uma faixa
@@ -253,6 +270,47 @@ QTabBar::tab:selected {{
 #CardSoft {{ background: {c['card_soft']}; }}
 #StatCard {{ background: {c['card']}; }}
 
+/* ------------------------------------------------------ planejador (Kanban) */
+#KanbanColumn {{
+    background: {c['card_soft']}; border: 1px solid {c['border_soft']};
+    border-radius: 16px;
+}}
+#KanbanTitle {{ color: {c['text']}; font-weight: 800; font-size: 13px; }}
+#KanbanCount {{
+    color: {c['muted']}; font-weight: 800; font-size: 11px;
+    background: {c['panel2']}; border-radius: 9px; padding: 1px 9px;
+}}
+#KanbanList {{
+    background: transparent; border: none; padding: 2px;
+}}
+#KanbanList::item {{ border: none; background: transparent; padding: 0px; margin: 0px; }}
+#KanbanList::item:selected {{ background: transparent; }}
+#KanbanCard {{
+    background: {c['card']}; border: 1px solid {c['border']};
+    border-radius: 12px;
+}}
+#KanbanCard:hover {{ border: 1px solid {c['accent']}; }}
+#KanbanCardTitle {{ color: {c['text']}; font-weight: 700; font-size: 12px; }}
+
+/* Calendário do planejador */
+#PlannerCalendar {{
+    background: {c['panel']}; border: 1px solid {c['border_soft']};
+    border-radius: 12px;
+}}
+#PlannerCalendar QToolButton {{
+    color: {c['text']}; background: transparent; border: none;
+    padding: 6px 10px; border-radius: 8px; font-weight: 700;
+}}
+#PlannerCalendar QToolButton:hover {{ background: {c['hover']}; }}
+#PlannerCalendar QMenu {{ background: {c['panel']}; color: {c['text']}; }}
+#PlannerCalendar QSpinBox {{ background: {c['panel2']}; color: {c['text']}; border: none; }}
+#PlannerCalendar QAbstractItemView {{
+    background: {c['panel']}; color: {c['text']};
+    selection-background-color: {c['accent']}; selection-color: {c['accent_text']};
+    outline: 0; border: none;
+}}
+#PlannerCalendar QWidget {{ alternate-background-color: {c['panel']}; }}
+
 /* -------------------------------------------------------------- progresso */
 QProgressBar {{
     background: {c['track']}; border: none; border-radius: 8px;
@@ -280,16 +338,29 @@ QSlider::handle:horizontal {{
 }}
 
 /* ----------------------------------------------------------------- scroll */
-QScrollBar:vertical {{ background: transparent; width: 12px; margin: 4px; }}
+/* Barra de rolagem fina e suave (estilo "overlay"): trilho transparente,
+   alça arredondada que cresce levemente e ganha cor de destaque no hover. */
+QScrollBar:vertical {{
+    background: transparent; width: 10px; margin: 6px 2px 6px 2px;
+    border: none;
+}}
 QScrollBar::handle:vertical {{
-    background: {c['border']}; border-radius: 6px; min-height: 30px;
+    background: {c['border']}; border-radius: 5px; min-height: 42px;
 }}
 QScrollBar::handle:vertical:hover {{ background: {c['accent']}; }}
-QScrollBar:horizontal {{ background: transparent; height: 12px; margin: 4px; }}
-QScrollBar::handle:horizontal {{
-    background: {c['border']}; border-radius: 6px; min-width: 30px;
+QScrollBar::handle:vertical:pressed {{ background: {c['accent']}; }}
+QScrollBar:horizontal {{
+    background: transparent; height: 10px; margin: 2px 6px 2px 6px;
+    border: none;
 }}
-QScrollBar::add-line, QScrollBar::sub-line {{ width: 0; height: 0; }}
+QScrollBar::handle:horizontal {{
+    background: {c['border']}; border-radius: 5px; min-width: 42px;
+}}
+QScrollBar::handle:horizontal:hover {{ background: {c['accent']}; }}
+QScrollBar::handle:horizontal:pressed {{ background: {c['accent']}; }}
+QScrollBar::add-line, QScrollBar::sub-line {{
+    width: 0; height: 0; background: none; border: none;
+}}
 QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
 
 /* -------------------------------------------------------------------- menu */

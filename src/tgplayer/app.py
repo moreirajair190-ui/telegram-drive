@@ -21,8 +21,16 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import Qt, QTimer, QUrl, QSize, QPoint
-from PySide6.QtGui import QAction, QColor, QFont, QDesktopServices, QIcon
+from PySide6.QtCore import Qt, QTimer, QUrl, QSize, QPoint, QRectF
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QFont,
+    QDesktopServices,
+    QIcon,
+    QPainter,
+    QPainterPath,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -41,6 +49,8 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QStyledItemDelegate,
+    QStyle,
     QTabWidget,
     QTreeWidget,
     QTreeWidgetItem,
@@ -60,8 +70,8 @@ from .dialogs import (
     wait_future,
 )
 from .files_tab import FilesTab
+from .planner_tab import PlannerTab
 from .logging_setup import setup_logging
-from .player import VideoPlayerDialog, is_webengine_available
 from .study_tab import StudyTab
 from .style import build_qss, palette
 from .summary_parser import match_videos_to_tree
@@ -102,6 +112,151 @@ ROLE_RAW_TITLE = Qt.UserRole + 2
 SUBJECT_ALL = -1
 SUBJECT_NONE = 0  # vídeos sem matéria
 SUBJECT_CONTINUE = -2  # filtro virtual "Continuar assistindo" (resume)
+
+
+class LessonTreeDelegate(QStyledItemDelegate):
+    """Delegate que pinta a linha inteira da árvore de aulas.
+
+    Resolve o "bug roxo": antes a seleção/realce era aplicada por coluna pelo
+    QSS, deixando faixas roxas quebradas, com emendas brancas entre as colunas.
+    Aqui desenhamos um único retângulo arredondado por linha (faixa contínua),
+    com cor suave por profundidade nas pastas e um destaque elegante na seleção.
+    """
+
+    def __init__(self, tree: "QTreeWidget", get_theme) -> None:
+        super().__init__(tree)
+        self._tree = tree
+        self._get_theme = get_theme
+
+    def _colors(self) -> dict[str, str]:
+        try:
+            return palette(self._get_theme())
+        except Exception:  # noqa: BLE001
+            return palette("dark")
+
+    def paint(self, painter: QPainter, option, index) -> None:  # noqa: N802
+        c = self._colors()
+        col = index.column()
+
+        # Determina nó/profundidade a partir do item (coluna 0 guarda os dados).
+        model = index.model()
+        idx0 = model.index(index.row(), 0, index.parent())
+        node_type = idx0.data(ROLE_NODE_TYPE)
+
+        depth = 0
+        p = index.parent()
+        while p.isValid():
+            depth += 1
+            p = p.parent()
+
+        selected = bool(option.state & QStyle.State_Selected)
+        hovered = bool(option.state & QStyle.State_MouseOver)
+
+        # Faixa contínua: pinta todas as colunas com o MESMO retângulo de fundo
+        # (sem cantos arredondados internos), evitando emendas entre colunas.
+        full = QRectF(option.rect)
+        # Pequena folga vertical para dar respiro entre linhas, sem criar gaps
+        # horizontais (a faixa cobre toda a largura da coluna).
+        full.adjust(0, 1.5, 0, -1.5)
+
+        bg: QColor | None = None
+        border: QColor | None = None
+
+        if node_type == "folder":
+            base = {
+                0: c.get("folder_l0", c["panel2"]),
+                1: c.get("folder_l1", c["panel2"]),
+            }.get(depth, c.get("folder_l2", c["panel2"]))
+            bg = QColor(base)
+            border = QColor(c.get("folder_border", c["border_soft"]))
+        elif node_type == "video":
+            if index.row() % 2 == 1:
+                bg = QColor(c.get("row_alt", c["panel"]))
+
+        if hovered and not selected:
+            bg = QColor(c["hover"])
+
+        if selected:
+            sel = QColor(c["accent"])
+            sel.setAlpha(46 if c.get("name") == "dark" else 38)
+            bg = sel
+            border = QColor(c["accent"])
+
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+
+        if bg is not None:
+            # Faixa ÚNICA e contínua por linha: arredondamos somente os cantos
+            # externos (esquerda na 1ª coluna, direita na última) e ESTENDEMOS
+            # as bordas internas 1px para fora, de forma que as colunas vizinhas
+            # se sobreponham e não exista nenhuma emenda branca no meio (era esse
+            # o "bug roxo" das divisões entre tópicos/subtópicos).
+            radius = 9.0
+            is_first = col == 0
+            is_last = col == (model.columnCount() - 1)
+            seam = 1.0  # sobreposição para matar a emenda entre colunas
+            rect = QRectF(full)
+            if not is_first:
+                rect.setLeft(rect.left() - seam)
+            if not is_last:
+                rect.setRight(rect.right() + seam)
+
+            path = QPainterPath()
+            if is_first and is_last:
+                path.addRoundedRect(rect, radius, radius)
+            elif is_first:
+                # Arredonda só a esquerda; direita reta (continua na próxima col).
+                path.addRoundedRect(QRectF(rect.left(), rect.top(),
+                                           rect.width() + radius, rect.height()),
+                                    radius, radius)
+                path = QPainterPath()
+                path.moveTo(rect.left() + radius, rect.top())
+                path.lineTo(rect.right(), rect.top())
+                path.lineTo(rect.right(), rect.bottom())
+                path.lineTo(rect.left() + radius, rect.bottom())
+                path.arcTo(rect.left(), rect.bottom() - 2 * radius, 2 * radius, 2 * radius, 270, -90)
+                path.lineTo(rect.left(), rect.top() + radius)
+                path.arcTo(rect.left(), rect.top(), 2 * radius, 2 * radius, 180, -90)
+            elif is_last:
+                path.moveTo(rect.left(), rect.top())
+                path.lineTo(rect.right() - radius, rect.top())
+                path.arcTo(rect.right() - 2 * radius, rect.top(), 2 * radius, 2 * radius, 90, -90)
+                path.lineTo(rect.right(), rect.bottom() - radius)
+                path.arcTo(rect.right() - 2 * radius, rect.bottom() - 2 * radius, 2 * radius, 2 * radius, 0, -90)
+                path.lineTo(rect.left(), rect.bottom())
+                path.closeSubpath()
+            else:
+                path.addRect(rect)
+            painter.fillPath(path, bg)
+
+            if border is not None and (selected or node_type == "folder"):
+                pen = painter.pen()
+                pen.setColor(border)
+                pen.setWidthF(1.0 if not selected else 1.4)
+                painter.setPen(pen)
+                # Borda apenas em cima/baixo para manter a faixa contínua (sem
+                # linhas verticais que reintroduziriam o efeito "quebrado").
+                painter.drawLine(int(rect.left()), int(rect.top()),
+                                 int(rect.right()), int(rect.top()))
+                painter.drawLine(int(rect.left()), int(rect.bottom()),
+                                 int(rect.right()), int(rect.bottom()))
+                if selected and is_first:
+                    # Indicador de acento na borda esquerda da seleção.
+                    accent = QColor(c["accent"])
+                    bar = QRectF(full.left() + 1.0, full.top() + 2.0, 3.0, full.height() - 4.0)
+                    bp = QPainterPath()
+                    bp.addRoundedRect(bar, 1.5, 1.5)
+                    painter.fillPath(bp, accent)
+
+        painter.restore()
+
+        # Texto/ícone padrão por cima do fundo desenhado. Limpamos os estados de
+        # seleção/hover para o Qt não repintar o fundo azul/roxo nativo.
+        opt = option
+        opt.state &= ~QStyle.State_Selected
+        opt.state &= ~QStyle.State_MouseOver
+        opt.state &= ~QStyle.State_HasFocus
+        super().paint(painter, opt, index)
 
 
 class DraggableTopBar(QWidget):
@@ -181,7 +336,6 @@ class MainWindow(QMainWindow):
         self.current_course_id: int | None = None
         self.current_subject_id: int = SUBJECT_ALL
         self.current_video_id: int | None = None
-        self._active_player: VideoPlayerDialog | None = None
         self.setWindowTitle("TgPlayer — Videoaulas do Telegram")
         # v6.4.14: voltamos à moldura nativa do Windows para garantir cliques,
         # redimensionamento, Snap Assist e botões minimizar/maximizar/fechar.
@@ -292,6 +446,10 @@ class MainWindow(QMainWindow):
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_lessons_tab(), "🎬  Aulas")
+        self.planner_tab = PlannerTab(self.db, self.get_current_course)
+        self.planner_tab.open_lesson_requested.connect(self._open_planner_lesson)
+        self.planner_tab.changed.connect(self._on_planner_changed)
+        self.tabs.addTab(self.planner_tab, "🗓  Planejador")
         self.study_tab = StudyTab(self.db, self.get_current_course)
         self.tabs.addTab(self.study_tab, "📊  Acompanhamento")
         self.files_tab = FilesTab(self.db, self.service, self.get_current_course)
@@ -572,6 +730,10 @@ class MainWindow(QMainWindow):
         self.video_tree.setUniformRowHeights(False)
         self.video_tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.video_tree.customContextMenuRequested.connect(self.show_video_menu)
+        self.video_tree.setMouseTracking(True)
+        # Delegate que pinta a linha inteira (resolve o "bug roxo" das divisões
+        # entre tópicos/subtópicos e dá um realce de seleção suave e contínuo).
+        self.video_tree.setItemDelegate(LessonTreeDelegate(self.video_tree, lambda: self.theme))
         # A primeira coluna estica para ocupar o espaço; as demais ajustam ao
         # conteúdo, garantindo que "Tipo", "Duração" e "Status" fiquem sempre
         # visíveis (antes "Status" ficava cortada com larguras fixas).
@@ -619,32 +781,39 @@ class MainWindow(QMainWindow):
         card_layout.addWidget(self.resume_bar)
 
         card_layout.addSpacing(10)
-        self.watch_btn = QPushButton("▶  Assistir aqui")
+        # Player principal = abrir no Telegram (Desktop / 64Gram / oficial), com
+        # reprodução direta do vídeo dentro do app do Telegram. O VLC fica como
+        # segunda opção (streaming local). Não há mais player embutido.
+        self.watch_btn = QPushButton("📲  Assistir no Telegram")
         self.watch_btn.setObjectName("PrimaryButton")
         self.watch_btn.setMinimumHeight(46)
         self.watch_btn.setCursor(Qt.PointingHandCursor)
         self.watch_btn.setToolTip(
-            "Abre o player embutido (rápido) dentro do TgPlayer. O vídeo começa "
-            "em poucos segundos, sem precisar abrir o VLC."
+            "Abre a aula no Telegram instalado (Telegram Desktop, 64Gram ou "
+            "oficial) e reproduz o vídeo direto no app."
         )
-        self.watch_btn.clicked.connect(self.watch_selected_internal)
+        self.watch_btn.clicked.connect(self.open_selected_in_telegram)
         card_layout.addWidget(self.watch_btn)
+        # Alias mantido para compatibilidade com código existente.
+        self.watch_tg_btn = self.watch_btn
 
-        row_open = QHBoxLayout()
-        row_open.setSpacing(8)
-        self.watch_tg_btn = QPushButton("📲 Telegram")
-        self.watch_tg_btn.setToolTip(
-            "Abre a mensagem original no Telegram Desktop/64Gram/Nekogram."
+        self.watch_vlc_btn = QPushButton("🎬  Assistir no VLC")
+        self.watch_vlc_btn.setMinimumHeight(40)
+        self.watch_vlc_btn.setCursor(Qt.PointingHandCursor)
+        self.watch_vlc_btn.setToolTip(
+            "Abre o vídeo no VLC via streaming local (segunda opção)."
         )
-        self.watch_tg_btn.clicked.connect(self.open_selected_in_telegram)
-        self.watch_vlc_btn = QPushButton("🎬 VLC")
-        self.watch_vlc_btn.setToolTip("Abre o vídeo no VLC (alternativa externa).")
         self.watch_vlc_btn.clicked.connect(self.watch_selected_vlc)
-        for b in (self.watch_tg_btn, self.watch_vlc_btn):
-            b.setMinimumHeight(38)
-            b.setCursor(Qt.PointingHandCursor)
-            row_open.addWidget(b)
-        card_layout.addLayout(row_open)
+        card_layout.addWidget(self.watch_vlc_btn)
+
+        self.plan_btn = QPushButton("🗓  Adicionar ao planejamento")
+        self.plan_btn.setMinimumHeight(40)
+        self.plan_btn.setCursor(Qt.PointingHandCursor)
+        self.plan_btn.setToolTip(
+            "Adiciona esta aula ao Planejador (quadro de tarefas / calendário)."
+        )
+        self.plan_btn.clicked.connect(self.add_selected_to_planner)
+        card_layout.addWidget(self.plan_btn)
 
         card_layout.addSpacing(4)
         actions_sep = QLabel("AÇÕES DA AULA")
@@ -690,9 +859,10 @@ class MainWindow(QMainWindow):
         help_title.setObjectName("SectionTitle")
         h_layout.addWidget(help_title)
         help_text = QLabel(
-            "O botão principal 'Assistir aqui' abre o player embutido, que começa o "
-            "vídeo em poucos segundos (streaming rápido com faststart). O progresso "
-            "é salvo automaticamente. 'Telegram' e 'VLC' continuam como alternativas."
+            "O botão principal abre a aula no Telegram instalado (Desktop, 64Gram "
+            "ou oficial) e reproduz o vídeo direto no app. Se preferir, use "
+            "'Assistir no VLC' como segunda opção (streaming local). Use o "
+            "Planejador para organizar quais aulas assistir em cada dia."
         )
         help_text.setObjectName("Muted")
         help_text.setWordWrap(True)
@@ -752,6 +922,10 @@ class MainWindow(QMainWindow):
             self.study_tab.apply_palette(palette(self.theme))
         except Exception:  # noqa: BLE001
             pass
+        try:
+            self.planner_tab.apply_palette(palette(self.theme))
+        except Exception:  # noqa: BLE001
+            pass
         if persist:
             self.db.set_setting("theme", self.theme)
         # Reaplica cores de itens pintados manualmente.
@@ -766,6 +940,11 @@ class MainWindow(QMainWindow):
         if widget is self.study_tab:
             try:
                 self.study_tab.refresh()
+            except Exception:  # noqa: BLE001
+                pass
+        elif widget is getattr(self, "planner_tab", None):
+            try:
+                self.planner_tab.refresh()
             except Exception:  # noqa: BLE001
                 pass
         elif widget is getattr(self, "files_tab", None):
@@ -1789,7 +1968,7 @@ class MainWindow(QMainWindow):
         if has_video is None:
             items = self.video_tree.selectedItems() if hasattr(self, "video_tree") else []
             has_video = bool(items and self._is_video_item(items[0]))
-        for name in ("watch_btn", "watch_tg_btn", "watch_vlc_btn", "resume_point_btn", "fav_btn", "edit_btn", "mark_btn"):
+        for name in ("watch_btn", "watch_vlc_btn", "plan_btn", "resume_point_btn", "fav_btn", "edit_btn", "mark_btn"):
             btn = getattr(self, name, None)
             if btn is not None:
                 btn.setEnabled(bool(has_video))
@@ -1980,9 +2159,9 @@ class MainWindow(QMainWindow):
         if not video:
             return
         menu = QMenu(self)
-        watch_here = menu.addAction("▶ Assistir aqui (player embutido)")
-        watch = menu.addAction("📲 Abrir no Telegram")
-        vlc = menu.addAction("Abrir no VLC")
+        watch = menu.addAction("📲 Assistir no Telegram")
+        vlc = menu.addAction("🎬 Assistir no VLC")
+        plan = menu.addAction("🗓 Adicionar ao planejamento")
         save_point = menu.addAction("⏱ Salvar ponto onde parei")
         menu.addSeparator()
         edit = menu.addAction("✎ Editar aula")
@@ -1994,12 +2173,12 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         delete = menu.addAction("Remover da lista")
         action = menu.exec(self.video_tree.mapToGlobal(pos))
-        if action == watch_here:
-            self.watch_selected_internal()
-        elif action == watch:
+        if action == watch:
             self.open_selected_in_telegram()
         elif action == vlc:
             self.watch_selected_vlc()
+        elif action == plan:
+            self.add_selected_to_planner()
         elif action == save_point:
             self.save_resume_point_selected()
         elif action == edit:
@@ -2232,6 +2411,54 @@ class MainWindow(QMainWindow):
         username = (getattr(course, "username", None) or "").strip().lstrip("@") or None
         return self.service.telegram_message_urls(username, video.chat_id, video.message_id)
 
+    # ----------------------------------------------------------- planejador
+    def add_selected_to_planner(self) -> None:
+        """Adiciona a aula selecionada ao Planejador (quadro Kanban)."""
+        video = self.selected_video()
+        if not video:
+            QMessageBox.information(
+                self, "Planejador", "Selecione uma aula para planejar."
+            )
+            return
+        try:
+            added = self.planner_tab.add_video(video.id, column_key="backlog")
+        except Exception:  # noqa: BLE001
+            added = False
+        if added:
+            self.statusBar().showMessage(
+                f"Aula adicionada ao Planejador: {video.title}", 4000
+            ) if hasattr(self, "statusBar") else None
+            QMessageBox.information(
+                self, "Planejador",
+                "Aula adicionada ao Backlog do Planejador. Abra a aba 🗓 "
+                "Planejador para arrastá-la para o dia ou semana desejada."
+            )
+
+    def _open_planner_lesson(self, video_id: int) -> None:
+        """Abre, no Telegram, a aula representada por um cartão do planejador."""
+        try:
+            video = self.db.get_video(int(video_id))
+        except Exception:  # noqa: BLE001
+            video = None
+        if not video:
+            return
+        app_url, web_url = self._telegram_urls_for_video(video)
+        for url in (app_url, web_url):
+            if url:
+                try:
+                    if QDesktopServices.openUrl(QUrl(url)):
+                        return
+                except Exception:  # noqa: BLE001
+                    continue
+
+    def _on_planner_changed(self) -> None:
+        """Mantém o dashboard de Acompanhamento em sintonia com o planejador."""
+        try:
+            if hasattr(self, "study_tab"):
+                self.study_tab.refresh()
+        except Exception:  # noqa: BLE001
+            pass
+
     def open_selected_in_telegram(self) -> None:
         video = self.selected_video()
         if not video:
@@ -2277,11 +2504,12 @@ class MainWindow(QMainWindow):
                 pass
 
     def watch_selected_internal(self) -> None:
-        """Abre a aula selecionada no PLAYER EMBUTIDO (rápido, same-origin)."""
-        video = self.selected_video()
-        if not video:
-            return
-        self._open_player_for(video)
+        """Player principal = abrir a aula no Telegram instalado.
+
+        Mantido com este nome por compatibilidade (duplo clique e atalhos),
+        mas agora encaminha para o Telegram (Desktop / 64Gram / oficial).
+        """
+        self.open_selected_in_telegram()
 
     def _play_media_video(self, media: dict[str, Any]) -> None:
         """Abre mídia avulsa da aba Arquivos diretamente no Telegram quando possível."""
@@ -2303,72 +2531,6 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001
             log.exception("Erro ao abrir mídia no Telegram")
             QMessageBox.critical(self, "Erro", str(exc))
-
-    def _open_player_for(self, video: Video) -> None:
-        """Prepara o streaming e abre o player embutido (QtWebEngine)."""
-        if not is_webengine_available():
-            # Sem QtWebEngine: oferece o VLC como caminho alternativo.
-            if QMessageBox.question(
-                self,
-                "Player embutido indisponível",
-                "O componente QtWebEngine não está disponível neste build, então "
-                "o player embutido não pode abrir. Deseja assistir pelo VLC?",
-            ) == QMessageBox.Yes:
-                self.watch_selected_vlc()
-            return
-
-        stream = self._prepare_stream(video)
-        if not stream:
-            return
-        token = stream.get("token")
-        player_url = stream.get("player_url")
-        stream_url = stream.get("stream_url") or stream.get("url")
-
-        def _on_progress(position_ms: int, duration_ms: int) -> None:
-            try:
-                pos = max(0, int(position_ms or 0))
-                dur = int(duration_ms or 0) or (
-                    int(video.duration * 1000) if video.duration else None
-                )
-                self.db.save_progress(video.id, pos, dur)
-                # Conclui a aula quando assistiu ~95% dela.
-                if dur and pos >= int(dur * 0.95):
-                    self.db.mark_watched(video.id)
-            except Exception:  # noqa: BLE001
-                log.exception("Falha ao salvar progresso do player embutido")
-
-        def _on_open_vlc() -> None:
-            try:
-                # Mantém o stream vivo para o VLC externo e abre nele.
-                if token:
-                    self.service.call(self.service.release_stream_later(token, 7200))
-                self._launch_vlc(stream_url)
-            except Exception:  # noqa: BLE001
-                log.exception("Falha ao abrir no VLC a partir do player")
-
-        try:
-            dlg = VideoPlayerDialog(
-                title=video.title,
-                url=stream_url,
-                token=token,
-                service=self.service,
-                start_position_ms=int(video.position_ms or 0),
-                on_progress=_on_progress,
-                on_open_vlc=_on_open_vlc,
-                player_url=player_url,
-                parent=self,
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.exception("Falha ao criar o player embutido")
-            QMessageBox.critical(self, "Erro no player", str(exc))
-            return
-
-        # Mantém referência para não ser coletado e atualiza listas ao fechar.
-        self._active_player = dlg
-        dlg.finished.connect(lambda _=None: self._refresh_after_change())
-        dlg.show()
-        dlg.raise_()
-        dlg.activateWindow()
 
     def watch_selected_vlc(self) -> None:
         video = self.selected_video()

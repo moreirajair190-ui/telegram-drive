@@ -262,6 +262,29 @@ class Database:
                     PRIMARY KEY(chat_id, message_id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_moov_updated ON moov_cache(updated_at);
+
+                -- Planejador de aulas (v6.6): cada cartão representa uma aula
+                -- (video_id) OU uma tarefa livre (free text). Os cartões vivem em
+                -- "colunas" (column_key: backlog / sched_<YYYY-MM-DD> / week_<n>
+                -- / done) e mantêm `sort_order` para o drag-and-drop estilo Kanban.
+                -- `scheduled_date` (YYYY-MM-DD) liga o cartão ao calendário.
+                CREATE TABLE IF NOT EXISTS plan_items (
+                    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                    video_id       INTEGER,
+                    course_id      INTEGER,
+                    title          TEXT NOT NULL,
+                    subtitle       TEXT,
+                    column_key     TEXT NOT NULL DEFAULT 'backlog',
+                    scheduled_date TEXT,
+                    status         TEXT NOT NULL DEFAULT 'todo',
+                    color          TEXT,
+                    sort_order     INTEGER NOT NULL DEFAULT 0,
+                    created_at     TEXT NOT NULL,
+                    updated_at     TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_plan_column ON plan_items(column_key);
+                CREATE INDEX IF NOT EXISTS idx_plan_date ON plan_items(scheduled_date);
+                CREATE INDEX IF NOT EXISTS idx_plan_video ON plan_items(video_id);
                 """
             )
             # ---- Migrações suaves de bancos antigos (v4/v5) -----------------
@@ -1118,6 +1141,147 @@ class Database:
         with self.connect() as conn:
             for index, task_id in enumerate(ordered_ids):
                 conn.execute("UPDATE tasks SET sort_order=? WHERE id=?", (index, task_id))
+
+    # ---- planejador (Kanban + calendário) -----------------------------------
+    def list_plan_items(self, column_key: str | None = None) -> list[dict[str, Any]]:
+        """Lista cartões do planejador. Junta dados ao vivo da aula (vídeo) para
+        refletir progresso/status atual sem duplicar estado."""
+        with self.connect() as conn:
+            sql = (
+                "SELECT p.*, v.watched_at AS v_watched_at, v.progress AS v_progress, "
+                "v.title AS v_title, c.title AS course_title "
+                "FROM plan_items p "
+                "LEFT JOIN videos v ON v.id = p.video_id "
+                "LEFT JOIN courses c ON c.id = p.course_id "
+            )
+            params: tuple = ()
+            if column_key is not None:
+                sql += "WHERE p.column_key = ? "
+                params = (column_key,)
+            sql += "ORDER BY p.column_key ASC, p.sort_order ASC, p.id ASC"
+            rows = conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def add_plan_item(
+        self,
+        title: str,
+        column_key: str = "backlog",
+        video_id: int | None = None,
+        course_id: int | None = None,
+        subtitle: str | None = None,
+        scheduled_date: str | None = None,
+        color: str | None = None,
+    ) -> int:
+        with self.connect() as conn:
+            order = conn.execute(
+                "SELECT COALESCE(MAX(sort_order), -1) + 1 AS n FROM plan_items WHERE column_key=?",
+                (column_key,),
+            ).fetchone()["n"]
+            cur = conn.execute(
+                "INSERT INTO plan_items(video_id, course_id, title, subtitle, column_key, "
+                "scheduled_date, status, color, sort_order, created_at, updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    int(video_id) if video_id else None,
+                    int(course_id) if course_id else None,
+                    (title or "Aula").strip(),
+                    (subtitle or None),
+                    column_key,
+                    scheduled_date,
+                    "todo",
+                    color,
+                    int(order),
+                    self.now(),
+                    self.now(),
+                ),
+            )
+            return int(cur.lastrowid)
+
+    def plan_item_exists_for_video(self, video_id: int) -> bool:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM plan_items WHERE video_id=? LIMIT 1", (int(video_id),)
+            ).fetchone()
+            return bool(row)
+
+    def update_plan_item(
+        self,
+        item_id: int,
+        title: str | None = None,
+        subtitle: str | None = None,
+        column_key: str | None = None,
+        scheduled_date: str | None = None,
+        status: str | None = None,
+        color: str | None = None,
+        scheduled_date_explicit: bool = False,
+    ) -> None:
+        with self.connect() as conn:
+            cur = conn.execute("SELECT * FROM plan_items WHERE id=?", (item_id,)).fetchone()
+            if not cur:
+                return
+            new_date = cur["scheduled_date"]
+            if scheduled_date_explicit:
+                new_date = scheduled_date
+            elif scheduled_date is not None:
+                new_date = scheduled_date
+            conn.execute(
+                "UPDATE plan_items SET title=?, subtitle=?, column_key=?, scheduled_date=?, "
+                "status=?, color=?, updated_at=? WHERE id=?",
+                (
+                    (title if title is not None else cur["title"]),
+                    (subtitle if subtitle is not None else cur["subtitle"]),
+                    (column_key if column_key is not None else cur["column_key"]),
+                    new_date,
+                    (status if status is not None else cur["status"]),
+                    (color if color is not None else cur["color"]),
+                    self.now(),
+                    item_id,
+                ),
+            )
+
+    def move_plan_item(self, item_id: int, column_key: str, sort_order: int,
+                       scheduled_date: str | None = None,
+                       scheduled_date_explicit: bool = False) -> None:
+        """Move um cartão para outra coluna/posição (drag-and-drop)."""
+        with self.connect() as conn:
+            cur = conn.execute("SELECT * FROM plan_items WHERE id=?", (item_id,)).fetchone()
+            if not cur:
+                return
+            new_date = cur["scheduled_date"]
+            if scheduled_date_explicit:
+                new_date = scheduled_date
+            status = cur["status"]
+            if column_key == "done":
+                status = "done"
+            elif status == "done":
+                status = "todo"
+            conn.execute(
+                "UPDATE plan_items SET column_key=?, sort_order=?, scheduled_date=?, "
+                "status=?, updated_at=? WHERE id=?",
+                (column_key, int(sort_order), new_date, status, self.now(), item_id),
+            )
+
+    def reorder_plan_column(self, column_key: str, ordered_ids: list[int]) -> None:
+        with self.connect() as conn:
+            for index, item_id in enumerate(ordered_ids):
+                conn.execute(
+                    "UPDATE plan_items SET column_key=?, sort_order=?, updated_at=? WHERE id=?",
+                    (column_key, index, self.now(), int(item_id)),
+                )
+
+    def delete_plan_item(self, item_id: int) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM plan_items WHERE id=?", (int(item_id),))
+
+    def plan_counts_by_date(self) -> dict[str, int]:
+        """Quantos cartões há por dia agendado (para marcar o calendário)."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT scheduled_date AS d, COUNT(*) AS n FROM plan_items "
+                "WHERE scheduled_date IS NOT NULL AND scheduled_date != '' "
+                "GROUP BY scheduled_date"
+            ).fetchall()
+        return {r["d"]: int(r["n"]) for r in rows}
 
     # ------------------------------------------------------------ row -> objeto
     def _row_to_course(self, row: sqlite3.Row) -> Course:

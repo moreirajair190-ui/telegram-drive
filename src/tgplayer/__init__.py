@@ -1,3 +1,3 @@
 """TgPlayer — organizador de videoaulas do Telegram."""
 
-__version__ = "6.5.1"
+__version__ = "6.6.0"
