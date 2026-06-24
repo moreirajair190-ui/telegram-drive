@@ -1,20 +1,24 @@
-"""Aba Planejador 🗓 — organização das aulas com calendário grande + Kanban.
+"""Aba Planejador 🗓 — organização das aulas no estilo de um calendário.
 
 Visão geral
 -----------
-A tela foi redesenhada para girar em torno de um **calendário mensal grande**,
-no qual você arrasta as aulas direto para a **célula do dia** desejado. Cada
-célula mostra, de forma organizada, as aulas agendadas para aquele dia.
+A tela foi pensada para funcionar como um **calendário** (à la Google Agenda):
 
-Layout
-------
-* À **esquerda**, um quadro Kanban enxuto (Backlog · Esta semana · Concluído)
-  com cartões arrastáveis — é de onde você "puxa" as aulas.
-* À **direita**, o **calendário grande** (grade do mês inteiro). Solte um cartão
-  sobre o dia para agendá-lo; clique num dia para ver/editar as aulas dele.
+* **Esquerda** — uma única lista enxuta, *"Aulas a planejar"*, com as aulas que
+  ainda não têm data. É de onde você "puxa" (arrasta) as aulas para um dia.
+* **Centro** — o **calendário grande** do mês. Cada dia mostra os eventos
+  (aulas/anotações) daquele dia. Você pode:
+    - **arrastar** uma aula da lista para a célula do dia (agendar);
+    - **arrastar** um evento de um dia para outro (reagendar);
+    - **clicar** num dia para abri-lo no painel da direita.
+* **Direita** — o **painel do dia** selecionado: lista os eventos daquele dia,
+  permite marcar como assistida, abrir no Telegram, mover/remover e escrever
+  uma **anotação** livre (campo de texto salvo por dia).
 
-Persistência em `plan_items` (ver db.py). O drag-and-drop usa QListWidget com
-`DragDrop`; cada cartão carrega o `plan_item_id` para gravar a movimentação.
+Persistência em `plan_items` (ver db.py):
+* itens sem data → `column_key = "backlog"`;
+* itens com data → `column_key = "sched_<YYYY-MM-DD>"` e `scheduled_date`;
+* `item_type` distingue aula (`lesson`) de anotação/tarefa (`note`).
 """
 
 from __future__ import annotations
@@ -40,6 +44,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMenu,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -50,8 +55,9 @@ from PySide6.QtWidgets import (
 from .db import Database
 
 
-# Chaves de coluna usadas no banco. "sched" é dinâmica (sched_<YYYY-MM-DD>).
+# Chaves de coluna usadas no banco. "sched_<data>" é dinâmica.
 COL_BACKLOG = "backlog"
+# Mantidas por compatibilidade com bancos/testes antigos (não usadas no UI novo).
 COL_WEEK = "week"
 COL_DONE = "done"
 
@@ -60,7 +66,7 @@ ROLE_VIDEO_ID = Qt.UserRole + 2
 
 CARD_COLORS = ["#7c5cff", "#22d3ee", "#34d399", "#fbbf24", "#f87171", "#a78bfa"]
 
-# Tipo MIME usado no drag-and-drop dos cartões do planejador.
+# Tipo MIME usado no drag-and-drop dos cartões/eventos do planejador.
 MIME_PLAN_ITEM = "application/x-tgplayer-plan-item"
 
 WEEKDAYS_SHORT = ["seg", "ter", "qua", "qui", "sex", "sáb", "dom"]
@@ -83,33 +89,38 @@ def _date_from_sched(key: str) -> str:
     return key[len("sched_"):] if _is_sched_key(key) else ""
 
 
-class KanbanList(QListWidget):
-    """Coluna do Kanban com drag-and-drop entre colunas e para o calendário.
+def _accent_for(data: dict) -> str:
+    return data.get("color") or CARD_COLORS[int(data.get("id") or 0) % len(CARD_COLORS)]
 
-    O arrasto usa um MIME próprio (`MIME_PLAN_ITEM`) carregando o id do cartão,
-    para que tanto outra coluna quanto uma célula do calendário consigam recebê-lo.
+
+def _icon_for(data: dict) -> str:
+    if bool(data.get("v_watched_at")) or data.get("status") == "done":
+        return "✅"
+    if (data.get("item_type") or "lesson") == "note" and not data.get("video_id"):
+        return "📝"
+    return "🎬" if data.get("video_id") else "📝"
+
+
+class BacklogList(QListWidget):
+    """Lista 'Aulas a planejar' (itens sem data). Origem de arrasto p/ o calendário.
+
+    O arrasto carrega um MIME próprio (`MIME_PLAN_ITEM`) com o id do item, para
+    que qualquer célula do calendário consiga recebê-lo.
     """
 
-    item_dropped = Signal(int, str)        # (plan_item_id, column_key)
-    reordered = Signal(str, list)          # (column_key, [ids...])
-
-    def __init__(self, column_key: str) -> None:
+    def __init__(self) -> None:
         super().__init__()
-        self.column_key = column_key
         self.setObjectName("KanbanList")
         self.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.setDragDropMode(QAbstractItemView.DragDrop)
+        self.setDragDropMode(QAbstractItemView.DragOnly)
         self.setDefaultDropAction(Qt.MoveAction)
-        self.setMovement(QListWidget.Snap)
         self.setSpacing(6)
         self.setUniformItemSizes(False)
         self.setWordWrap(True)
         self.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.setAcceptDrops(True)
         self.setDragEnabled(True)
 
-    # -- arrasto com MIME próprio (necessário para o calendário receber) -----
     def startDrag(self, supported_actions) -> None:  # noqa: N802, ANN001
         item = self.currentItem()
         if item is None:
@@ -117,41 +128,29 @@ class KanbanList(QListWidget):
         item_id = int(item.data(ROLE_ITEM_ID) or 0)
         if not item_id:
             return
-        mime = QMimeData()
-        mime.setData(MIME_PLAN_ITEM, str(item_id).encode("utf-8"))
-        mime.setText(item.text())
-        drag = QDrag(self)
-        drag.setMimeData(mime)
-        widget = self.itemWidget(item)
-        if widget is not None:
-            pix = widget.grab()
-            drag.setPixmap(pix)
-            drag.setHotSpot(QPoint(pix.width() // 2, pix.height() // 2))
-        drag.exec(Qt.MoveAction)
+        _begin_item_drag(self, item_id, self.itemWidget(item))
 
-    def dropEvent(self, event) -> None:  # noqa: N802
-        source = event.source()
-        if isinstance(source, KanbanList) and source is not self:
-            item = source.currentItem()
-            if item is not None:
-                item_id = int(item.data(ROLE_ITEM_ID) or 0)
-                if item_id:
-                    event.setDropAction(Qt.MoveAction)
-                    event.accept()
-                    self.item_dropped.emit(item_id, self.column_key)
-                    return
-        super().dropEvent(event)
-        ids = []
-        for i in range(self.count()):
-            it = self.item(i)
-            iid = int(it.data(ROLE_ITEM_ID) or 0)
-            if iid:
-                ids.append(iid)
-        self.reordered.emit(self.column_key, ids)
+
+def _begin_item_drag(source: QWidget, item_id: int, preview: QWidget | None) -> None:
+    """Inicia um QDrag carregando o id do item no MIME próprio."""
+    mime = QMimeData()
+    mime.setData(MIME_PLAN_ITEM, str(item_id).encode("utf-8"))
+    drag = QDrag(source)
+    drag.setMimeData(mime)
+    if preview is not None:
+        pix = preview.grab()
+        drag.setPixmap(pix)
+        drag.setHotSpot(QPoint(pix.width() // 2, min(pix.height() // 2, 16)))
+    drag.exec(Qt.MoveAction)
 
 
 class DayCell(QFrame):
-    """Célula de um dia no calendário grande. Aceita soltar cartões (aulas)."""
+    """Célula de um dia no calendário. É origem E destino de arrasto.
+
+    - Soltar um item (da lista ou de outro dia) agenda/reagenda para este dia.
+    - Pressionar e arrastar um *pill* daqui inicia o arrasto desse evento.
+    - Clique simples seleciona o dia (abre no painel da direita).
+    """
 
     clicked = Signal(QDate)
     card_dropped = Signal(int, QDate)   # (plan_item_id, data)
@@ -166,15 +165,18 @@ class DayCell(QFrame):
         self._is_today = False
         self._selected = False
         self._palette: dict = {}
+        self._items: list[dict] = []
+        self._press_pos: QPoint | None = None
+        self._press_item_id = 0
 
         v = QVBoxLayout(self)
-        v.setContentsMargins(7, 6, 7, 6)
+        v.setContentsMargins(7, 5, 7, 5)
         v.setSpacing(3)
 
-        # Cabeçalho em um widget de altura fixa, para o número do dia nunca
-        # colidir com os "pills" das aulas (evita sobreposição no relayout).
+        # Cabeçalho de altura fixa (número do dia + contador), para nunca colidir
+        # com os pills das aulas durante relayouts em massa do calendário.
         head_w = QWidget()
-        head_w.setFixedHeight(20)
+        head_w.setFixedHeight(18)
         head = QHBoxLayout(head_w)
         head.setContentsMargins(0, 0, 0, 0)
         self.num_lbl = QLabel("")
@@ -186,10 +188,8 @@ class DayCell(QFrame):
         head.addWidget(self.count_lbl)
         v.addWidget(head_w, 0)
 
-        # Lista compacta de aulas agendadas naquele dia, dentro de um widget
-        # hospedeiro real (não um layout "solto"). Isso garante que os pills
-        # recebam geometria própria abaixo do cabeçalho e nunca o sobreponham
-        # durante relayouts em massa do calendário.
+        # Os pills moram num widget hospedeiro real (não um layout solto), o que
+        # garante geometria própria abaixo do cabeçalho.
         items_host = QWidget()
         self.items_box = QVBoxLayout(items_host)
         self.items_box.setContentsMargins(0, 0, 0, 0)
@@ -198,7 +198,7 @@ class DayCell(QFrame):
         v.addStretch(1)
 
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.setMinimumHeight(86)
+        self.setMinimumHeight(84)
 
     def set_palette(self, colors: dict) -> None:
         self._palette = dict(colors or {})
@@ -209,32 +209,26 @@ class DayCell(QFrame):
         self._in_month = in_month
         self._is_today = is_today
         self._selected = selected
+        self._items = list(items or [])
         self.num_lbl.setText(str(date.day()))
-        # Limpa pills antigos de forma SÍNCRONA. Usar deleteLater() aqui faz o
-        # widget velho sobreviver até o próximo ciclo de eventos, mantendo a
-        # geometria antiga (y≈0) e sobrepondo o cabeçalho durante relayouts em
-        # massa. setParent(None) + remoção imediata do layout evita isso.
+        # Limpa pills antigos de forma SÍNCRONA (evita widget órfão com geometria
+        # velha sobrepondo o cabeçalho até o próximo ciclo de eventos).
         while self.items_box.count():
             it = self.items_box.takeAt(0)
             w = it.widget() if it is not None else None
             if w is not None:
                 w.setParent(None)
                 w.deleteLater()
-        # Mostra até 3 pills; o resto vira "+N".
         shown = items[:3]
         for it in shown:
             self.items_box.addWidget(self._make_pill(it))
         extra = len(items) - len(shown)
         if extra > 0:
-            more = QLabel(f"+{extra} aula(s)")
+            more = QLabel(f"+{extra} evento(s)")
             more.setObjectName("DayMore")
             self.items_box.addWidget(more)
         self.count_lbl.setText(str(len(items)) if items else "")
         self._apply_state_style()
-        # Força o layout a recalcular imediatamente: ao adicionar/remover pills
-        # rapidamente (ex.: relayout em massa do calendário), o espaço do
-        # cabeçalho precisa ser reservado já — senão o 1º pill sobrepõe o número
-        # do dia até um próximo ciclo de eventos.
         if self.layout() is not None:
             self.items_box.invalidate()
             self.items_box.activate()
@@ -242,17 +236,16 @@ class DayCell(QFrame):
             self.layout().activate()
 
     def _make_pill(self, data: dict) -> QWidget:
-        watched = bool(data.get("v_watched_at"))
-        accent = data.get("color") or CARD_COLORS[int(data["id"]) % len(CARD_COLORS)]
+        accent = _accent_for(data)
         pill = QLabel()
         pill.setObjectName("DayPill")
-        title = data.get("title") or data.get("v_title") or "Aula"
-        icon = "✅" if watched else ("🎬" if data.get("video_id") else "📝")
-        # Trunca para caber na célula.
+        title = data.get("title") or data.get("v_title") or "Evento"
+        icon = _icon_for(data)
         short = title if len(title) <= 22 else title[:21] + "…"
         pill.setText(f"{icon} {short}")
         pill.setToolTip(title)
         pill.setProperty("video_id", int(data.get("video_id") or 0))
+        pill.setProperty("item_id", int(data.get("id") or 0))
         pill.setFixedHeight(19)
         pill.setStyleSheet(
             f"#DayPill {{ background: {self._pill_bg(accent)}; "
@@ -263,12 +256,8 @@ class DayCell(QFrame):
         return pill
 
     def _pill_bg(self, accent: str) -> str:
-        # Fundo translúcido suave derivado do acento.
         col = QColor(accent)
-        if self._palette.get("name") == "dark":
-            col.setAlpha(46)
-        else:
-            col.setAlpha(30)
+        col.setAlpha(46 if self._palette.get("name") == "dark" else 30)
         return f"rgba({col.red()},{col.green()},{col.blue()},{col.alpha()/255:.2f})"
 
     def _apply_state_style(self) -> None:
@@ -295,6 +284,7 @@ class DayCell(QFrame):
             f"#DayCell {{ background: {bg}; border: "
             f"{'2px' if (self._selected or self._is_today) else '1px'} solid {border}; "
             f"border-radius: 12px; }}"
+            f"#DayCell:hover {{ border-color: {c.get('accent', '#7c5cff')}; }}"
             f"#DayCount {{ color: {c.get('muted2', '#888')}; font-size: 10px; "
             f"font-weight: 800; }}"
             f"#DayMore {{ color: {c.get('muted', '#888')}; font-size: 10px; "
@@ -302,18 +292,58 @@ class DayCell(QFrame):
         )
 
     # -- interação ----------------------------------------------------------
+    def _item_id_at(self, pos: QPoint) -> int:
+        child = self.childAt(pos)
+        if child is not None:
+            return int(child.property("item_id") or 0)
+        return 0
+
     def mousePressEvent(self, event) -> None:  # noqa: N802, ANN001
-        if self.date is not None and event.button() == Qt.LeftButton:
-            self.clicked.emit(self.date)
+        if event.button() == Qt.LeftButton:
+            self._press_pos = event.position().toPoint()
+            self._press_item_id = self._item_id_at(self._press_pos)
         super().mousePressEvent(event)
 
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802, ANN001
+        # Arrastar um pill para outro dia = reagendar.
+        if (self._press_pos is not None and self._press_item_id
+                and (event.buttons() & Qt.LeftButton)):
+            dist = (event.position().toPoint() - self._press_pos).manhattanLength()
+            if dist >= 8:
+                item_id = self._press_item_id
+                self._press_item_id = 0
+                self._press_pos = None
+                _begin_item_drag(self, item_id, self._preview_for(item_id))
+                return
+        super().mouseMoveEvent(event)
+
+    def _preview_for(self, item_id: int) -> QWidget | None:
+        for i in range(self.items_box.count()):
+            w = self.items_box.itemAt(i).widget()
+            if w is not None and int(w.property("item_id") or 0) == item_id:
+                return w
+        return None
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802, ANN001
+        # Clique simples (sem arrasto) seleciona o dia.
+        if (self.date is not None and event.button() == Qt.LeftButton
+                and self._press_pos is not None):
+            dist = (event.position().toPoint() - self._press_pos).manhattanLength()
+            if dist < 8:
+                self.clicked.emit(self.date)
+        self._press_pos = None
+        self._press_item_id = 0
+        super().mouseReleaseEvent(event)
+
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802, ANN001
-        # Duplo clique numa aula (pill) abre no Telegram.
+        vid = 0
         child = self.childAt(event.position().toPoint())
         if child is not None:
             vid = int(child.property("video_id") or 0)
-            if vid:
-                self.item_activated.emit(vid)
+        if vid:
+            self.item_activated.emit(vid)
+        elif self.date is not None:
+            self.clicked.emit(self.date)
         super().mouseDoubleClickEvent(event)
 
     def dragEnterEvent(self, event) -> None:  # noqa: N802, ANN001
@@ -322,6 +352,12 @@ class DayCell(QFrame):
             self._set_drop_highlight(True)
         else:
             super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event) -> None:  # noqa: N802, ANN001
+        if event.mimeData().hasFormat(MIME_PLAN_ITEM):
+            event.acceptProposedAction()
+        else:
+            super().dragMoveEvent(event)
 
     def dragLeaveEvent(self, event) -> None:  # noqa: N802, ANN001
         self._set_drop_highlight(False)
@@ -354,7 +390,7 @@ class DayCell(QFrame):
 
 
 class PlannerTab(QWidget):
-    """Planejador: calendário grande (com drop por dia) + quadro Kanban."""
+    """Planejador estilo calendário: lista de aulas a planejar · calendário · dia."""
 
     changed = Signal()
     open_lesson_requested = Signal(int)
@@ -367,6 +403,8 @@ class PlannerTab(QWidget):
         self.selected_date = QDate.currentDate()
         self.shown_month = QDate(self.selected_date.year(), self.selected_date.month(), 1)
         self._cells: list[DayCell] = []
+        self._note_item_id = 0          # id do plan_item que guarda a nota do dia
+        self._note_dirty = False
         self._build_ui()
         self.refresh()
 
@@ -376,15 +414,16 @@ class PlannerTab(QWidget):
         root.setContentsMargins(14, 14, 14, 14)
         root.setSpacing(14)
 
-        root.addWidget(self._build_sidebar())
+        root.addWidget(self._build_sidebar(), 0)
         root.addWidget(self._build_calendar_panel(), 1)
+        root.addWidget(self._build_day_panel(), 0)
 
-    # ---- coluna esquerda: cartões + ações --------------------------------
+    # ---- coluna esquerda: aulas a planejar -------------------------------
     def _build_sidebar(self) -> QWidget:
         left = QFrame()
         left.setObjectName("Card")
-        left.setMaximumWidth(310)
-        left.setMinimumWidth(268)
+        left.setMaximumWidth(290)
+        left.setMinimumWidth(252)
         ll = QVBoxLayout(left)
         ll.setContentsMargins(16, 16, 16, 16)
         ll.setSpacing(10)
@@ -394,8 +433,8 @@ class PlannerTab(QWidget):
         ll.addWidget(title)
 
         sub = QLabel(
-            "Arraste as aulas dos cartões abaixo direto para o dia desejado no "
-            "calendário ao lado. Organize o que assistir e acompanhe tudo."
+            "Arraste uma aula daqui para um dia do calendário. Clique num dia "
+            "para ver os eventos e escrever anotações."
         )
         sub.setObjectName("Muted2")
         sub.setWordWrap(True)
@@ -403,12 +442,12 @@ class PlannerTab(QWidget):
 
         btn_row = QHBoxLayout()
         btn_row.setSpacing(8)
-        self.add_task_btn = QPushButton("＋ Tarefa")
-        self.add_task_btn.setToolTip("Cria um cartão livre (tarefa) no Backlog.")
+        self.add_task_btn = QPushButton("＋ Anotação")
+        self.add_task_btn.setToolTip("Cria uma anotação/tarefa no dia selecionado.")
         self.add_task_btn.clicked.connect(self._add_free_task)
         self.add_lesson_btn = QPushButton("＋ Aula")
         self.add_lesson_btn.setObjectName("PrimaryButton")
-        self.add_lesson_btn.setToolTip("Escolhe uma aula dos seus grupos/canais para planejar.")
+        self.add_lesson_btn.setToolTip("Escolhe uma aula do curso atual para planejar.")
         self.add_lesson_btn.clicked.connect(self._add_lesson_from_course)
         for b in (self.add_task_btn, self.add_lesson_btn):
             b.setMinimumHeight(34)
@@ -416,12 +455,23 @@ class PlannerTab(QWidget):
             btn_row.addWidget(b)
         ll.addLayout(btn_row)
 
-        # Mini-quadro de colunas (rolagem vertical), enxuto.
-        self.col_backlog = self._make_column("📥  Backlog", COL_BACKLOG)
-        self.col_week = self._make_column("📌  Esta semana", COL_WEEK)
-        self.col_done = self._make_column("✅  Concluído", COL_DONE)
-        for col in (self.col_backlog, self.col_week, self.col_done):
-            ll.addWidget(col["frame"], col["stretch"])
+        head = QHBoxLayout()
+        lbl = QLabel("📥  Aulas a planejar")
+        lbl.setObjectName("KanbanTitle")
+        head.addWidget(lbl)
+        head.addStretch(1)
+        self.backlog_count = QLabel("0")
+        self.backlog_count.setObjectName("KanbanCount")
+        head.addWidget(self.backlog_count)
+        ll.addLayout(head)
+
+        self.backlog = BacklogList()
+        self.backlog.customContextMenuRequested.connect(
+            lambda pos: self._card_menu(self.backlog, pos)
+        )
+        self.backlog.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.backlog.itemDoubleClicked.connect(self._on_card_double_clicked)
+        ll.addWidget(self.backlog, 1)
 
         self.summary_label = QLabel()
         self.summary_label.setObjectName("Muted2")
@@ -430,39 +480,7 @@ class PlannerTab(QWidget):
 
         return left
 
-    def _make_column(self, title: str, key: str) -> dict:
-        frame = QFrame()
-        frame.setObjectName("KanbanColumn")
-        v = QVBoxLayout(frame)
-        v.setContentsMargins(10, 8, 10, 10)
-        v.setSpacing(6)
-
-        head = QHBoxLayout()
-        lbl = QLabel(title)
-        lbl.setObjectName("KanbanTitle")
-        head.addWidget(lbl)
-        head.addStretch(1)
-        count = QLabel("0")
-        count.setObjectName("KanbanCount")
-        head.addWidget(count)
-        v.addLayout(head)
-
-        listw = KanbanList(key)
-        listw.item_dropped.connect(self._on_item_dropped)
-        listw.reordered.connect(self._on_reordered)
-        listw.customContextMenuRequested.connect(
-            lambda pos, lw=listw: self._card_menu(lw, pos)
-        )
-        listw.setContextMenuPolicy(Qt.CustomContextMenu)
-        listw.itemDoubleClicked.connect(self._on_card_double_clicked)
-        # Backlog é o maior (de onde se puxa aulas); demais menores.
-        stretch = 3 if key == COL_BACKLOG else 2
-        listw.setMinimumHeight(90 if key == COL_BACKLOG else 70)
-        v.addWidget(listw, 1)
-        return {"frame": frame, "list": listw, "count": count, "key": key,
-                "stretch": stretch}
-
-    # ---- painel direito: calendário grande -------------------------------
+    # ---- painel central: calendário grande -------------------------------
     def _build_calendar_panel(self) -> QWidget:
         panel = QFrame()
         panel.setObjectName("Card")
@@ -470,7 +488,6 @@ class PlannerTab(QWidget):
         v.setContentsMargins(16, 14, 16, 16)
         v.setSpacing(10)
 
-        # Barra de navegação do mês.
         nav = QHBoxLayout()
         nav.setSpacing(8)
         self.prev_btn = QPushButton("‹")
@@ -496,7 +513,6 @@ class PlannerTab(QWidget):
         nav.addWidget(self.today_btn)
         v.addLayout(nav)
 
-        # Cabeçalho com os dias da semana.
         head = QGridLayout()
         head.setContentsMargins(0, 0, 0, 0)
         head.setSpacing(8)
@@ -510,7 +526,6 @@ class PlannerTab(QWidget):
             self.weekday_labels.append(lbl)
         v.addLayout(head)
 
-        # Grade do mês (6 semanas x 7 dias) com rolagem caso falte espaço.
         scroll = QScrollArea()
         scroll.setObjectName("StudyScroll")
         scroll.setWidgetResizable(True)
@@ -535,22 +550,77 @@ class PlannerTab(QWidget):
         scroll.setWidget(grid_host)
         v.addWidget(scroll, 1)
 
-        # Rodapé: dia selecionado.
-        self.day_label = QLabel()
-        self.day_label.setObjectName("CalSelectedDay")
-        v.addWidget(self.day_label)
-
         return panel
 
-    # ------------------------------------------------------------ helpers
-    def _column_key_for(self, base_key: str) -> str:
-        if base_key == "sched":
-            return _sched_key(self.selected_date.toString("yyyy-MM-dd"))
-        return base_key
+    # ---- painel direito: dia selecionado ---------------------------------
+    def _build_day_panel(self) -> QWidget:
+        panel = QFrame()
+        panel.setObjectName("Card")
+        panel.setMinimumWidth(290)
+        panel.setMaximumWidth(340)
+        v = QVBoxLayout(panel)
+        v.setContentsMargins(16, 16, 16, 16)
+        v.setSpacing(10)
 
-    def _current_course_id(self) -> int | None:
-        course = self.get_current_course()
-        return getattr(course, "id", None) if course else None
+        self.day_title = QLabel("")
+        self.day_title.setObjectName("CalMonth")
+        self.day_title.setWordWrap(True)
+        v.addWidget(self.day_title)
+
+        self.day_sub = QLabel("")
+        self.day_sub.setObjectName("Muted2")
+        self.day_sub.setWordWrap(True)
+        v.addWidget(self.day_sub)
+
+        ev_head = QLabel("Eventos do dia")
+        ev_head.setObjectName("KanbanTitle")
+        v.addWidget(ev_head)
+
+        self.day_events = QListWidget()
+        self.day_events.setObjectName("DayEvents")
+        self.day_events.setWordWrap(True)
+        self.day_events.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.day_events.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.day_events.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.day_events.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.day_events.customContextMenuRequested.connect(
+            lambda pos: self._card_menu(self.day_events, pos)
+        )
+        self.day_events.itemDoubleClicked.connect(self._on_card_double_clicked)
+        v.addWidget(self.day_events, 1)
+
+        day_btns = QHBoxLayout()
+        day_btns.setSpacing(8)
+        self.day_add_lesson = QPushButton("＋ Aula")
+        self.day_add_lesson.setCursor(Qt.PointingHandCursor)
+        self.day_add_lesson.clicked.connect(self._add_lesson_to_selected_day)
+        self.day_add_note = QPushButton("＋ Anotação")
+        self.day_add_note.setCursor(Qt.PointingHandCursor)
+        self.day_add_note.clicked.connect(self._add_free_task)
+        for b in (self.day_add_lesson, self.day_add_note):
+            b.setMinimumHeight(32)
+            day_btns.addWidget(b)
+        v.addLayout(day_btns)
+
+        notes_head = QLabel("📝  Anotações do dia")
+        notes_head.setObjectName("KanbanTitle")
+        v.addWidget(notes_head)
+
+        self.note_edit = QPlainTextEdit()
+        self.note_edit.setObjectName("DayNote")
+        self.note_edit.setPlaceholderText(
+            "Escreva aqui o que quiser lembrar deste dia…"
+        )
+        self.note_edit.setMaximumHeight(140)
+        self.note_edit.textChanged.connect(self._on_note_changed)
+        v.addWidget(self.note_edit)
+
+        self.save_note_btn = QPushButton("Salvar anotação")
+        self.save_note_btn.setCursor(Qt.PointingHandCursor)
+        self.save_note_btn.clicked.connect(self._save_day_note)
+        v.addWidget(self.save_note_btn)
+
+        return panel
 
     # ------------------------------------------------------------ navegação
     def _shift_month(self, delta: int) -> None:
@@ -564,21 +634,11 @@ class PlannerTab(QWidget):
         self.refresh()
 
     def _on_cell_clicked(self, date: QDate) -> None:
+        self._flush_note_if_dirty()
         self.selected_date = date
         if date.month() != self.shown_month.month() or date.year() != self.shown_month.year():
             self.shown_month = QDate(date.year(), date.month(), 1)
         self.refresh()
-
-    def _refresh_day_label(self) -> None:
-        d = self.selected_date
-        try:
-            wd = WEEKDAYS_FULL[d.dayOfWeek() - 1]
-        except Exception:  # noqa: BLE001
-            wd = ""
-        self.day_label.setText(
-            f"📌 Dia selecionado: {wd.capitalize()}, {d.toString('dd/MM/yyyy')} "
-            f"— arraste aulas para aqui ou para qualquer dia."
-        )
 
     def _refresh_month_label(self) -> None:
         m = MONTHS_PT[self.shown_month.month() - 1]
@@ -587,36 +647,31 @@ class PlannerTab(QWidget):
     # ------------------------------------------------------------ refresh
     def refresh(self) -> None:
         self._refresh_month_label()
-        self._refresh_day_label()
 
-        for col in (self.col_backlog, self.col_week, self.col_done):
-            col["list"].clear()
-
+        self.backlog.clear()
         items = self.db.list_plan_items()
 
-        # Mapeia aulas por dia (para preencher as células).
         by_date: dict[str, list[dict]] = {}
+        backlog_items: list[dict] = []
         for it in items:
             key = it.get("column_key") or COL_BACKLOG
-            if key == COL_BACKLOG:
-                self._add_card_widget(self.col_backlog["list"], it)
-            elif key == COL_WEEK:
-                self._add_card_widget(self.col_week["list"], it)
-            elif key == COL_DONE:
-                self._add_card_widget(self.col_done["list"], it)
-            elif _is_sched_key(key):
-                d = _date_from_sched(key)
-                by_date.setdefault(d, []).append(it)
+            if _is_sched_key(key) or it.get("scheduled_date"):
+                d = it.get("scheduled_date") or _date_from_sched(key)
+                if d:
+                    by_date.setdefault(d, []).append(it)
+                    continue
+            # Tudo que não tem data cai na lista "Aulas a planejar".
+            backlog_items.append(it)
 
-        self.col_backlog["count"].setText(str(self.col_backlog["list"].count()))
-        self.col_week["count"].setText(str(self.col_week["list"].count()))
-        self.col_done["count"].setText(str(self.col_done["list"].count()))
+        for it in backlog_items:
+            self._add_card_widget(self.backlog, it)
+        self.backlog_count.setText(str(len(backlog_items)))
 
         self._fill_calendar(by_date)
+        self._refresh_day_panel(by_date.get(self.selected_date.toString("yyyy-MM-dd"), []))
         self._refresh_summary(items, by_date)
 
     def _fill_calendar(self, by_date: dict[str, list[dict]]) -> None:
-        # Primeiro dia exibido = segunda-feira da semana do dia 1.
         first = QDate(self.shown_month.year(), self.shown_month.month(), 1)
         offset = first.dayOfWeek() - 1  # 0 = segunda
         start = first.addDays(-offset)
@@ -629,7 +684,87 @@ class PlannerTab(QWidget):
             is_today = date == today
             selected = date == self.selected_date
             cell.set_palette(self._palette)
-            cell.set_day(date, in_month, is_today, selected, by_date.get(date_str, []))
+            # Não mostramos a "nota do dia" como pill (ela vai no painel lateral).
+            visible = [it for it in by_date.get(date_str, [])
+                       if not self._is_day_note(it)]
+            cell.set_day(date, in_month, is_today, selected, visible)
+
+    # ------------------------------------------------------------ painel do dia
+    def _is_day_note(self, it: dict) -> bool:
+        """Nota do dia = anotação livre sem título 'real' (guardada só p/ texto)."""
+        return ((it.get("item_type") or "lesson") == "note"
+                and (it.get("title") or "").strip() == "•nota do dia•")
+
+    def _refresh_day_panel(self, day_items: list[dict]) -> None:
+        d = self.selected_date
+        try:
+            wd = WEEKDAYS_FULL[d.dayOfWeek() - 1]
+        except Exception:  # noqa: BLE001
+            wd = ""
+        self.day_title.setText(f"{d.day()} de {MONTHS_PT[d.month() - 1]}")
+        self.day_sub.setText(f"{wd.capitalize()} · {d.toString('dd/MM/yyyy')}")
+
+        # Lista de eventos (exceto a nota oculta do dia).
+        self.day_events.clear()
+        events = [it for it in day_items if not self._is_day_note(it)]
+        if not events:
+            ph = QListWidgetItem("Nenhum evento. Arraste uma aula para cá ou use os botões abaixo.")
+            ph.setFlags(Qt.NoItemFlags)
+            ph.setForeground(QColor(self._palette.get("muted2", "#888")))
+            self.day_events.addItem(ph)
+        else:
+            for it in events:
+                self._add_day_event_widget(it)
+
+        # Nota do dia.
+        note_item = next((it for it in day_items if self._is_day_note(it)), None)
+        self._note_item_id = int(note_item["id"]) if note_item else 0
+        self.note_edit.blockSignals(True)
+        self.note_edit.setPlainText((note_item or {}).get("note") or "")
+        self.note_edit.blockSignals(False)
+        self._note_dirty = False
+
+    def _add_day_event_widget(self, data: dict) -> None:
+        item = QListWidgetItem(self.day_events)
+        item.setData(ROLE_ITEM_ID, int(data["id"]))
+        item.setData(ROLE_VIDEO_ID, int(data["video_id"]) if data.get("video_id") else 0)
+        widget = self._build_card(data, compact=True)
+        item.setSizeHint(widget.sizeHint())
+        self.day_events.addItem(item)
+        self.day_events.setItemWidget(item, widget)
+
+    def _on_note_changed(self) -> None:
+        self._note_dirty = True
+
+    def _flush_note_if_dirty(self) -> None:
+        if self._note_dirty:
+            self._save_day_note(silent=True)
+
+    def _save_day_note(self, silent: bool = False) -> None:
+        text = self.note_edit.toPlainText().strip()
+        date_str = self.selected_date.toString("yyyy-MM-dd")
+        if self._note_item_id:
+            if text:
+                self.db.update_plan_item(self._note_item_id, note=text)
+            else:
+                # Nota esvaziada → remove o item oculto.
+                self.db.delete_plan_item(self._note_item_id)
+                self._note_item_id = 0
+        elif text:
+            self._note_item_id = self.db.add_plan_item(
+                "•nota do dia•", column_key=_sched_key(date_str),
+                course_id=self._current_course_id(), scheduled_date=date_str,
+                note=text, item_type="note",
+            )
+        self._note_dirty = False
+        if not silent:
+            self.refresh()
+            self.changed.emit()
+
+    # ------------------------------------------------------------ cards
+    def _current_course_id(self) -> int | None:
+        course = self.get_current_course()
+        return getattr(course, "id", None) if course else None
 
     def _add_card_widget(self, listw: QListWidget, data: dict) -> None:
         item = QListWidgetItem(listw)
@@ -641,26 +776,28 @@ class PlannerTab(QWidget):
         listw.addItem(item)
         listw.setItemWidget(item, widget)
 
-    def _build_card(self, data: dict) -> QWidget:
+    def _build_card(self, data: dict, compact: bool = False) -> QWidget:
         card = QFrame()
         card.setObjectName("KanbanCard")
-        watched = bool(data.get("v_watched_at"))
-        accent = data.get("color") or CARD_COLORS[(int(data["id"])) % len(CARD_COLORS)]
+        watched = bool(data.get("v_watched_at")) or data.get("status") == "done"
+        accent = _accent_for(data)
         v = QVBoxLayout(card)
-        v.setContentsMargins(10, 8, 10, 8)
-        v.setSpacing(3)
+        if compact:
+            v.setContentsMargins(10, 5, 10, 5)
+            v.setSpacing(1)
+        else:
+            v.setContentsMargins(10, 7, 10, 7)
+            v.setSpacing(2)
 
-        title = data.get("title") or data.get("v_title") or "Aula"
-        icon = "🎬" if data.get("video_id") else "📝"
-        if watched:
-            icon = "✅"
+        title = data.get("title") or data.get("v_title") or "Evento"
+        icon = _icon_for(data)
         title_lbl = QLabel(f"{icon}  {title}")
         title_lbl.setObjectName("KanbanCardTitle")
         title_lbl.setWordWrap(True)
         v.addWidget(title_lbl)
 
         meta_bits = []
-        if data.get("course_title"):
+        if not compact and data.get("course_title"):
             meta_bits.append(str(data["course_title"]))
         if data.get("subtitle"):
             meta_bits.append(str(data["subtitle"]))
@@ -677,43 +814,19 @@ class PlannerTab(QWidget):
         return card
 
     def _refresh_summary(self, items: list[dict], by_date: dict[str, list[dict]]) -> None:
-        total = len(items)
-        done = sum(1 for it in items if (it.get("column_key") == COL_DONE or it.get("v_watched_at")))
-        week = sum(1 for it in items if it.get("column_key") == COL_WEEK)
-        scheduled = sum(len(v) for v in by_date.values())
+        real = [it for it in items if not self._is_day_note(it)]
+        total = len(real)
+        done = sum(1 for it in real
+                   if (it.get("status") == "done" or it.get("v_watched_at")))
+        scheduled = sum(len([it for it in v if not self._is_day_note(it)])
+                        for v in by_date.values())
         self.summary_label.setText(
-            f"📊 {total} cartões · {scheduled} agendados · {week} nesta semana · "
-            f"{done} concluídos."
+            f"📊 {total} aulas · {scheduled} agendadas · {done} concluídas."
         )
 
     # ------------------------------------------------------------ drag/drop
-    def _on_item_dropped(self, item_id: int, base_column_key: str) -> None:
-        target_key = base_column_key
-        sched_date = None
-        explicit = True
-        if base_column_key == "sched":
-            target_key = self._column_key_for("sched")
-            sched_date = self.selected_date.toString("yyyy-MM-dd")
-        elif _is_sched_key(base_column_key):
-            sched_date = _date_from_sched(base_column_key)
-        else:
-            sched_date = None  # sai da agenda
-        self.db.move_plan_item(
-            item_id, target_key, 9999,
-            scheduled_date=sched_date, scheduled_date_explicit=explicit,
-        )
-        self.refresh()
-        self.changed.emit()
-
-    def _on_reordered(self, base_column_key: str, ids: list) -> None:
-        if not ids:
-            return
-        key = self._column_key_for(base_column_key) if base_column_key == "sched" else base_column_key
-        self.db.reorder_plan_column(key, [int(i) for i in ids])
-        self.changed.emit()
-
     def _on_card_dropped_on_date(self, item_id: int, date) -> None:  # noqa: ANN001
-        # Aceita QDate (vindo das células) ou string "YYYY-MM-DD" (API/menus).
+        # Aceita QDate (das células) ou string "YYYY-MM-DD" (API/menus/testes).
         if isinstance(date, QDate):
             qd = date
             date_str = date.toString("yyyy-MM-dd")
@@ -724,55 +837,93 @@ class PlannerTab(QWidget):
                 qd = QDate(y, m, d)
             except Exception:  # noqa: BLE001
                 qd = self.selected_date
-        self.db.move_plan_item(
-            item_id, _sched_key(date_str), 9999,
-            scheduled_date=date_str, scheduled_date_explicit=True,
-        )
+                date_str = qd.toString("yyyy-MM-dd")
+        self.db.set_plan_item_date(item_id, date_str)
         self.selected_date = qd
-        # Garante que o mês exibido contenha o dia destino.
         self.shown_month = QDate(qd.year(), qd.month(), 1)
         self.refresh()
         self.changed.emit()
 
+    # mantido por compatibilidade com versões antigas (kanban) e testes.
+    def _on_item_dropped(self, item_id: int, base_column_key: str) -> None:
+        if base_column_key == "sched":
+            self._on_card_dropped_on_date(
+                item_id, self.selected_date.toString("yyyy-MM-dd")
+            )
+            return
+        if _is_sched_key(base_column_key):
+            self._on_card_dropped_on_date(item_id, _date_from_sched(base_column_key))
+            return
+        # Qualquer outra coluna (backlog/week/done) → desagenda (volta p/ lista).
+        if base_column_key == COL_DONE:
+            self.db.move_plan_item(item_id, COL_BACKLOG, 9999,
+                                   scheduled_date=None, scheduled_date_explicit=True)
+            self.db.update_plan_item(item_id, status="done")
+        else:
+            self.db.set_plan_item_date(item_id, None)
+        self.refresh()
+        self.changed.emit()
+
+    def _on_reordered(self, base_column_key: str, ids: list) -> None:
+        if not ids:
+            return
+        self.db.reorder_plan_column(base_column_key, [int(i) for i in ids])
+        self.changed.emit()
+
     # ------------------------------------------------------------ actions
     def _add_free_task(self) -> None:
-        text, ok = QInputDialog.getText(self, "Nova tarefa", "Descrição da tarefa:")
+        text, ok = QInputDialog.getText(
+            self, "Nova anotação",
+            f"Anotação para {self.selected_date.toString('dd/MM/yyyy')}:",
+        )
         if not ok or not text.strip():
             return
+        date_str = self.selected_date.toString("yyyy-MM-dd")
         self.db.add_plan_item(
-            text.strip(), column_key=COL_WEEK, course_id=self._current_course_id()
+            text.strip(), column_key=_sched_key(date_str),
+            course_id=self._current_course_id(), scheduled_date=date_str,
+            item_type="note",
         )
         self.refresh()
         self.changed.emit()
 
-    def _add_lesson_from_course(self) -> None:
+    def _pick_lesson(self) -> object | None:
         course = self.get_current_course()
         if not course:
             QMessageBox.information(
                 self, "Planejador",
                 "Selecione um curso na aba Aulas para escolher uma aula."
             )
-            return
+            return None
         videos = self.db.list_videos(course.id)
         if not videos:
             QMessageBox.information(
                 self, "Planejador",
                 "Este curso ainda não tem aulas. Sincronize na aba Aulas."
             )
-            return
+            return None
         labels = [f"{v.title}" for v in videos]
         choice, ok = QInputDialog.getItem(
             self, "Adicionar aula", "Escolha a aula para planejar:", labels, 0, False
         )
         if not ok:
-            return
-        video = videos[labels.index(choice)]
-        # Adiciona ao Backlog (de lá o usuário arrasta para o dia desejado).
-        self.add_video(video.id, column_key=COL_BACKLOG)
+            return None
+        return videos[labels.index(choice)]
+
+    def _add_lesson_from_course(self) -> None:
+        video = self._pick_lesson()
+        if video is not None:
+            # Vai para a lista "Aulas a planejar" (de lá arrasta-se para o dia).
+            self.add_video(video.id, column_key=COL_BACKLOG)
+
+    def _add_lesson_to_selected_day(self) -> None:
+        video = self._pick_lesson()
+        if video is not None:
+            self.add_video(video.id, column_key="sched")
 
     def add_video(self, video_id: int, column_key: str = COL_BACKLOG,
                   silent: bool = False) -> bool:
-        """Adiciona uma aula ao planejador. Usado pelo menu da aba Aulas."""
+        """Adiciona uma aula ao planejador. Usado também pela aba Aulas."""
         video = self.db.get_video(int(video_id))
         if not video:
             return False
@@ -792,6 +943,7 @@ class PlannerTab(QWidget):
         self.db.add_plan_item(
             video.title, column_key=key, video_id=video.id,
             course_id=course_id, subtitle=subtitle, scheduled_date=sched_date,
+            item_type="lesson",
         )
         self.refresh()
         self.changed.emit()
@@ -809,12 +961,13 @@ class PlannerTab(QWidget):
             return
         item_id = int(item.data(ROLE_ITEM_ID) or 0)
         vid = int(item.data(ROLE_VIDEO_ID) or 0)
+        if not item_id:
+            return
         menu = QMenu(self)
         open_act = menu.addAction("📲 Assistir no Telegram") if vid else None
-        to_today = menu.addAction("🗓 Agendar para o dia selecionado")
-        to_week = menu.addAction("📌 Mover para Esta semana")
-        to_backlog = menu.addAction("📥 Mover para Backlog")
-        to_done = menu.addAction("✅ Marcar como concluído")
+        to_day = menu.addAction("🗓 Agendar para o dia selecionado")
+        unschedule = menu.addAction("📥 Tirar do dia (voltar p/ lista)")
+        done_act = menu.addAction("✅ Marcar como concluído")
         menu.addSeparator()
         recolor = menu.addAction("🎨 Mudar cor")
         delete = menu.addAction("🗑 Remover do planejamento")
@@ -823,18 +976,20 @@ class PlannerTab(QWidget):
             return
         if open_act is not None and action == open_act:
             self.open_lesson_requested.emit(vid)
-        elif action == to_today:
-            self._on_item_dropped(item_id, "sched")
-        elif action == to_week:
-            self._on_item_dropped(item_id, COL_WEEK)
-        elif action == to_backlog:
-            self._on_item_dropped(item_id, COL_BACKLOG)
-        elif action == to_done:
-            self.db.move_plan_item(item_id, COL_DONE, 9999)
+        elif action == to_day:
+            self._on_card_dropped_on_date(
+                item_id, self.selected_date.toString("yyyy-MM-dd")
+            )
+        elif action == unschedule:
+            self.db.set_plan_item_date(item_id, None)
+            self.refresh()
+            self.changed.emit()
+        elif action == done_act:
+            self.db.update_plan_item(item_id, status="done")
             self.refresh()
             self.changed.emit()
         elif action == recolor:
-            idx = (item_id) % len(CARD_COLORS)
+            idx = item_id % len(CARD_COLORS)
             color, ok = QInputDialog.getItem(
                 self, "Cor do cartão", "Escolha uma cor:", CARD_COLORS, idx, False
             )
