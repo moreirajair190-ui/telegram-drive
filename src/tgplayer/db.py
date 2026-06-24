@@ -309,6 +309,10 @@ class Database:
             self._ensure_column(conn, "videos", "width", "INTEGER")
             self._ensure_column(conn, "videos", "height", "INTEGER")
             self._ensure_column(conn, "videos", "last_watched_at", "TEXT")
+            # Migração v6.7: planejador estilo Google Calendar — anotações por
+            # item e diferenciação de tipo (aula × nota/tarefa livre).
+            self._ensure_column(conn, "plan_items", "note", "TEXT")
+            self._ensure_column(conn, "plan_items", "item_type", "TEXT DEFAULT 'lesson'")
             # Migração v5 -> v6: campos antigos topic_id/topic_title viram subjects.
             self._migrate_topics_to_subjects(conn)
 
@@ -1171,6 +1175,8 @@ class Database:
         subtitle: str | None = None,
         scheduled_date: str | None = None,
         color: str | None = None,
+        note: str | None = None,
+        item_type: str = "lesson",
     ) -> int:
         with self.connect() as conn:
             order = conn.execute(
@@ -1179,8 +1185,8 @@ class Database:
             ).fetchone()["n"]
             cur = conn.execute(
                 "INSERT INTO plan_items(video_id, course_id, title, subtitle, column_key, "
-                "scheduled_date, status, color, sort_order, created_at, updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                "scheduled_date, status, color, note, item_type, sort_order, created_at, updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     int(video_id) if video_id else None,
                     int(course_id) if course_id else None,
@@ -1190,6 +1196,8 @@ class Database:
                     scheduled_date,
                     "todo",
                     color,
+                    (note or None),
+                    (item_type or "lesson"),
                     int(order),
                     self.now(),
                     self.now(),
@@ -1213,27 +1221,32 @@ class Database:
         scheduled_date: str | None = None,
         status: str | None = None,
         color: str | None = None,
+        note: str | None = None,
+        item_type: str | None = None,
         scheduled_date_explicit: bool = False,
     ) -> None:
         with self.connect() as conn:
             cur = conn.execute("SELECT * FROM plan_items WHERE id=?", (item_id,)).fetchone()
             if not cur:
                 return
-            new_date = cur["scheduled_date"]
+            cur_d = dict(cur)
+            new_date = cur_d.get("scheduled_date")
             if scheduled_date_explicit:
                 new_date = scheduled_date
             elif scheduled_date is not None:
                 new_date = scheduled_date
             conn.execute(
                 "UPDATE plan_items SET title=?, subtitle=?, column_key=?, scheduled_date=?, "
-                "status=?, color=?, updated_at=? WHERE id=?",
+                "status=?, color=?, note=?, item_type=?, updated_at=? WHERE id=?",
                 (
-                    (title if title is not None else cur["title"]),
-                    (subtitle if subtitle is not None else cur["subtitle"]),
-                    (column_key if column_key is not None else cur["column_key"]),
+                    (title if title is not None else cur_d.get("title")),
+                    (subtitle if subtitle is not None else cur_d.get("subtitle")),
+                    (column_key if column_key is not None else cur_d.get("column_key")),
                     new_date,
-                    (status if status is not None else cur["status"]),
-                    (color if color is not None else cur["color"]),
+                    (status if status is not None else cur_d.get("status")),
+                    (color if color is not None else cur_d.get("color")),
+                    (note if note is not None else cur_d.get("note")),
+                    (item_type if item_type is not None else (cur_d.get("item_type") or "lesson")),
                     self.now(),
                     item_id,
                 ),
@@ -1272,6 +1285,18 @@ class Database:
     def delete_plan_item(self, item_id: int) -> None:
         with self.connect() as conn:
             conn.execute("DELETE FROM plan_items WHERE id=?", (int(item_id),))
+
+    def set_plan_item_date(self, item_id: int, scheduled_date: str | None) -> None:
+        """Atalho usado pelo calendário: (re)agenda um item para uma data.
+
+        `scheduled_date=None` desagenda (volta a ficar sem data, no Backlog).
+        O `column_key` passa a refletir a data (`sched_<data>`) ou `backlog`.
+        """
+        column_key = f"sched_{scheduled_date}" if scheduled_date else "backlog"
+        self.move_plan_item(
+            item_id, column_key, 9999,
+            scheduled_date=scheduled_date, scheduled_date_explicit=True,
+        )
 
     def plan_counts_by_date(self) -> dict[str, int]:
         """Quantos cartões há por dia agendado (para marcar o calendário)."""

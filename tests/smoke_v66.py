@@ -24,7 +24,7 @@ _tmp = tempfile.mkdtemp(prefix="tgp_smoke_")
 os.environ["TGPLAYER_DATA"] = _tmp
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from PySide6.QtCore import QCoreApplication, Qt  # noqa: E402
+from PySide6.QtCore import QCoreApplication, QDate, Qt  # noqa: E402
 
 try:
     QCoreApplication.setAttribute(Qt.AA_ShareOpenGLContexts, True)
@@ -96,53 +96,65 @@ def test_planner_crud_and_dragdrop(win):
     videos = db.list_videos(course.id)
     assert videos, "sem vídeos para planejar"
 
-    # Adiciona aula ao backlog.
+    # Adiciona aula à lista "Aulas a planejar" (backlog, sem data).
     ok = planner.add_video(videos[0].id, column_key="backlog")
     assert ok, "add_video falhou"
     # Não duplica.
     assert planner.add_video(videos[0].id, column_key="backlog", silent=True) is False
     # Adiciona aula agendada para o dia selecionado (vai para o calendário).
     planner.add_video(videos[1].id, column_key="sched")
-    # Tarefa livre.
-    item_id = db.add_plan_item("Revisar pneumonia", column_key=pt.COL_WEEK)
-    assert item_id > 0
 
     planner.refresh()
-    assert planner.col_backlog["list"].count() == 1, "backlog deveria ter 1 cartão"
-    # A agendada deve aparecer numa célula do calendário (não há mais coluna "hoje").
+    assert planner.backlog.count() == 1, "lista a planejar deveria ter 1 cartão"
+    # A agendada deve aparecer numa célula do calendário.
     today_str = planner.selected_date.toString("yyyy-MM-dd")
     counts0 = db.plan_counts_by_date()
     assert counts0.get(today_str, 0) >= 1, f"aula não agendada no calendário: {counts0}"
-    assert planner.col_week["list"].count() == 1, "semana deveria ter 1 cartão"
 
-    # Move o cartão do backlog para "semana" (simula drop entre colunas).
-    backlog_item = planner.col_backlog["list"].item(0)
+    # Arrasta o cartão da lista para o dia selecionado (drop no calendário).
+    backlog_item = planner.backlog.item(0)
     bid = int(backlog_item.data(pt.ROLE_ITEM_ID))
-    planner._on_item_dropped(bid, pt.COL_WEEK)
-    assert planner.col_backlog["list"].count() == 0
-    assert planner.col_week["list"].count() == 2
-
-    # Agenda um cartão num dia futuro via drop no calendário.
-    week_item = planner.col_week["list"].item(0)
-    wid = int(week_item.data(pt.ROLE_ITEM_ID))
-    future = db.today()  # usa hoje (formato YYYY-MM-DD)
-    planner._on_card_dropped_on_date(wid, future)
-    counts = db.plan_counts_by_date()
-    assert counts.get(future, 0) >= 1, f"calendário não marcou {future}: {counts}"
-
-    # Marca como concluído.
+    planner._on_card_dropped_on_date(bid, today_str)
     planner.refresh()
-    done_target = planner.col_week["list"].item(0)
-    did = int(done_target.data(pt.ROLE_ITEM_ID))
-    db.move_plan_item(did, pt.COL_DONE, 9999)
+    assert planner.backlog.count() == 0, "cartão deveria ter saído da lista"
+    counts1 = db.plan_counts_by_date()
+    assert counts1.get(today_str, 0) >= 2, f"dia deveria ter 2 eventos: {counts1}"
+
+    # Reagenda para um dia futuro via drop no calendário.
+    future = QDate.fromString(today_str, "yyyy-MM-dd").addDays(3).toString("yyyy-MM-dd")
+    planner._on_card_dropped_on_date(bid, future)
+    counts2 = db.plan_counts_by_date()
+    assert counts2.get(future, 0) >= 1, f"calendário não marcou {future}: {counts2}"
+
+    # Tira do dia (volta para a lista "a planejar").
+    db.set_plan_item_date(bid, None)
     planner.refresh()
-    assert planner.col_done["list"].count() >= 1, "coluna concluído vazia"
+    assert planner.backlog.count() == 1, "cartão deveria voltar para a lista"
+
+    # Anotação do dia (campo de notas estilo Google Calendar).
+    planner.selected_date = QDate.fromString(today_str, "yyyy-MM-dd")
+    planner.note_edit.setPlainText("Estudar 3 capítulos hoje.")
+    planner._save_day_note()
+    notes = [it for it in db.list_plan_items()
+             if (it.get("note") or "").startswith("Estudar 3")]
+    assert notes, "anotação do dia não foi salva"
+
+    # Marca uma aula como concluída.
+    planner.refresh()
+    sched_items = [it for it in db.list_plan_items()
+                   if it.get("scheduled_date") and not planner._is_day_note(it)]
+    assert sched_items, "deveria haver aula agendada"
+    did = int(sched_items[0]["id"])
+    db.update_plan_item(did, status="done")
+    planner.refresh()
+    done = [it for it in db.list_plan_items() if it.get("status") == "done"]
+    assert done, "nenhuma aula marcada como concluída"
 
     # Remove um cartão.
     total_before = len(db.list_plan_items())
     db.delete_plan_item(did)
     assert len(db.list_plan_items()) == total_before - 1
-    print("  ✔ planejador CRUD + drag-drop + calendário")
+    print("  ✔ planejador CRUD + drag-drop + calendário + anotações")
 
 
 def capture(win):

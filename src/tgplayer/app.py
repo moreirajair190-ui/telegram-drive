@@ -657,7 +657,7 @@ class MainWindow(QMainWindow):
     def _build_sidebar(self) -> QWidget:
         sidebar = QWidget()
         sidebar.setObjectName("Sidebar")
-        sidebar.setFixedWidth(300)
+        sidebar.setFixedWidth(344)
         layout = QVBoxLayout(sidebar)
         layout.setContentsMargins(18, 18, 18, 18)
         layout.setSpacing(10)
@@ -670,6 +670,12 @@ class MainWindow(QMainWindow):
         self.course_list.currentItemChanged.connect(self.on_course_selected)
         self.course_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.course_list.customContextMenuRequested.connect(self.show_course_menu)
+        # Sem rolagem horizontal: o texto longo (ex.: "1158 aulas · 0 assistidas
+        # · 0%") quebra em linha dentro do item, sem precisar arrastar para o lado.
+        self.course_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.course_list.setWordWrap(True)
+        self.course_list.setTextElideMode(Qt.ElideNone)
+        self.course_list.setVerticalScrollMode(QListWidget.ScrollPerPixel)
         layout.addWidget(self.course_list, 2)
         self._attach_list_placeholder(
             self.course_list,
@@ -689,6 +695,10 @@ class MainWindow(QMainWindow):
         self.subject_list.currentItemChanged.connect(self.on_subject_selected)
         self.subject_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.subject_list.customContextMenuRequested.connect(self.show_subject_menu)
+        self.subject_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.subject_list.setWordWrap(True)
+        self.subject_list.setTextElideMode(Qt.ElideNone)
+        self.subject_list.setVerticalScrollMode(QListWidget.ScrollPerPixel)
         layout.addWidget(self.subject_list, 3)
         self._attach_list_placeholder(
             self.subject_list,

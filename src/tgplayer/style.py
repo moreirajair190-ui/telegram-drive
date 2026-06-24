@@ -320,6 +320,20 @@ QTabBar::tab:selected {{
 #DayCell {{ background: {c['panel']}; border: 1px solid {c['border_soft']}; border-radius: 12px; }}
 #DayCell:hover {{ border-color: {c['accent']}; }}
 
+/* Painel do dia (lateral direita do planejador) */
+#DayEvents {{
+    background: {c['card_soft']}; border: 1px solid {c['border_soft']};
+    border-radius: 12px; padding: 4px;
+}}
+#DayEvents::item {{ border: none; background: transparent; padding: 0px; margin: 2px 0; }}
+#DayEvents::item:selected {{ background: transparent; }}
+#DayNote {{
+    background: {c['panel']}; color: {c['text']};
+    border: 1px solid {c['border_soft']}; border-radius: 12px;
+    padding: 8px 10px; font-size: 12px; selection-background-color: {c['selection']};
+}}
+#DayNote:focus {{ border-color: {c['accent']}; }}
+
 /* -------------------------------------------------------------- progresso */
 QProgressBar {{
     background: {c['track']}; border: none; border-radius: 8px;
