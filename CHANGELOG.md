@@ -1,5 +1,46 @@
 # Changelog — TgPlayer
 
+## v6.5.0
+
+Foco desta versão: **player embutido de volta no app Windows** (rápido, sem
+depender do VLC) e **correção da lentidão do vídeo na web**.
+
+### 🎬 Player embutido (Windows) — NOVO
+
+- O player local voltou, agora baseado em **QtWebEngine** (Chromium do Qt). Ele
+  carrega a MESMA página HTML5 do player web (`player_html.build_player_html`),
+  servida pelo servidor local em `/player/{token}` — ou seja, **mesma origem**
+  do vídeo (evita o bloqueio de mídia cross-origin do Chromium).
+- **Partida rápida**: o backend faz *faststart virtual* (monta `ftyp+moov` em
+  memória e serve antes do `mdat`), então o vídeo começa em poucos segundos —
+  **sem a demora do VLC** para abrir o stream HTTP.
+- Novo botão **"▶ Assistir aqui"** (principal) no painel de detalhes; duplo
+  clique numa aula também abre o player embutido. "Telegram" e "VLC" ficam como
+  alternativas. Há uma ação equivalente no menu de contexto.
+- Overlay de carregamento com barra de progresso de buffer; se demorar mais que
+  ~5 s, aparece o atalho "Abrir no VLC". Atalhos: Espaço (play/pause), F (tela
+  cheia), M (mudo), Esc (fechar).
+- Retomada automática da posição salva e **salvamento de progresso** ao fechar
+  (conclui a aula automaticamente ao assistir ~95%).
+- Robustez: se o QtWebEngine não estiver disponível no ambiente, o app oferece o
+  VLC automaticamente, sem quebrar (`is_webengine_available()`).
+- **Build (`TgPlayer.spec`)**: QtWebEngine deixou de ser excluído e passou a ser
+  coletado (core + widgets + recursos como `QtWebEngineProcess`, `.pak`, ICU).
+  Sem isso, o player embutido abriria em branco no `.exe`.
+
+### 🌐 Web — correção da lentidão para carregar o vídeo
+
+- O proxy `/api/stream` criava **uma `aiohttp.ClientSession` nova por
+  requisição** — cada Range pedido pelo `<video>` pagava um novo handshake, o
+  que deixava o vídeo lento/"sem carregar". Agora há uma **sessão keep-alive
+  global** (TCP reaproveitado, pool generoso), criada no startup e fechada no
+  shutdown.
+- Cabeçalhos `Cache-Control: no-store, no-transform` e `X-Accel-Buffering: no`
+  evitam que CDNs/proxies (ex.: Cloudflare) bufferizem o stream e atrasem a
+  partida.
+- `404` do upstream agora vira `stream_expired` (o frontend pode refazer o
+  preparo) em vez de erro genérico.
+
 ## v6.4.15
 
 Foco desta versão: **acompanhamento redesenhado** (dashboard de estudos) e a

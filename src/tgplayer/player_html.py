@@ -194,6 +194,8 @@ function pushState(){{
     position: Math.floor((v.currentTime||0)*1000),
     duration: Math.floor((v.duration||0)*1000),
     paused: v.paused, ended: v.ended,
+    volume: v.volume, muted: v.muted,
+    rate: v.playbackRate,
     wantVlc: !!s.wantVlc
   }};
 }}

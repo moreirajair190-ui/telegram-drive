@@ -94,13 +94,28 @@ web_db: WebDatabase = None  # type: ignore[assignment]
 enc: EncryptionService = None  # type: ignore[assignment]
 accounts: TelegramAccountService = None  # type: ignore[assignment]
 tg: TelegramAuthService = None  # type: ignore[assignment]
+# Sessão HTTP REUTILIZÁVEL para o proxy de streaming. Criar uma ClientSession
+# por requisição (como na versão antiga) custa caro: novo handshake/connector a
+# cada Range pedido pelo <video>, o que deixava o vídeo MUITO lento para
+# carregar. Reutilizamos uma única sessão com keep-alive (TCP reaproveitado).
+stream_http: aiohttp.ClientSession = None  # type: ignore[assignment]
 bearer = HTTPBearer(auto_error=False)
 
 
 # =========================================================== ciclo de vida
 @app.on_event("startup")
 async def _startup() -> None:
-    global core_db, web_db, enc, accounts, tg
+    global core_db, web_db, enc, accounts, tg, stream_http
+
+    # Sessão HTTP keep-alive para o proxy de streaming (ver comentário acima).
+    # connector com pool generoso e DNS cache: o upstream é sempre 127.0.0.1, e
+    # várias conexões Range podem estar ativas ao mesmo tempo no <video>.
+    stream_http = aiohttp.ClientSession(
+        connector=aiohttp.TCPConnector(
+            limit=64, limit_per_host=64, keepalive_timeout=75, force_close=False
+        ),
+        timeout=aiohttp.ClientTimeout(total=None, connect=15, sock_read=None),
+    )
 
     # Criptografia — obrigatória. Em dev pode-se permitir chave efêmera.
     try:
@@ -148,6 +163,11 @@ async def _startup() -> None:
 async def _shutdown() -> None:
     try:
         tg.stop()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        if stream_http is not None and not stream_http.closed:
+            await stream_http.close()
     except Exception:  # noqa: BLE001
         pass
 
@@ -831,31 +851,46 @@ async def prepare_stream(video_id: int, payload: dict[str, Any] | None = None, u
 
 @app.api_route("/api/stream/{token}", methods=["GET", "HEAD"])
 async def stream_proxy(token: str, request: Request) -> Response:
-    """Proxy do streaming (suporta HTTP Range). O token isola a conta."""
+    """Proxy do streaming (suporta HTTP Range). O token isola a conta.
+
+    Usa a ``stream_http`` (ClientSession keep-alive global) em vez de criar uma
+    nova sessão por requisição — isto reduz drasticamente a latência do primeiro
+    byte de cada pedido Range do ``<video>`` e corrige o vídeo "que não carrega"
+    / demora muito. Os cabeçalhos de cache impedem proxies intermediários de
+    bufferizar/cachear o stream (mantém a partida fluida).
+    """
     port = getattr(tg, "port", None)
     if not port:
         raise HTTPException(503, "Servidor de streaming não está pronto")
+    if stream_http is None or stream_http.closed:
+        raise HTTPException(503, "Proxy de streaming indisponível")
     upstream = f"http://127.0.0.1:{port}/stream/{token}/video"
     headers = {}
     if "range" in request.headers:
         headers["Range"] = request.headers["range"]
 
-    session = aiohttp.ClientSession()
     try:
-        resp = await session.request(request.method, upstream, headers=headers)
+        resp = await stream_http.request(request.method, upstream, headers=headers)
     except Exception as exc:  # noqa: BLE001
-        await session.close()
         raise HTTPException(502, "Falha no streaming") from exc
+
+    if resp.status == 404:
+        # Stream expirou (app/servidor reiniciou): avisa o frontend para refazer.
+        await resp.release()
+        raise HTTPException(404, "stream_expired")
 
     out_headers = {}
     for h in ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"):
         if h in resp.headers:
             out_headers[h] = resp.headers[h]
     out_headers.setdefault("Accept-Ranges", "bytes")
+    # Evita bufferização/caching agressivo por CDNs/proxies (ex.: Cloudflare),
+    # que atrasava a partida do vídeo na web.
+    out_headers["Cache-Control"] = "no-store, no-transform"
+    out_headers["X-Accel-Buffering"] = "no"
 
     if request.method == "HEAD":
         await resp.release()
-        await session.close()
         return Response(status_code=resp.status, headers=out_headers)
 
     async def _iter():
@@ -863,8 +898,8 @@ async def stream_proxy(token: str, request: Request) -> Response:
             async for chunk in resp.content.iter_chunked(256 * 1024):
                 yield chunk
         finally:
+            # Libera APENAS a resposta; a sessão global permanece viva.
             await resp.release()
-            await session.close()
 
     return StreamingResponse(_iter(), status_code=resp.status, headers=out_headers)
 

@@ -56,14 +56,24 @@ except Exception:
     pass
 
 # Submódulos PySide6 usados explicitamente.
-# O player local QtMultimedia/QtWebEngine foi removido da interface principal;
-# não coletamos esses módulos pesados para reduzir falhas e tamanho do build.
+# v6.5: o PLAYER EMBUTIDO usa QtWebEngine (Chromium do Qt) para reproduzir a
+# página HTML5 same-origin servida pelo servidor local. Por isso precisamos
+# coletar os módulos QtWebEngine* (core + widgets) e seus recursos (datas).
 hiddenimports += [
     "PySide6.QtCore",
     "PySide6.QtGui",
     "PySide6.QtWidgets",
     "PySide6.QtNetwork",
+    "PySide6.QtWebChannel",
+    "PySide6.QtWebEngineCore",
+    "PySide6.QtWebEngineWidgets",
+    "PySide6.QtPrintSupport",  # dependência indireta do QtWebEngine
 ]
+
+# Coleta os recursos (locales, ICU, QtWebEngineProcess.exe, .pak) do
+# QtWebEngine. Sem isto o player embutido abre uma tela em branco no .exe.
+_collect("PySide6.QtWebEngineCore")
+_collect("PySide6.QtWebEngineWidgets")
 
 # QtCharts é OPCIONAL: os gráficos da aba "Acompanhamento" usam QPainter puro
 # (módulo charts.py). Se o pacote estiver instalado, coletamos; senão, ignora.
@@ -100,8 +110,8 @@ a = Analysis(
         "numpy",
         "PIL",
         "pytest",
-        "PySide6.QtWebEngineCore",
-        "PySide6.QtWebEngineWidgets",
+        # QtWebEngine* NÃO é mais excluído: ele é necessário para o player
+        # embutido (v6.5). QtMultimedia continua fora (não usamos QMediaPlayer).
         "PySide6.QtMultimedia",
         "PySide6.QtMultimediaWidgets",
     ],

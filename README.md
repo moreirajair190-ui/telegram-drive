@@ -1,6 +1,6 @@
-# TgPlayer v6.4.15
+# TgPlayer v6.5.0
 
-TgPlayer é um organizador de videoaulas do Telegram. A versão atual prioriza abrir a mensagem original no Telegram Desktop/64Gram/Nekogram, mantendo progresso/manual de estudo, favoritos, checklist e Pomodoro.
+TgPlayer é um organizador de videoaulas do Telegram. A partir da v6.5 o app conta com um **player embutido rápido** (QtWebEngine + streaming faststart) que reproduz a aula dentro do próprio TgPlayer em poucos segundos — sem depender do VLC. Abrir no Telegram Desktop/64Gram/Nekogram e abrir no VLC continuam como alternativas. Mantém progresso/manual de estudo, favoritos, checklist e Pomodoro.
 
 ## Como rodar em desenvolvimento
 
