@@ -309,6 +309,12 @@ QCheckBox {{ color: {c['text']}; spacing: 8px; }}
 /* Rótulos SEM fundo opaco — evita "caixas" cobrindo o texto. */
 QLabel {{ color: {c['text']}; background: transparent; }}
 
+/* ----------------------------------------------------- estado vazio (listas) */
+#ListPlaceholder {{
+    color: {c['muted2']}; font-size: 12.5px; font-weight: 700;
+    background: transparent; line-height: 150%;
+}}
+
 /* ------------------------------------------------------------ player embutido */
 #PlayerDialog {{ background: #05070f; }}
 #PlayerStage {{ background: #000; border: none; }}

@@ -13,7 +13,6 @@ from datetime import datetime
 from typing import Callable
 
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QComboBox,
     QFrame,
