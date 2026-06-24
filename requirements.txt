@@ -1,4 +1,4 @@
-# TgPlayer v6.5.1 — dependências
+# TgPlayer v6.6 — dependências
 #
 # Instale com:
 #     pip install -r requirements.txt
@@ -7,15 +7,14 @@
 # (Python 3.13 pode dar problema com TgCrypto/Pyrogram — prefira 3.11/3.12.)
 
 # Interface gráfica (Qt para Python).
-# O pacote "PySide6" JÁ inclui PySide6-Essentials + PySide6-Addons
-# (QtMultimedia, QtWebEngine, etc.). NÃO liste PySide6-Addons separado:
-# isso causa conflito de versões no pip e quebra o build do .exe.
+# O pacote "PySide6" JÁ inclui PySide6-Essentials + PySide6-Addons.
 #
-# IMPORTANTE (v6.5): o PLAYER EMBUTIDO usa o componente QtWebEngine, que vem
-# dentro do PySide6-Addons (já incluso no PySide6). Se você instalou apenas
-# "PySide6-Essentials" manualmente, o player embutido não abrirá — instale o
-# pacote completo "PySide6".
-PySide6>=6.6,<6.9
+# v6.6: o PLAYER EMBUTIDO (QtWebEngine) foi REMOVIDO. A reprodução agora abre a
+# aula direto no Telegram instalado (Telegram Desktop, 64Gram ou oficial) e, como
+# segunda opção, no VLC local. Por isso o QtWebEngine não é mais necessário —
+# "PySide6-Essentials" já é suficiente para a interface, mas manter o pacote
+# completo "PySide6" também funciona.
+PySide6>=6.6,<6.12
 
 # Observação: a aba "Acompanhamento" desenha os gráficos com QPainter puro
 # (módulo charts.py). NÃO é necessário instalar PySide6-Charts/QtCharts.

@@ -31,3 +31,6 @@ Thumbs.db
 .vscode/
 TGClassPlayer_v*.zip
 TgPlayer_v*.zip
+
+# Screenshots gerados pelos smoke tests
+.smoke_shots/

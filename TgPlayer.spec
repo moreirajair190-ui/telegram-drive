@@ -45,8 +45,8 @@ def _collect(pkg):
 _collect("pyrogram")
 _collect("tgcrypto")
 
-# python-vlc (OPCIONAL): só é coletado se estiver instalado. O player embutido
-# do TgPlayer usa QtWebEngine; o VLC é apenas uma alternativa externa opcional.
+# python-vlc (OPCIONAL): só é coletado se estiver instalado. O VLC local é a
+# SEGUNDA opção de reprodução (a principal é abrir a aula no Telegram).
 _collect("vlc")
 
 # aiohttp.
@@ -56,24 +56,16 @@ except Exception:
     pass
 
 # Submódulos PySide6 usados explicitamente.
-# v6.5: o PLAYER EMBUTIDO usa QtWebEngine (Chromium do Qt) para reproduzir a
-# página HTML5 same-origin servida pelo servidor local. Por isso precisamos
-# coletar os módulos QtWebEngine* (core + widgets) e seus recursos (datas).
+# v6.6: o player embutido (QtWebEngine) foi REMOVIDO. A reprodução agora é feita
+# abrindo a aula no Telegram instalado (Desktop/64Gram/oficial) e, como segunda
+# opção, no VLC local. Por isso NÃO coletamos mais os módulos QtWebEngine*,
+# deixando o executável bem menor.
 hiddenimports += [
     "PySide6.QtCore",
     "PySide6.QtGui",
     "PySide6.QtWidgets",
     "PySide6.QtNetwork",
-    "PySide6.QtWebChannel",
-    "PySide6.QtWebEngineCore",
-    "PySide6.QtWebEngineWidgets",
-    "PySide6.QtPrintSupport",  # dependência indireta do QtWebEngine
 ]
-
-# Coleta os recursos (locales, ICU, QtWebEngineProcess.exe, .pak) do
-# QtWebEngine. Sem isto o player embutido abre uma tela em branco no .exe.
-_collect("PySide6.QtWebEngineCore")
-_collect("PySide6.QtWebEngineWidgets")
 
 # QtCharts é OPCIONAL: os gráficos da aba "Acompanhamento" usam QPainter puro
 # (módulo charts.py). Se o pacote estiver instalado, coletamos; senão, ignora.
@@ -110,8 +102,11 @@ a = Analysis(
         "numpy",
         "PIL",
         "pytest",
-        # QtWebEngine* NÃO é mais excluído: ele é necessário para o player
-        # embutido (v6.5). QtMultimedia continua fora (não usamos QMediaPlayer).
+        # v6.6: player embutido removido — QtWebEngine e QtMultimedia ficam
+        # FORA do build (executável menor). A reprodução usa Telegram + VLC.
+        "PySide6.QtWebEngineCore",
+        "PySide6.QtWebEngineWidgets",
+        "PySide6.QtWebChannel",
         "PySide6.QtMultimedia",
         "PySide6.QtMultimediaWidgets",
     ],

@@ -1,8 +1,12 @@
-# TgPlayer v6.5.1
+# TgPlayer v6.6.0
 
-TgPlayer é um organizador de videoaulas do Telegram. A partir da v6.5 o app conta com um **player embutido rápido** (QtWebEngine + streaming faststart) que reproduz a aula dentro do próprio TgPlayer em poucos segundos — sem depender do VLC. Abrir no Telegram Desktop/64Gram/Nekogram e abrir no VLC continuam como alternativas. Mantém progresso/manual de estudo, favoritos, checklist e Pomodoro.
+TgPlayer é um organizador de videoaulas do Telegram. A reprodução abre a aula **direto no Telegram instalado** (Telegram Desktop, **64Gram** ou Telegram oficial), tocando o vídeo dentro do próprio app do Telegram — e, como **segunda opção**, no **VLC local** (streaming). Mantém progresso/manual de estudo, favoritos, checklist e Pomodoro.
 
-A v6.5.1 traz uma **revisão geral do layout do app Windows**: estados vazios amigáveis nas listas e na aba Arquivos, painel de detalhes reorganizado com o botão "Assistir aqui" em destaque e ações agrupadas, colunas da árvore de aulas que não cortam mais o "Status", além de limpeza de código (remoção de módulos/arquivos mortos e imports não usados).
+A v6.6.0 traz três novidades principais:
+
+- **Player revertido**: o player embutido (QtWebEngine) foi removido. O **player principal** voltou a ser a abertura da aula **no Telegram** (Desktop/64Gram/oficial), com o **VLC local** como segunda opção. Executável mais leve, sem QtWebEngine.
+- **Árvore de aulas mais bonita**: corrigido o "bug roxo" das divisões entre tópicos/subtópicos — agora cada linha é uma faixa contínua, com seleção elegante. **Barra de rolagem mais suave**.
+- **🗓 Planejador de aulas (novo)**: um **quadro Kanban/Trello** (Backlog · Para o dia · Esta semana · Concluído) com **cartões arrastáveis** e um **calendário integrado** para agendar qual aula assistir em cada dia ou organizar as "tarefas da semana". Adicione aulas dos seus grupos/canais do Telegram e organize-as por dia/semana.
 
 ## Como rodar em desenvolvimento
 
