@@ -62,6 +62,7 @@ from .dialogs import (
 )
 from .files_tab import FilesTab
 from .logging_setup import setup_logging
+from .player import VideoPlayerDialog, is_webengine_available
 from .study_tab import StudyTab
 from .style import build_qss, palette
 from .summary_parser import match_videos_to_tree
@@ -181,6 +182,7 @@ class MainWindow(QMainWindow):
         self.current_course_id: int | None = None
         self.current_subject_id: int = SUBJECT_ALL
         self.current_video_id: int | None = None
+        self._active_player: VideoPlayerDialog | None = None
         self.setWindowTitle("TgPlayer — Videoaulas do Telegram")
         # v6.4.14: voltamos à moldura nativa do Windows para garantir cliques,
         # redimensionamento, Snap Assist e botões minimizar/maximizar/fechar.
@@ -565,19 +567,31 @@ class MainWindow(QMainWindow):
         card_layout.addWidget(self.resume_bar)
 
         card_layout.addSpacing(6)
-        self.watch_btn = QPushButton("▶  Abrir no Telegram")
+        self.watch_btn = QPushButton("▶  Assistir aqui")
         self.watch_btn.setObjectName("PrimaryButton")
-        self.watch_btn.setToolTip("Abre a mensagem original no Telegram Desktop/64Gram/Nekogram pelo protocolo do sistema.")
-        self.watch_btn.clicked.connect(self.open_selected_in_telegram)
+        self.watch_btn.setToolTip(
+            "Abre o player embutido (rápido) dentro do TgPlayer. O vídeo começa "
+            "em poucos segundos, sem precisar abrir o VLC."
+        )
+        self.watch_btn.clicked.connect(self.watch_selected_internal)
         card_layout.addWidget(self.watch_btn)
 
-        row1 = QHBoxLayout()
+        row_open = QHBoxLayout()
+        self.watch_tg_btn = QPushButton("📲 Telegram")
+        self.watch_tg_btn.setToolTip(
+            "Abre a mensagem original no Telegram Desktop/64Gram/Nekogram."
+        )
+        self.watch_tg_btn.clicked.connect(self.open_selected_in_telegram)
         self.watch_vlc_btn = QPushButton("Abrir no VLC")
         self.watch_vlc_btn.clicked.connect(self.watch_selected_vlc)
+        row_open.addWidget(self.watch_tg_btn)
+        row_open.addWidget(self.watch_vlc_btn)
+        card_layout.addLayout(row_open)
+
+        row1 = QHBoxLayout()
         self.resume_point_btn = QPushButton("⏱ Salvar ponto")
-        self.resume_point_btn.setToolTip("Salva manualmente o minuto em que você parou no Telegram.")
+        self.resume_point_btn.setToolTip("Salva manualmente o minuto em que você parou.")
         self.resume_point_btn.clicked.connect(self.save_resume_point_selected)
-        row1.addWidget(self.watch_vlc_btn)
         row1.addWidget(self.resume_point_btn)
         card_layout.addLayout(row1)
 
@@ -607,9 +621,10 @@ class MainWindow(QMainWindow):
         help_title.setObjectName("SectionTitle")
         h_layout.addWidget(help_title)
         help_text = QLabel(
-            "O botão principal abre a mensagem original no Telegram Desktop/64Gram/Nekogram. "
-            "Como o Telegram não envia ao TgPlayer o minuto assistido, use 'Salvar ponto' "
-            "para registrar manualmente onde você parou. O VLC continua como opção secundária."
+            "O botão principal 'Assistir aqui' abre o player embutido, que começa o "
+            "vídeo em poucos segundos (streaming rápido com faststart). O progresso "
+            "é salvo automaticamente. 'Telegram' e 'Abrir no VLC' continuam como "
+            "alternativas."
         )
         help_text.setObjectName("Muted")
         help_text.setWordWrap(True)
@@ -1703,7 +1718,7 @@ class MainWindow(QMainWindow):
         if has_video is None:
             items = self.video_tree.selectedItems() if hasattr(self, "video_tree") else []
             has_video = bool(items and self._is_video_item(items[0]))
-        for name in ("watch_btn", "watch_vlc_btn", "resume_point_btn", "fav_btn", "edit_btn", "mark_btn"):
+        for name in ("watch_btn", "watch_tg_btn", "watch_vlc_btn", "resume_point_btn", "fav_btn", "edit_btn", "mark_btn"):
             btn = getattr(self, name, None)
             if btn is not None:
                 btn.setEnabled(bool(has_video))
@@ -1795,7 +1810,7 @@ class MainWindow(QMainWindow):
     def on_tree_double_clicked(self, item: QTreeWidgetItem, _column: int) -> None:
         if self._is_video_item(item):
             self.current_video_id = int(item.data(0, ROLE_VIDEO_ID))
-            self.open_selected_in_telegram()
+            self.watch_selected_internal()
             return
         if self._is_folder_item(item):
             videos = self._find_video_descendants(item)
@@ -1894,7 +1909,8 @@ class MainWindow(QMainWindow):
         if not video:
             return
         menu = QMenu(self)
-        watch = menu.addAction("▶ Abrir no Telegram")
+        watch_here = menu.addAction("▶ Assistir aqui (player embutido)")
+        watch = menu.addAction("📲 Abrir no Telegram")
         vlc = menu.addAction("Abrir no VLC")
         save_point = menu.addAction("⏱ Salvar ponto onde parei")
         menu.addSeparator()
@@ -1907,7 +1923,9 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         delete = menu.addAction("Remover da lista")
         action = menu.exec(self.video_tree.mapToGlobal(pos))
-        if action == watch:
+        if action == watch_here:
+            self.watch_selected_internal()
+        elif action == watch:
             self.open_selected_in_telegram()
         elif action == vlc:
             self.watch_selected_vlc()
@@ -2188,16 +2206,11 @@ class MainWindow(QMainWindow):
                 pass
 
     def watch_selected_internal(self) -> None:
-        """Player local removido da interface principal.
-
-        Mantemos este método apenas por compatibilidade com versões antigas/tests.
-        """
-        QMessageBox.information(
-            self,
-            "Player local removido",
-            "O player local foi removido porque dependia de codecs/streaming instáveis. "
-            "Use Abrir no Telegram ou Abrir no VLC.",
-        )
+        """Abre a aula selecionada no PLAYER EMBUTIDO (rápido, same-origin)."""
+        video = self.selected_video()
+        if not video:
+            return
+        self._open_player_for(video)
 
     def _play_media_video(self, media: dict[str, Any]) -> None:
         """Abre mídia avulsa da aba Arquivos diretamente no Telegram quando possível."""
@@ -2221,12 +2234,70 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Erro", str(exc))
 
     def _open_player_for(self, video: Video) -> None:
-        """Player local removido: mantido só para compatibilidade interna."""
-        QMessageBox.information(
-            self,
-            "Player local removido",
-            "O player local foi removido desta versão. Use Abrir no Telegram ou Abrir no VLC.",
-        )
+        """Prepara o streaming e abre o player embutido (QtWebEngine)."""
+        if not is_webengine_available():
+            # Sem QtWebEngine: oferece o VLC como caminho alternativo.
+            if QMessageBox.question(
+                self,
+                "Player embutido indisponível",
+                "O componente QtWebEngine não está disponível neste build, então "
+                "o player embutido não pode abrir. Deseja assistir pelo VLC?",
+            ) == QMessageBox.Yes:
+                self.watch_selected_vlc()
+            return
+
+        stream = self._prepare_stream(video)
+        if not stream:
+            return
+        token = stream.get("token")
+        player_url = stream.get("player_url")
+        stream_url = stream.get("stream_url") or stream.get("url")
+
+        def _on_progress(position_ms: int, duration_ms: int) -> None:
+            try:
+                pos = max(0, int(position_ms or 0))
+                dur = int(duration_ms or 0) or (
+                    int(video.duration * 1000) if video.duration else None
+                )
+                self.db.save_progress(video.id, pos, dur)
+                # Conclui a aula quando assistiu ~95% dela.
+                if dur and pos >= int(dur * 0.95):
+                    self.db.mark_watched(video.id)
+            except Exception:  # noqa: BLE001
+                log.exception("Falha ao salvar progresso do player embutido")
+
+        def _on_open_vlc() -> None:
+            try:
+                # Mantém o stream vivo para o VLC externo e abre nele.
+                if token:
+                    self.service.call(self.service.release_stream_later(token, 7200))
+                self._launch_vlc(stream_url)
+            except Exception:  # noqa: BLE001
+                log.exception("Falha ao abrir no VLC a partir do player")
+
+        try:
+            dlg = VideoPlayerDialog(
+                title=video.title,
+                url=stream_url,
+                token=token,
+                service=self.service,
+                start_position_ms=int(video.position_ms or 0),
+                on_progress=_on_progress,
+                on_open_vlc=_on_open_vlc,
+                player_url=player_url,
+                parent=self,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Falha ao criar o player embutido")
+            QMessageBox.critical(self, "Erro no player", str(exc))
+            return
+
+        # Mantém referência para não ser coletado e atualiza listas ao fechar.
+        self._active_player = dlg
+        dlg.finished.connect(lambda _=None: self._refresh_after_change())
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
 
     def watch_selected_vlc(self) -> None:
         video = self.selected_video()

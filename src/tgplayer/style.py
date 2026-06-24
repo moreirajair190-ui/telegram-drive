@@ -308,7 +308,29 @@ QDialog {{ background: {c['bg']}; }}
 QCheckBox {{ color: {c['text']}; spacing: 8px; }}
 /* Rótulos SEM fundo opaco — evita "caixas" cobrindo o texto. */
 QLabel {{ color: {c['text']}; background: transparent; }}
-#PlayerDialog {{ background: #000; }}
+
+/* ------------------------------------------------------------ player embutido */
+#PlayerDialog {{ background: #05070f; }}
+#PlayerStage {{ background: #000; border: none; }}
+#PlayerWeb {{ background: #000; }}
+#PlayerBar {{
+    background: {c['panel']}; border-top: 1px solid {c['border_soft']};
+}}
+#PlayerBar QPushButton#IconButton {{
+    background: transparent; border: 1px solid transparent; border-radius: 10px;
+    font-size: 17px; padding: 6px 10px; color: {c['text']};
+}}
+#PlayerBar QPushButton#IconButton:hover {{
+    background: {c['hover']}; border-color: {c['border']};
+}}
+#PlayerLoading {{
+    background: rgba(5, 7, 15, 0.86);
+}}
+#PlayerToast {{
+    background: {c['panel2']}; color: {c['text']};
+    border: 1px solid {c['accent']}; border-radius: 999px;
+    padding: 8px 16px; font-weight: 800; margin: 8px;
+}}
 """
 
 

@@ -10,6 +10,11 @@
 # O pacote "PySide6" JÁ inclui PySide6-Essentials + PySide6-Addons
 # (QtMultimedia, QtWebEngine, etc.). NÃO liste PySide6-Addons separado:
 # isso causa conflito de versões no pip e quebra o build do .exe.
+#
+# IMPORTANTE (v6.5): o PLAYER EMBUTIDO usa o componente QtWebEngine, que vem
+# dentro do PySide6-Addons (já incluso no PySide6). Se você instalou apenas
+# "PySide6-Essentials" manualmente, o player embutido não abrirá — instale o
+# pacote completo "PySide6".
 PySide6>=6.6,<6.9
 
 # Observação: a aba "Acompanhamento" desenha os gráficos com QPainter puro
