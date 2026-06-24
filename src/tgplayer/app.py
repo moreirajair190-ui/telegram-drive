@@ -14,8 +14,6 @@ APIs de sincronização, streaming (player same-origin) e diálogos.
 
 from __future__ import annotations
 
-import ctypes
-import ctypes.wintypes
 import logging
 import re
 import sys
@@ -32,6 +30,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
     QHBoxLayout,
+    QHeaderView,
     QInputDialog,
     QLabel,
     QLineEdit,
@@ -318,6 +317,41 @@ class MainWindow(QMainWindow):
         btn.setCursor(Qt.PointingHandCursor)
         return btn
 
+    def _attach_list_placeholder(self, listw: QListWidget, text: str) -> QLabel:
+        """Cria um rótulo de 'estado vazio' sobreposto a uma QListWidget.
+
+        O rótulo fica centralizado sobre a lista e some assim que houver itens.
+        Mantém a interface acolhedora quando ainda não há cursos/matérias.
+        """
+        ph = QLabel(text, listw.viewport())
+        ph.setObjectName("ListPlaceholder")
+        ph.setAlignment(Qt.AlignCenter)
+        ph.setWordWrap(True)
+        ph.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+
+        def _reposition() -> None:
+            ph.setGeometry(listw.viewport().rect().adjusted(14, 14, -14, -14))
+            ph.setVisible(listw.count() == 0)
+
+        listw._placeholder = ph  # type: ignore[attr-defined]
+        listw._placeholder_reposition = _reposition  # type: ignore[attr-defined]
+        # Reposiciona quando a lista é redimensionada.
+        orig_resize = listw.resizeEvent
+
+        def _resize(event):  # noqa: ANN001
+            orig_resize(event)
+            _reposition()
+
+        listw.resizeEvent = _resize  # type: ignore[assignment]
+        _reposition()
+        return ph
+
+    def _refresh_list_placeholders(self) -> None:
+        for listw in (getattr(self, "course_list", None), getattr(self, "subject_list", None)):
+            fn = getattr(listw, "_placeholder_reposition", None)
+            if fn is not None:
+                fn()
+
     def _build_topbar(self) -> QWidget:
         """Barra superior compacta.
 
@@ -411,6 +445,10 @@ class MainWindow(QMainWindow):
         self.course_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.course_list.customContextMenuRequested.connect(self.show_course_menu)
         layout.addWidget(self.course_list, 2)
+        self._attach_list_placeholder(
+            self.course_list,
+            "Nenhum curso ainda.\nConecte-se e use “+ Adicionar cursos”.",
+        )
 
         self.add_courses_btn = QPushButton("+  Adicionar cursos")
         self.add_courses_btn.clicked.connect(self.add_courses_from_telegram)
@@ -426,6 +464,10 @@ class MainWindow(QMainWindow):
         self.subject_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.subject_list.customContextMenuRequested.connect(self.show_subject_menu)
         layout.addWidget(self.subject_list, 3)
+        self._attach_list_placeholder(
+            self.subject_list,
+            "Selecione um curso para ver as matérias.",
+        )
 
         self.edit_subjects_btn = QPushButton("✎  Editar matérias/sumários")
         self.edit_subjects_btn.clicked.connect(self.edit_subjects)
@@ -453,17 +495,20 @@ class MainWindow(QMainWindow):
         head_col.addWidget(self.course_title)
         head_col.addWidget(self.course_meta)
 
+        head_col.addSpacing(4)
         prog_row = QHBoxLayout()
-        prog_row.setSpacing(10)
+        prog_row.setSpacing(12)
         self.overall_progress = QProgressBar()
         self.overall_progress.setTextVisible(True)
         self.overall_progress.setFormat("%p% concluído")
         self.overall_progress.setValue(0)
-        self.overall_progress.setFixedHeight(14)
+        self.overall_progress.setFixedHeight(16)
         prog_row.addWidget(self.overall_progress, 1)
         self.overall_meta = QLabel("0/0 aulas · 0h")
         self.overall_meta.setObjectName("Muted2")
-        prog_row.addWidget(self.overall_meta)
+        self.overall_meta.setMinimumWidth(150)
+        self.overall_meta.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        prog_row.addWidget(self.overall_meta, 0)
         head_col.addLayout(prog_row)
 
         header.addLayout(head_col, 1)
@@ -527,9 +572,16 @@ class MainWindow(QMainWindow):
         self.video_tree.setUniformRowHeights(False)
         self.video_tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.video_tree.customContextMenuRequested.connect(self.show_video_menu)
-        self.video_tree.setColumnWidth(0, 620)
-        self.video_tree.setColumnWidth(1, 120)
-        self.video_tree.setColumnWidth(2, 90)
+        # A primeira coluna estica para ocupar o espaço; as demais ajustam ao
+        # conteúdo, garantindo que "Tipo", "Duração" e "Status" fiquem sempre
+        # visíveis (antes "Status" ficava cortada com larguras fixas).
+        header = self.video_tree.header()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        header.setMinimumSectionSize(80)
         layout.addWidget(self.video_tree, 1)
 
         return center
@@ -566,9 +618,11 @@ class MainWindow(QMainWindow):
         self.resume_bar.hide()
         card_layout.addWidget(self.resume_bar)
 
-        card_layout.addSpacing(6)
+        card_layout.addSpacing(10)
         self.watch_btn = QPushButton("▶  Assistir aqui")
         self.watch_btn.setObjectName("PrimaryButton")
+        self.watch_btn.setMinimumHeight(46)
+        self.watch_btn.setCursor(Qt.PointingHandCursor)
         self.watch_btn.setToolTip(
             "Abre o player embutido (rápido) dentro do TgPlayer. O vídeo começa "
             "em poucos segundos, sem precisar abrir o VLC."
@@ -577,38 +631,53 @@ class MainWindow(QMainWindow):
         card_layout.addWidget(self.watch_btn)
 
         row_open = QHBoxLayout()
+        row_open.setSpacing(8)
         self.watch_tg_btn = QPushButton("📲 Telegram")
         self.watch_tg_btn.setToolTip(
             "Abre a mensagem original no Telegram Desktop/64Gram/Nekogram."
         )
         self.watch_tg_btn.clicked.connect(self.open_selected_in_telegram)
-        self.watch_vlc_btn = QPushButton("Abrir no VLC")
+        self.watch_vlc_btn = QPushButton("🎬 VLC")
+        self.watch_vlc_btn.setToolTip("Abre o vídeo no VLC (alternativa externa).")
         self.watch_vlc_btn.clicked.connect(self.watch_selected_vlc)
-        row_open.addWidget(self.watch_tg_btn)
-        row_open.addWidget(self.watch_vlc_btn)
+        for b in (self.watch_tg_btn, self.watch_vlc_btn):
+            b.setMinimumHeight(38)
+            b.setCursor(Qt.PointingHandCursor)
+            row_open.addWidget(b)
         card_layout.addLayout(row_open)
 
-        row1 = QHBoxLayout()
+        card_layout.addSpacing(4)
+        actions_sep = QLabel("AÇÕES DA AULA")
+        actions_sep.setObjectName("SectionTitle")
+        card_layout.addWidget(actions_sep)
+
+        grid = QHBoxLayout()
+        grid.setSpacing(8)
         self.resume_point_btn = QPushButton("⏱ Salvar ponto")
         self.resume_point_btn.setToolTip("Salva manualmente o minuto em que você parou.")
         self.resume_point_btn.clicked.connect(self.save_resume_point_selected)
-        row1.addWidget(self.resume_point_btn)
-        card_layout.addLayout(row1)
-
-        row1b = QHBoxLayout()
         self.fav_btn = QPushButton("★ Favorito")
+        self.fav_btn.setToolTip("Marca/desmarca a aula como favorita.")
         self.fav_btn.clicked.connect(self.toggle_favorite_selected)
-        row1b.addWidget(self.fav_btn)
-        card_layout.addLayout(row1b)
+        for b in (self.resume_point_btn, self.fav_btn):
+            b.setMinimumHeight(38)
+            b.setCursor(Qt.PointingHandCursor)
+            grid.addWidget(b)
+        card_layout.addLayout(grid)
 
-        row2 = QHBoxLayout()
+        grid2 = QHBoxLayout()
+        grid2.setSpacing(8)
         self.edit_btn = QPushButton("✎ Editar")
+        self.edit_btn.setToolTip("Edita título, matéria e metadados da aula.")
         self.edit_btn.clicked.connect(self.edit_selected_video)
         self.mark_btn = QPushButton("✓ Assistida")
+        self.mark_btn.setToolTip("Alterna o status assistida/pendente.")
         self.mark_btn.clicked.connect(self.toggle_watched_selected)
-        row2.addWidget(self.edit_btn)
-        row2.addWidget(self.mark_btn)
-        card_layout.addLayout(row2)
+        for b in (self.edit_btn, self.mark_btn):
+            b.setMinimumHeight(38)
+            b.setCursor(Qt.PointingHandCursor)
+            grid2.addWidget(b)
+        card_layout.addLayout(grid2)
         layout.addWidget(card)
 
         # Cartão "como funciona".
@@ -623,8 +692,7 @@ class MainWindow(QMainWindow):
         help_text = QLabel(
             "O botão principal 'Assistir aqui' abre o player embutido, que começa o "
             "vídeo em poucos segundos (streaming rápido com faststart). O progresso "
-            "é salvo automaticamente. 'Telegram' e 'Abrir no VLC' continuam como "
-            "alternativas."
+            "é salvo automaticamente. 'Telegram' e 'VLC' continuam como alternativas."
         )
         help_text.setObjectName("Muted")
         help_text.setWordWrap(True)
@@ -894,6 +962,7 @@ class MainWindow(QMainWindow):
             if selected_id and course.id == selected_id:
                 self.course_list.setCurrentItem(item)
         self.course_list.blockSignals(False)
+        self._refresh_list_placeholders()
         if selected_id and self.current_course_id == selected_id:
             self.refresh_subjects()
             self.render_lessons()
@@ -1093,6 +1162,7 @@ class MainWindow(QMainWindow):
         course = self.get_current_course()
         if not course:
             self.subject_list.blockSignals(False)
+            self._refresh_list_placeholders()
             return
         subjects = self.db.list_subjects(course.id)
         videos = self.db.list_videos(course.id)
@@ -1131,6 +1201,7 @@ class MainWindow(QMainWindow):
             self.subject_list.setCurrentRow(0)
             self.current_subject_id = SUBJECT_ALL
         self.subject_list.blockSignals(False)
+        self._refresh_list_placeholders()
 
     def on_subject_selected(self, current: QListWidgetItem | None, _prev=None) -> None:
         if not current:

@@ -45,8 +45,8 @@ def _collect(pkg):
 _collect("pyrogram")
 _collect("tgcrypto")
 
-# python-vlc (OPCIONAL): backend de vídeo com libVLC embarcado. Só é coletado
-# se estiver instalado; caso contrário o app usa o QMediaPlayer normalmente.
+# python-vlc (OPCIONAL): só é coletado se estiver instalado. O player embutido
+# do TgPlayer usa QtWebEngine; o VLC é apenas uma alternativa externa opcional.
 _collect("vlc")
 
 # aiohttp.

@@ -129,6 +129,33 @@ class FilesTab(QWidget):
         self.grid.itemDoubleClicked.connect(self._on_item_activated)
         outer.addWidget(self.grid, 1)
 
+        # Estado vazio amigável sobre a grade (some assim que houver arquivos).
+        self._grid_placeholder = QLabel(
+            "Nenhum arquivo para mostrar.\n"
+            "Escolha um chat acima e clique em “Atualizar”.",
+            self.grid.viewport(),
+        )
+        self._grid_placeholder.setObjectName("ListPlaceholder")
+        self._grid_placeholder.setAlignment(Qt.AlignCenter)
+        self._grid_placeholder.setWordWrap(True)
+        self._grid_placeholder.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+
+        def _reposition_ph() -> None:
+            self._grid_placeholder.setGeometry(
+                self.grid.viewport().rect().adjusted(20, 20, -20, -20)
+            )
+            self._grid_placeholder.setVisible(self.grid.count() == 0)
+
+        self._reposition_grid_placeholder = _reposition_ph
+        _orig_resize = self.grid.resizeEvent
+
+        def _resize(event):  # noqa: ANN001
+            _orig_resize(event)
+            _reposition_ph()
+
+        self.grid.resizeEvent = _resize  # type: ignore[assignment]
+        _reposition_ph()
+
         self.status = QLabel("Selecione um chat e clique em Atualizar.")
         self.status.setObjectName("Muted2")
         outer.addWidget(self.status)
@@ -300,6 +327,9 @@ class FilesTab(QWidget):
         self.status.setText(
             f"{total} arquivo(s)." if total else "Nenhum arquivo com esse filtro."
         )
+        fn = getattr(self, "_reposition_grid_placeholder", None)
+        if fn is not None:
+            fn()
         if self._thumb_queue and not self._thumb_timer.isActive():
             self._thumb_timer.start()
 

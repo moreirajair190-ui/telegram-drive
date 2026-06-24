@@ -1,5 +1,41 @@
 # Changelog — TgPlayer
 
+## v6.5.1
+
+Foco desta versão: **revisão geral do app Windows** — layout mais bonito,
+suave e consistente, mais limpeza de código e correção de detalhes.
+
+### ✨ Layout e experiência
+
+- **Estados vazios amigáveis**: as listas de **cursos** e **matérias** e a aba
+  **Arquivos** agora mostram uma mensagem central acolhedora quando estão vazias,
+  em vez de uma caixa em branco (ex.: "Nenhum curso ainda. Conecte-se e use
+  '+ Adicionar cursos'.").
+- **Painel de detalhes da aula reorganizado**: o botão **"▶ Assistir aqui"** ficou
+  maior e em destaque; os botões secundários (Telegram / VLC) e as ações da aula
+  (Salvar ponto, Favorito, Editar, Assistida) ganharam altura consistente e foram
+  agrupados sob a seção **"AÇÕES DA AULA"** num grid 2×2.
+- **Cabeçalho do curso** com barra de progresso e contadores realinhados (o texto
+  "X/Y aulas · Zh" agora fica à direita, sem se espremer).
+- **Árvore de aulas**: as colunas (Tipo, Duração, Status) passaram a se ajustar
+  ao conteúdo com a primeira coluna esticando — antes a coluna **"Status"** ficava
+  cortada na borda direita.
+- Cursor de "mãozinha" nos botões de ação e ajustes finos de espaçamento/QSS.
+
+### 🧹 Limpeza de código
+
+- Removido o módulo morto **`vlc_embed.py`** (backend libVLC antigo, sem nenhuma
+  referência — substituído pelo player QtWebEngine).
+- Removido o arquivo obsoleto **`MUDANCAS_v6.4.15.txt`** (já coberto pelo CHANGELOG).
+- Removidos imports não usados (`ctypes`/`ctypes.wintypes` em `app.py`, `QFont`
+  em `study_tab.py`) — `pyflakes` limpo.
+- Comentário desatualizado no `TgPlayer.spec` (menção ao QMediaPlayer) corrigido.
+
+### ✅ Qualidade
+
+- 13 testes passando + smoke test headless de toda a UI (3 abas) e do player
+  embutido (QtWebEngine offscreen).
+
 ## v6.5.0
 
 Foco desta versão: **player embutido de volta no app Windows** (rápido, sem
