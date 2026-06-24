@@ -101,7 +101,7 @@ def test_planner_crud_and_dragdrop(win):
     assert ok, "add_video falhou"
     # Não duplica.
     assert planner.add_video(videos[0].id, column_key="backlog", silent=True) is False
-    # Adiciona aula agendada para o dia selecionado.
+    # Adiciona aula agendada para o dia selecionado (vai para o calendário).
     planner.add_video(videos[1].id, column_key="sched")
     # Tarefa livre.
     item_id = db.add_plan_item("Revisar pneumonia", column_key=pt.COL_WEEK)
@@ -109,7 +109,10 @@ def test_planner_crud_and_dragdrop(win):
 
     planner.refresh()
     assert planner.col_backlog["list"].count() == 1, "backlog deveria ter 1 cartão"
-    assert planner.col_today["list"].count() == 1, "coluna do dia deveria ter 1 cartão"
+    # A agendada deve aparecer numa célula do calendário (não há mais coluna "hoje").
+    today_str = planner.selected_date.toString("yyyy-MM-dd")
+    counts0 = db.plan_counts_by_date()
+    assert counts0.get(today_str, 0) >= 1, f"aula não agendada no calendário: {counts0}"
     assert planner.col_week["list"].count() == 1, "semana deveria ter 1 cartão"
 
     # Move o cartão do backlog para "semana" (simula drop entre colunas).
@@ -128,6 +131,7 @@ def test_planner_crud_and_dragdrop(win):
     assert counts.get(future, 0) >= 1, f"calendário não marcou {future}: {counts}"
 
     # Marca como concluído.
+    planner.refresh()
     done_target = planner.col_week["list"].item(0)
     did = int(done_target.data(pt.ROLE_ITEM_ID))
     db.move_plan_item(did, pt.COL_DONE, 9999)
@@ -163,6 +167,9 @@ def capture(win):
     win.apply_theme("light")
     app.processEvents()
     win.tabs.setCurrentIndex(idx)
+    win.planner_tab.refresh()
+    for _ in range(6):
+        app.processEvents()
     win.grab().save(os.path.join(SHOTS, "03_planejador_claro.png"))
     win.tabs.setCurrentIndex(0)
     win.video_tree.expandAll()

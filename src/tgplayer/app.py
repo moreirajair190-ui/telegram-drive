@@ -21,7 +21,18 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import Qt, QTimer, QUrl, QSize, QPoint, QRectF
+from PySide6.QtCore import (
+    Qt,
+    QTimer,
+    QUrl,
+    QSize,
+    QPoint,
+    QRectF,
+    QObject,
+    QEvent,
+    QEasingCurve,
+    QPropertyAnimation,
+)
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -108,6 +119,51 @@ ROLE_VIDEO_ID = Qt.UserRole
 ROLE_NODE_TYPE = Qt.UserRole + 1
 ROLE_RAW_TITLE = Qt.UserRole + 2
 
+
+class SmoothScroller(QObject):
+    """Dá rolagem com animação suave à roda do mouse de qualquer view.
+
+    Em vez do "salto" abrupto padrão do Qt, cada giro da roda anima o valor da
+    barra de rolagem com uma curva de desaceleração (OutCubic), criando aquela
+    sensação macia/contínua. Funciona em QTreeWidget, QListWidget, QScrollArea,
+    etc. — basta `SmoothScroller.install(view)`.
+    """
+
+    def __init__(self, view) -> None:  # noqa: ANN001
+        super().__init__(view)
+        self._view = view
+        self._bar = view.verticalScrollBar()
+        self._target = self._bar.value()
+        self._anim = QPropertyAnimation(self._bar, b"value", self)
+        self._anim.setEasingCurve(QEasingCurve.OutCubic)
+        self._anim.setDuration(380)
+        view.viewport().installEventFilter(self)
+
+    @classmethod
+    def install(cls, view) -> "SmoothScroller":  # noqa: ANN001
+        return cls(view)
+
+    def eventFilter(self, obj, event):  # noqa: N802, ANN001
+        if event.type() == QEvent.Wheel and obj is self._view.viewport():
+            delta = event.angleDelta().y()
+            if delta == 0:
+                return False
+            bar = self._bar
+            # Mantém o alvo dentro dos limites e sincronizado caso o usuário
+            # tenha arrastado a barra no meio da animação.
+            if self._anim.state() != QPropertyAnimation.Running:
+                self._target = bar.value()
+            step = int(bar.singleStep() * 3)
+            self._target -= (delta / 120.0) * step
+            self._target = max(bar.minimum(), min(bar.maximum(), int(self._target)))
+            self._anim.stop()
+            self._anim.setStartValue(bar.value())
+            self._anim.setEndValue(self._target)
+            self._anim.start()
+            event.accept()
+            return True
+        return False
+
 # Identificador especial para "todas as matérias".
 SUBJECT_ALL = -1
 SUBJECT_NONE = 0  # vídeos sem matéria
@@ -134,6 +190,16 @@ class LessonTreeDelegate(QStyledItemDelegate):
         except Exception:  # noqa: BLE001
             return palette("dark")
 
+    @staticmethod
+    def _mix(a: QColor, b: QColor, t: float) -> QColor:
+        """Interpola linearmente duas cores (t=0 → a, t=1 → b)."""
+        t = max(0.0, min(1.0, t))
+        return QColor(
+            int(a.red() + (b.red() - a.red()) * t),
+            int(a.green() + (b.green() - a.green()) * t),
+            int(a.blue() + (b.blue() - a.blue()) * t),
+        )
+
     def paint(self, painter: QPainter, option, index) -> None:  # noqa: N802
         c = self._colors()
         col = index.column()
@@ -151,24 +217,27 @@ class LessonTreeDelegate(QStyledItemDelegate):
 
         selected = bool(option.state & QStyle.State_Selected)
         hovered = bool(option.state & QStyle.State_MouseOver)
+        is_first = col == 0
+        is_last = col == (model.columnCount() - 1)
 
-        # Faixa contínua: pinta todas as colunas com o MESMO retângulo de fundo
-        # (sem cantos arredondados internos), evitando emendas entre colunas.
+        # Faixa contínua por linha, com respiro vertical para dar leveza.
         full = QRectF(option.rect)
-        # Pequena folga vertical para dar respiro entre linhas, sem criar gaps
-        # horizontais (a faixa cobre toda a largura da coluna).
-        full.adjust(0, 1.5, 0, -1.5)
+        full.adjust(0, 2.0, 0, -2.0)
 
         bg: QColor | None = None
-        border: QColor | None = None
+        # Cor do indicador de hierarquia desenhado na esquerda das pastas.
+        tint: QColor | None = None
 
         if node_type == "folder":
+            # Estratégia leve: só o nível 0 ganha faixa visível; níveis mais
+            # profundos ficam quase transparentes (some "cinza sobre cinza").
             base = {
                 0: c.get("folder_l0", c["panel2"]),
                 1: c.get("folder_l1", c["panel2"]),
             }.get(depth, c.get("folder_l2", c["panel2"]))
             bg = QColor(base)
-            border = QColor(c.get("folder_border", c["border_soft"]))
+            # Indicador colorido à esquerda, mais forte no nível 0 e suave depois.
+            tint = QColor(c.get("folder_tint", c["accent"]))
         elif node_type == "video":
             if index.row() % 2 == 1:
                 bg = QColor(c.get("row_alt", c["panel"]))
@@ -178,75 +247,47 @@ class LessonTreeDelegate(QStyledItemDelegate):
 
         if selected:
             sel = QColor(c["accent"])
-            sel.setAlpha(46 if c.get("name") == "dark" else 38)
+            sel.setAlpha(40 if c.get("name") == "dark" else 30)
             bg = sel
-            border = QColor(c["accent"])
 
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing, True)
 
-        if bg is not None:
-            # Faixa ÚNICA e contínua por linha: arredondamos somente os cantos
-            # externos (esquerda na 1ª coluna, direita na última) e ESTENDEMOS
-            # as bordas internas 1px para fora, de forma que as colunas vizinhas
-            # se sobreponham e não exista nenhuma emenda branca no meio (era esse
-            # o "bug roxo" das divisões entre tópicos/subtópicos).
-            radius = 9.0
-            is_first = col == 0
-            is_last = col == (model.columnCount() - 1)
-            seam = 1.0  # sobreposição para matar a emenda entre colunas
+        if bg is not None and bg.alpha() > 0:
+            # Faixa ÚNICA e contínua: arredonda só os cantos externos (esquerda
+            # na 1ª coluna, direita na última) e estende 1px para dentro nas
+            # bordas internas, sobrepondo as colunas para não sobrar emenda.
+            radius = 10.0
+            seam = 1.0
             rect = QRectF(full)
             if not is_first:
                 rect.setLeft(rect.left() - seam)
             if not is_last:
                 rect.setRight(rect.right() + seam)
+            painter.fillPath(
+                self._row_path(rect, radius, is_first, is_last), bg
+            )
 
-            path = QPainterPath()
-            if is_first and is_last:
-                path.addRoundedRect(rect, radius, radius)
-            elif is_first:
-                # Arredonda só a esquerda; direita reta (continua na próxima col).
-                path.addRoundedRect(QRectF(rect.left(), rect.top(),
-                                           rect.width() + radius, rect.height()),
-                                    radius, radius)
-                path = QPainterPath()
-                path.moveTo(rect.left() + radius, rect.top())
-                path.lineTo(rect.right(), rect.top())
-                path.lineTo(rect.right(), rect.bottom())
-                path.lineTo(rect.left() + radius, rect.bottom())
-                path.arcTo(rect.left(), rect.bottom() - 2 * radius, 2 * radius, 2 * radius, 270, -90)
-                path.lineTo(rect.left(), rect.top() + radius)
-                path.arcTo(rect.left(), rect.top(), 2 * radius, 2 * radius, 180, -90)
-            elif is_last:
-                path.moveTo(rect.left(), rect.top())
-                path.lineTo(rect.right() - radius, rect.top())
-                path.arcTo(rect.right() - 2 * radius, rect.top(), 2 * radius, 2 * radius, 90, -90)
-                path.lineTo(rect.right(), rect.bottom() - radius)
-                path.arcTo(rect.right() - 2 * radius, rect.bottom() - 2 * radius, 2 * radius, 2 * radius, 0, -90)
-                path.lineTo(rect.left(), rect.bottom())
-                path.closeSubpath()
-            else:
-                path.addRect(rect)
-            painter.fillPath(path, bg)
+        # Indicador de hierarquia da pasta: barrinha colorida arredondada na
+        # margem esquerda (somente na 1ª coluna). Substitui as bordas pesadas.
+        if node_type == "folder" and is_first and tint is not None:
+            strength = {0: 1.0, 1: 0.55}.get(depth, 0.32)
+            bar_color = self._mix(QColor(c["panel"]), tint, strength)
+            bar_w = 3.5 if depth == 0 else 3.0
+            bar = QRectF(full.left() + 2.0, full.top() + 3.0,
+                         bar_w, full.height() - 6.0)
+            bp = QPainterPath()
+            bp.addRoundedRect(bar, bar_w / 2.0, bar_w / 2.0)
+            painter.fillPath(bp, bar_color)
 
-            if border is not None and (selected or node_type == "folder"):
-                pen = painter.pen()
-                pen.setColor(border)
-                pen.setWidthF(1.0 if not selected else 1.4)
-                painter.setPen(pen)
-                # Borda apenas em cima/baixo para manter a faixa contínua (sem
-                # linhas verticais que reintroduziriam o efeito "quebrado").
-                painter.drawLine(int(rect.left()), int(rect.top()),
-                                 int(rect.right()), int(rect.top()))
-                painter.drawLine(int(rect.left()), int(rect.bottom()),
-                                 int(rect.right()), int(rect.bottom()))
-                if selected and is_first:
-                    # Indicador de acento na borda esquerda da seleção.
-                    accent = QColor(c["accent"])
-                    bar = QRectF(full.left() + 1.0, full.top() + 2.0, 3.0, full.height() - 4.0)
-                    bp = QPainterPath()
-                    bp.addRoundedRect(bar, 1.5, 1.5)
-                    painter.fillPath(bp, accent)
+        # Indicador de acento na seleção (barra esquerda viva).
+        if selected and is_first:
+            accent = QColor(c["accent"])
+            bar = QRectF(full.left() + 1.5, full.top() + 2.5,
+                         3.5, full.height() - 5.0)
+            bp = QPainterPath()
+            bp.addRoundedRect(bar, 1.75, 1.75)
+            painter.fillPath(bp, accent)
 
         painter.restore()
 
@@ -257,6 +298,33 @@ class LessonTreeDelegate(QStyledItemDelegate):
         opt.state &= ~QStyle.State_MouseOver
         opt.state &= ~QStyle.State_HasFocus
         super().paint(painter, opt, index)
+
+    @staticmethod
+    def _row_path(rect: QRectF, radius: float, is_first: bool, is_last: bool) -> QPainterPath:
+        """Constrói o caminho da faixa: cantos arredondados só nas pontas."""
+        path = QPainterPath()
+        if is_first and is_last:
+            path.addRoundedRect(rect, radius, radius)
+        elif is_first:
+            path.moveTo(rect.left() + radius, rect.top())
+            path.lineTo(rect.right(), rect.top())
+            path.lineTo(rect.right(), rect.bottom())
+            path.lineTo(rect.left() + radius, rect.bottom())
+            path.arcTo(rect.left(), rect.bottom() - 2 * radius, 2 * radius, 2 * radius, 270, -90)
+            path.lineTo(rect.left(), rect.top() + radius)
+            path.arcTo(rect.left(), rect.top(), 2 * radius, 2 * radius, 180, -90)
+            path.closeSubpath()
+        elif is_last:
+            path.moveTo(rect.left(), rect.top())
+            path.lineTo(rect.right() - radius, rect.top())
+            path.arcTo(rect.right() - 2 * radius, rect.top(), 2 * radius, 2 * radius, 90, -90)
+            path.lineTo(rect.right(), rect.bottom() - radius)
+            path.arcTo(rect.right() - 2 * radius, rect.bottom() - 2 * radius, 2 * radius, 2 * radius, 0, -90)
+            path.lineTo(rect.left(), rect.bottom())
+            path.closeSubpath()
+        else:
+            path.addRect(rect)
+        return path
 
 
 class DraggableTopBar(QWidget):
@@ -731,6 +799,15 @@ class MainWindow(QMainWindow):
         self.video_tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.video_tree.customContextMenuRequested.connect(self.show_video_menu)
         self.video_tree.setMouseTracking(True)
+        # Rolagem suave (pixel a pixel) — em vez de pular de item em item, a
+        # árvore desliza continuamente, deixando a navegação muito mais fluida.
+        self.video_tree.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.video_tree.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.video_tree.setAutoScroll(True)
+        # Passo de rolagem da roda do mouse mais curto = sensação mais macia.
+        self.video_tree.verticalScrollBar().setSingleStep(16)
+        # Animação de rolagem suave (desaceleração) na roda do mouse.
+        self._tree_scroller = SmoothScroller.install(self.video_tree)
         # Delegate que pinta a linha inteira (resolve o "bug roxo" das divisões
         # entre tópicos/subtópicos e dá um realce de seleção suave e contínuo).
         self.video_tree.setItemDelegate(LessonTreeDelegate(self.video_tree, lambda: self.theme))
